@@ -4,14 +4,17 @@ mod tests;
 
 use crate::automod::{action_vars, automod_member_blocked, kick_with_recovery};
 use crate::commands::{PermLevel, permission_level};
-use crate::discord::{DiscordCall, race_discord_call};
+use crate::discord::{DISCORD_REST_TIMEOUT, DiscordCall, race_discord_call};
 use crate::state::BotState;
 use crate::{cases, db, logging};
-use jmodguard::onboarding_trap::{RULE_ID, cleanup_window_minutes, join_window_minutes, role_id};
+use jmodguard::onboarding_trap::{
+    RULE_ID, cleanup_window_minutes, join_window_minutes, removal_role_ids, role_id,
+};
 use jmodguard::types::RuleDef;
 use parking_lot::Mutex;
 use serenity::all::{
-    Cache, GuildId, GuildMemberUpdateEvent, Http, Member, RoleId, Timestamp, User, UserId,
+    Cache, GuildId, GuildMemberUpdateEvent, Http, Member, PartialGuild, Permissions, RoleId,
+    Timestamp, User, UserId,
 };
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::Future;
@@ -182,6 +185,16 @@ impl MatchClaim<'_> {
         active.phase = ClaimPhase::Dispatched;
         true
     }
+
+    fn dispatched_roles_admit(&self, roles_admit: impl FnOnce(&[RoleId]) -> bool) -> bool {
+        self.recent.claims.lock().active[usize::from(self.dry_run)]
+            .get(&self.key.0)
+            .is_some_and(|active| {
+                Arc::ptr_eq(&active.token, &self.token)
+                    && active.phase == ClaimPhase::Dispatched
+                    && active.latest_roles.as_deref().is_none_or(roles_admit)
+            })
+    }
 }
 
 impl Drop for MatchClaim<'_> {
@@ -260,9 +273,16 @@ impl RecentMatches {
         membership: Option<(Timestamp, &[RoleId])>,
     ) {
         for mode in &mut self.claims.lock().active {
-            if let Some(active) = mode.get_mut(&(guild, user))
-                && active.phase != ClaimPhase::Dispatched
-            {
+            if let Some(active) = mode.get_mut(&(guild, user)) {
+                // After a mutation, a missing stay or trap role ends this sequence.
+                if active.phase == ClaimPhase::Dispatched
+                    && active
+                        .latest_roles
+                        .as_ref()
+                        .is_some_and(|roles| !roles.contains(&active.role))
+                {
+                    continue;
+                }
                 let roles = membership
                     .filter(|(joined_at, _)| *joined_at == active.joined_at)
                     .map_or(&[][..], |(_, roles)| roles);
@@ -381,29 +401,26 @@ async fn check_event(app: &Arc<BotState>, http: &Arc<Http>, cache: &Cache, event
     let (mut vars, reason) =
         action_vars(event.user, event.display_name, &rule.name, action, 1, None);
     let cleanup_window = cleanup_window_minutes(rule).filter(|minutes| *minutes > 0);
+    let guard = DispatchGuard {
+        app,
+        http,
+        cache,
+        event: &event,
+        matched: rule,
+        claim: &claim,
+        role,
+    };
 
-    // Supersession cancels enrollment and preflight, but the cutoff race also
-    // covers the committed kick. Claim completion is synchronous at handoff.
+    // Supersession cancels preflight. Writer cutoff also covers the committed sequence.
     let dispatch = async {
-        let (enrollment, member, dry_run, role_exemptions) = claim
+        let (enrollment, prepared) = claim
             .preflight(async {
                 let enrollment = cases::capture(app, event.guild.get()).await?;
-                let (member, dry_run, role_exemptions) =
-                    member_at_dispatch(app, http, cache, &event, &enrollment, rule, &claim).await?;
-                Some((enrollment, member, dry_run, role_exemptions))
+                let prepared = guard.prepare(&enrollment).await?;
+                Some((enrollment, prepared))
             })
             .await?;
-        let dispatched = if dry_run {
-            Dispatch::DryRun
-        } else {
-            let started_at_ms = Timestamp::now().timestamp_millis();
-            let error = kick_with_recovery(app, http, event.guild, &member, &reason).await;
-            Dispatch::Kick {
-                started_at_ms,
-                error,
-                role_exemptions,
-            }
-        };
+        let dispatched = guard.execute(&enrollment, prepared, &reason).await;
         Some((enrollment, dispatched))
     };
     let DiscordCall::Finished(Some((enrollment, dispatched))) =
@@ -415,20 +432,33 @@ async fn check_event(app: &Arc<BotState>, http: &Arc<Http>, cache: &Cache, event
     if !app.activation.may_record() {
         return;
     }
-    match dispatched {
-        Dispatch::DryRun => {
-            let mut action_text = format!("[DRY RUN] would kick: {}", action.reason);
+    let removals = match dispatched {
+        Dispatch::DryRun { remove_roles } => {
+            let mut action_text = String::from("[DRY RUN] ");
+            if remove_roles {
+                action_text.push_str("would remove selected roles, then ");
+            }
+            action_text.push_str(&format!("would kick: {}", action.reason));
             if let Some(minutes) = cleanup_window {
                 action_text.push_str(&format!(
                     " and would clean tracked messages from the last {minutes} minutes"
                 ));
             }
             vars.insert("action".into(), action_text);
+            RoleRemovals::default()
+        }
+        Dispatch::KickSkipped(removals) => {
+            vars.insert(
+                "action".into(),
+                "kick cancelled after role removal attempt".into(),
+            );
+            removals
         }
         Dispatch::Kick {
             started_at_ms,
             error,
             role_exemptions,
+            removals,
         } => {
             let outcome = cases::classify_discord(error.as_ref());
             let case_id = cases::record_onboarding_kick(
@@ -536,19 +566,40 @@ async fn check_event(app: &Arc<BotState>, http: &Arc<Http>, cache: &Cache, event
                 )
                 .await,
             );
+            removals
         }
+    };
+    if removals != RoleRemovals::default() {
+        let action = vars.get_mut("action").expect("dispatch includes an action");
+        action.insert_str(
+            0,
+            &format!(
+                "roles removed ({}), unconfirmed or skipped ({}); ",
+                removals.confirmed, removals.unconfirmed
+            ),
+        );
     }
     vars.insert("content".into(), String::new());
     logging::emit_to(app, http, event.guild, "automod", vars).await;
 }
 
 enum Dispatch {
-    DryRun,
+    DryRun {
+        remove_roles: bool,
+    },
+    KickSkipped(RoleRemovals),
     Kick {
         started_at_ms: i64,
         error: Option<serenity::Error>,
         role_exemptions: Vec<u64>,
+        removals: RoleRemovals,
     },
+}
+
+#[derive(Default, PartialEq, Eq)]
+struct RoleRemovals {
+    confirmed: usize,
+    unconfirmed: usize,
 }
 
 /// Refresh after each potentially slow pre-dispatch operation. Once a match
@@ -575,78 +626,234 @@ async fn refresh_rule(
     .then_some(current)
 }
 
-async fn member_at_dispatch(
-    app: &BotState,
-    http: &Http,
-    cache: &Cache,
-    event: &RoleEvent<'_>,
-    enrollment: &db::GuildEnrollment,
-    matched: &RuleDef,
-    claim: &MatchClaim<'_>,
-) -> Option<(Member, bool, Vec<u64>)> {
-    let (guild_id, user_id) = (event.guild, event.user.id);
-    let joined_at = event.joined_at;
-    let role = RoleId::new(role_id(matched)?);
-    let mut dry_run = matched.dry_run;
+struct DispatchGuard<'a> {
+    app: &'a BotState,
+    http: &'a Http,
+    cache: &'a Cache,
+    event: &'a RoleEvent<'a>,
+    matched: &'a RuleDef,
+    claim: &'a MatchClaim<'a>,
+    role: RoleId,
+}
 
-    // Enrollment capture and both REST lookups are awaited. Check the
-    // primary rule after each one, with the final read as the last await
-    // before validating recent membership evidence and dispatching the kick.
-    refresh_rule(app, enrollment, matched, &mut dry_run).await?;
-    let guild = http.get_guild(guild_id).await.ok()?;
-    if guild.owner_id == user_id {
-        return None;
+struct PreparedMatch {
+    member: Member,
+    guild: PartialGuild,
+    rule: RuleDef,
+    dry_run: bool,
+    bot: Option<Member>,
+    removal_roles: Vec<u64>,
+}
+
+impl DispatchGuard<'_> {
+    async fn prepare(&self, enrollment: &db::GuildEnrollment) -> Option<PreparedMatch> {
+        let (guild_id, user_id) = (self.event.guild, self.event.user.id);
+        let mut dry_run = self.matched.dry_run;
+        let removal_roles = removal_role_ids(guild_id.get(), self.matched).unwrap_or_default();
+
+        // Keep the final primary read immediately before the membership checks
+        // and claim handoff. Optional capability lookup only applies to live removal.
+        refresh_rule(self.app, enrollment, self.matched, &mut dry_run).await?;
+        let guild = self.http.get_guild(guild_id).await.ok()?;
+        if guild.owner_id == user_id {
+            return None;
+        }
+        refresh_rule(self.app, enrollment, self.matched, &mut dry_run).await?;
+        let mut bot = None;
+        if !dry_run && !removal_roles.is_empty() {
+            let bot_id = self.cache.current_user().id;
+            bot =
+                tokio::time::timeout(DISCORD_REST_TIMEOUT, self.http.get_member(guild_id, bot_id))
+                    .await
+                    .ok()
+                    .and_then(Result::ok)
+                    .filter(|member| member.user.id == bot_id);
+            refresh_rule(self.app, enrollment, self.matched, &mut dry_run).await?;
+        }
+        let member = self.http.get_member(guild_id, user_id).await.ok()?;
+        let rule = refresh_rule(self.app, enrollment, self.matched, &mut dry_run).await?;
+        if !self.member_admits(&guild, &member, &rule, dry_run)
+            || !self
+                .claim
+                .complete(dry_run, |roles| self.roles_admit(&guild, &rule, roles))
+        {
+            return None;
+        }
+        Some(PreparedMatch {
+            member,
+            guild,
+            rule,
+            dry_run,
+            bot,
+            removal_roles,
+        })
     }
-    refresh_rule(app, enrollment, matched, &mut dry_run).await?;
-    let member = http.get_member(guild_id, user_id).await.ok()?;
-    let rule = refresh_rule(app, enrollment, matched, &mut dry_run).await?;
 
-    let roles_admit = |assigned: &[RoleId]| {
+    async fn execute(
+        &self,
+        enrollment: &db::GuildEnrollment,
+        mut prepared: PreparedMatch,
+        reason: &str,
+    ) -> Dispatch {
+        let (guild_id, user_id) = (self.event.guild, self.event.user.id);
+        let mut removals = RoleRemovals::default();
+        let selection_matches = |rule: &RuleDef| {
+            removal_role_ids(guild_id.get(), rule).as_ref() == Some(&prepared.removal_roles)
+        };
+        if prepared.dry_run {
+            return Dispatch::DryRun {
+                remove_roles: !prepared.removal_roles.is_empty()
+                    && selection_matches(&prepared.rule),
+            };
+        }
+        for id in &prepared.removal_roles {
+            if !selection_matches(&prepared.rule) {
+                break;
+            }
+            let id = RoleId::new(*id);
+            if !prepared.member.roles.contains(&id)
+                || !prepared
+                    .guild
+                    .roles
+                    .get(&id)
+                    .is_some_and(|role| !role.managed)
+            {
+                continue;
+            }
+            if !prepared
+                .bot
+                .as_ref()
+                .is_some_and(|bot| can_remove_roles(&prepared.guild, bot, &prepared.member))
+            {
+                removals.unconfirmed += 1;
+                continue;
+            }
+            let result = tokio::time::timeout(
+                DISCORD_REST_TIMEOUT,
+                self.http
+                    .remove_member_role(guild_id, user_id, id, Some(reason)),
+            )
+            .await;
+            if matches!(result, Ok(Ok(()))) {
+                removals.confirmed += 1;
+            } else {
+                removals.unconfirmed += 1;
+            }
+
+            // The add/remove-role endpoint can race with a new stay, exemption,
+            // or configuration. Revalidate before the next removal or kick.
+            let Some((guild, member, rule)) = self.recheck(enrollment).await else {
+                return Dispatch::KickSkipped(removals);
+            };
+            prepared.guild = guild;
+            prepared.member = member;
+            prepared.rule = rule;
+        }
+
+        let started_at_ms = Timestamp::now().timestamp_millis();
+        let error =
+            kick_with_recovery(self.app, self.http, guild_id, &prepared.member, reason).await;
+        Dispatch::Kick {
+            started_at_ms,
+            error,
+            role_exemptions: prepared.rule.whitelist_roles,
+            removals,
+        }
+    }
+
+    async fn recheck(
+        &self,
+        enrollment: &db::GuildEnrollment,
+    ) -> Option<(PartialGuild, Member, RuleDef)> {
+        let guild_id = self.event.guild;
+        let (guild, member) = tokio::time::timeout(DISCORD_REST_TIMEOUT, async {
+            tokio::try_join!(
+                self.http.get_guild(guild_id),
+                self.http.get_member(guild_id, self.event.user.id),
+            )
+        })
+        .await
+        .ok()?
+        .ok()?;
+        let mut dry_run = false;
+        let rule = refresh_rule(self.app, enrollment, self.matched, &mut dry_run).await?;
+        (!dry_run
+            && self.member_admits(&guild, &member, &rule, false)
+            && self
+                .claim
+                .dispatched_roles_admit(|roles| self.roles_admit(&guild, &rule, roles)))
+        .then_some((guild, member, rule))
+    }
+
+    fn roles_admit(&self, guild: &PartialGuild, rule: &RuleDef, assigned: &[RoleId]) -> bool {
+        let user = self.event.user.id.get();
         let roles: Vec<_> = assigned.iter().map(|role| role.get()).collect();
-        let effective = roles.iter().copied().chain([guild_id.get()]);
-        assigned.contains(&role)
+        let effective = roles.iter().copied().chain([guild.id.get()]);
+        assigned.contains(&self.role)
             && !effective
                 .clone()
                 .any(|role| !guild.roles.contains_key(&RoleId::new(role)))
-            && permission_level(app.cfg.bot.owner_id, &guild.roles, user_id.get(), effective)
+            && permission_level(self.app.cfg.bot.owner_id, &guild.roles, user, effective)
                 < PermLevel::Mod
-            && !jmodguard::custom_rules::rule_scope_skips(
-                &rule,
-                user_id.get(),
-                0,
-                &roles,
-                false,
-                false,
-            )
-    };
-    let cached_contradicts = cache.guild(guild_id).is_some_and(|cached| {
-        let staff = |assigned: &[RoleId]| {
-            let roles = assigned
-                .iter()
-                .map(|role| role.get())
-                .chain([guild_id.get()]);
-            permission_level(app.cfg.bot.owner_id, &cached.roles, user_id.get(), roles)
-                >= PermLevel::Mod
-        };
-        cached.owner_id == user_id
-            || staff(event.roles)
-            || staff(&member.roles)
-            || cached.members.get(&user_id).is_some_and(|cached_member| {
-                cached_member.joined_at != Some(joined_at)
-                    || !roles_admit(&cached_member.roles)
-                    || staff(&cached_member.roles)
-            })
-    });
-    if member.user.id != user_id
-        || member.joined_at != Some(joined_at)
-        || !roles_admit(event.roles)
-        || !roles_admit(&member.roles)
-        || cached_contradicts
-        || !app.activation.may_record()
-        || (!dry_run && automod_member_blocked(app, guild_id.get(), user_id.get(), "kick"))
-        || !claim.complete(dry_run, roles_admit)
-    {
-        return None;
+            && !jmodguard::custom_rules::rule_scope_skips(rule, user, 0, &roles, false, false)
     }
-    Some((member, dry_run, rule.whitelist_roles))
+
+    fn member_admits(
+        &self,
+        guild: &PartialGuild,
+        member: &Member,
+        rule: &RuleDef,
+        dry_run: bool,
+    ) -> bool {
+        let (guild_id, user_id) = (self.event.guild, self.event.user.id);
+        let joined_at = self.event.joined_at;
+        let cached_contradicts = self.cache.guild(guild_id).is_some_and(|cached| {
+            let staff = |assigned: &[RoleId]| {
+                let roles = assigned
+                    .iter()
+                    .map(|role| role.get())
+                    .chain([guild_id.get()]);
+                permission_level(
+                    self.app.cfg.bot.owner_id,
+                    &cached.roles,
+                    user_id.get(),
+                    roles,
+                ) >= PermLevel::Mod
+            };
+            cached.owner_id == user_id
+                || staff(self.event.roles)
+                || staff(&member.roles)
+                || cached.members.get(&user_id).is_some_and(|cached_member| {
+                    cached_member.joined_at != Some(joined_at)
+                        || !self.roles_admit(guild, rule, &cached_member.roles)
+                        || staff(&cached_member.roles)
+                })
+        });
+        guild.owner_id != user_id
+            && member.user.id == user_id
+            && member.joined_at == Some(joined_at)
+            && self.roles_admit(guild, rule, self.event.roles)
+            && self.roles_admit(guild, rule, &member.roles)
+            && !cached_contradicts
+            && self.app.activation.may_record()
+            && (dry_run || !automod_member_blocked(self.app, guild_id.get(), user_id.get(), "kick"))
+    }
+}
+
+fn can_remove_roles(guild: &PartialGuild, bot: &Member, member: &Member) -> bool {
+    if bot.user.id == member.user.id
+        || !guild
+            .member_permissions(bot)
+            .contains(Permissions::MANAGE_ROLES | Permissions::KICK_MEMBERS)
+        || bot.roles.iter().any(|id| !guild.roles.contains_key(id))
+    {
+        return false;
+    }
+    let top = bot.roles.iter().filter_map(|id| guild.roles.get(id)).max();
+    top.is_some_and(|top| {
+        member
+            .roles
+            .iter()
+            .all(|id| guild.roles.get(id).is_some_and(|role| role < top))
+    })
 }

@@ -7978,6 +7978,7 @@ test('built-in onboarding trap starts off, warns on unsafe setup, and saves a gu
   const calls = [];
   const id = 'onboarding_bot_trap';
   const roleId = '22';
+  const removableId = String((1n << 60n) + 7n);
   const reason = '[Automod] Kicked for suspected bot (onboarding)';
   const record = {
     rule_id: id,
@@ -7992,7 +7993,11 @@ test('built-in onboarding trap starts off, warns on unsafe setup, and saves a gu
   const original = record.effective;
   const h = harness(async (url, options) => {
     if (url.endsWith('/server-names')) return response({
-      roles: [{ id: roleId, name: 'Anti-bot', managed: false }],
+      roles: [
+        { id: roleId, name: 'Anti-bot', managed: false },
+        { id: removableId, name: 'Newcomer', managed: false },
+        { id: '24', name: 'Managed', managed: true },
+      ],
       channels: [],
       onboarding_trap: { bot_can_kick: false, roles_at_or_above_bot: [roleId], roles_with_grants: [roleId], roles_with_member_grants: [roleId] },
     });
@@ -8031,6 +8036,10 @@ test('built-in onboarding trap starts off, warns on unsafe setup, and saves a gu
   assert.match(textOf(modal), /individual channel permission grant/);
   await typeValue(pickerLabelled(modal, 'Join window (minutes)'), '0');
   await typeValue(pickerLabelled(modal, 'Recent-message cleanup (minutes)'), '25');
+  const removeRoles = pickerLabelled(modal, 'Roles to remove before kicking');
+  assert.ok(removeRoles);
+  assert.deepEqual([...removeRoles.options].map(option => option.value).filter(Boolean), [removableId]);
+  await chooseOption(removeRoles, '@Newcomer');
   await save(modal);
   assert.equal(calls.length, 1);
   assert.equal(calls[0].scope, 'guild');
@@ -8038,7 +8047,7 @@ test('built-in onboarding trap starts off, warns on unsafe setup, and saves a gu
   assert.equal(calls[0].data.enabled, true);
   assert.equal(calls[0].data.dry_run, true);
   assert.equal(calls[0].data.skip_moderators, true);
-  assert.deepEqual(calls[0].data.params, { role_id: roleId, join_window_minutes: 0, cleanup_window_minutes: 25 });
+  assert.deepEqual(calls[0].data.params, { role_id: roleId, join_window_minutes: 0, cleanup_window_minutes: 25, remove_role_ids: [removableId] });
   assert.deepEqual(calls[0].data.actions, [{ at: 1, action: 'kick', reason }]);
   await settle();
   assert.match(textOf(card), /lacks Kick Members/);
@@ -8046,6 +8055,7 @@ test('built-in onboarding trap starts off, warns on unsafe setup, and saves a gu
 
   modal = await edit();
   assert.equal(pickerLabelled(modal, 'Recent-message cleanup (minutes)').value, '25');
+  await fire(pickerByName(modal, 'Remove @Newcomer'), 'click');
   await typeValue(pickerLabelled(modal, 'Recent-message cleanup (minutes)'), '0');
   await fire(pickerByName(modal, 'Remove @Anti-bot'), 'click');
   assert.equal(pickerLabelled(modal, 'Enabled').disabled, true);
@@ -8053,6 +8063,7 @@ test('built-in onboarding trap starts off, warns on unsafe setup, and saves a gu
   assert.equal(calls[1].data.enabled, false);
   assert.equal(calls[1].data.params.role_id, null);
   assert.equal(calls[1].data.params.cleanup_window_minutes, 0);
+  assert.deepEqual(calls[1].data.params.remove_role_ids, []);
   assert.deepEqual(calls[1].expected, calls[0].data);
 });
 

@@ -1131,10 +1131,13 @@ fn prepare_copied_rules(dst: i64, rows: Vec<(String, RuleDef)>) -> Result<Vec<(S
     for (id, mut rule) in rows {
         crate::image_spam::validate_rule(&id, &rule)?;
         if id == crate::onboarding_trap::RULE_ID {
-            // The role belongs to the source server and must be picked again.
+            // These roles belong to the source server and must be picked again.
             rule.enabled = false;
             if let Some(role) = rule.params.get_mut("role_id") {
                 *role = serde_json::Value::Null;
+            }
+            if let Some(params) = rule.params.as_object_mut() {
+                params.remove("remove_role_ids");
             }
             crate::onboarding_trap::validate(dst, &rule)?;
         }
