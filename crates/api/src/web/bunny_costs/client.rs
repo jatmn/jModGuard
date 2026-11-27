@@ -106,10 +106,9 @@ impl Client {
                 ],
             )
             .await?;
-        // Bunny's chart schema describes numeric values without raw units:
-        // https://bunny.net/docs/api-reference/magic-containers/applications/get-application-statistics-charts.md
-        // Model CPU as average cores, RAM and provisioned volume as bytes,
-        // and traffic as bytes transferred per bucket. The mock pins this model.
+        // The published chart schema leaves sample units and bucket reducers
+        // unspecified. The estimate models average cores, average RAM bytes,
+        // traffic bytes per bucket, and provisioned volume bytes for the bucket.
         let hours = if hourly { 1.0 } else { 24.0 };
         let month_hours = window.month_days() * 24.0;
         for series in charts.cpu.into_values() {

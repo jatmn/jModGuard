@@ -47,6 +47,7 @@ struct MockData {
     status: Option<StatusCode>,
     delay: Duration,
     requests: Vec<Uri>,
+    charts: Option<Value>,
     traffic: Option<Value>,
     storage: Option<BTreeMap<NaiveDate, u64>>,
 }
@@ -88,12 +89,13 @@ async fn mock_reply(
     headers: HeaderMap,
 ) -> Response {
     assert_eq!(headers.get("accesskey").unwrap(), KEY);
-    let (status, delay, traffic, storage) = {
+    let (status, delay, charts, traffic, storage) = {
         let mut state = state.lock().unwrap();
         state.requests.push(uri.clone());
         (
             state.status,
             state.delay,
+            state.charts.clone(),
             state.traffic.clone(),
             state.storage.clone(),
         )
@@ -107,7 +109,7 @@ async fn mock_reply(
         path if path == format!("/mc/apps/{MC}/summary") => {
             json!({"monthlyCost": 2.50, "unused": KEY, "unusedId": MC})
         }
-        path if path == format!("/mc/apps/{MC}/statistics/charts") => json!({
+        path if path == format!("/mc/apps/{MC}/statistics/charts") => charts.unwrap_or_else(|| json!({
             "cpuUsageSplitChart": {"placeholder-pod": {"chart": {date: 0.5}}},
             "ramUsageSplitChart": {"placeholder-pod": {"chart": {date: 67_108_865}}},
             "trafficSplitChart": traffic.unwrap_or_else(|| json!({
@@ -115,7 +117,7 @@ async fn mock_reply(
             })),
             "volumesSplitCapacityChart": {"placeholder-volume": {"chart": {date: 1_000_000_000}}},
             "releases": [{"secret": KEY}],
-        }),
+        })),
         path if [CORE, GUILD]
             .iter()
             .any(|id| path == format!("/database/v2/databases/{id}/statistics")) =>
@@ -249,7 +251,48 @@ async fn allowed_routes_keep_identifier_case_and_send_required_query_windows() {
 }
 
 #[tokio::test]
-async fn magic_container_mock_pins_chart_units_and_regional_egress() {
+async fn magic_container_hourly_fixture_prices_closed_samples() {
+    let mock = Mock::start().await;
+    let charts = include_str!("fixtures/magic_containers_hourly.json");
+    mock.state.lock().unwrap().charts = Some(serde_json::from_str(charts).unwrap());
+    let client = mock.client(Duration::from_secs(2));
+    let cfg = config();
+    let observed = Utc.with_ymd_and_hms(2026, 11, 1, 3, 30, 0).unwrap();
+    let month = observed.date_naive();
+    let window = Window {
+        month,
+        from: midnight(month),
+        to: observed,
+    };
+    let data = collect(&client, &cfg.sources[0], window, false)
+        .await
+        .unwrap();
+    assert_eq!(data.days.len(), 1);
+    let costs = data.days[&month];
+
+    // Under the estimate model, the three closed hours add up to
+    // (0.025 + 0.05 + 0.005) core-hours * $0.02 = $0.0016.
+    // RAM has 56 MiB (one block), 96 MiB (two blocks), then a missing point.
+    // The two recorded RAM points cost 3 * $0.0003125 = $0.0009375.
+    // Traffic costs (2 + 3 + 1) MB / 1000 * $0.01 = $0.00006.
+    // One allocated GB over three hours costs $0.10 * 3 / (30 * 24).
+    // The 03:00 points belong to the open hour and contribute no cost.
+    for (component, actual, expected) in [
+        ("CPU", costs.cpu, 0.0016),
+        ("RAM", costs.ram, 0.0009375),
+        ("egress", costs.egress, 0.00006),
+        ("volume", costs.volume, 0.10 * 3.0 / 720.0),
+    ] {
+        assert!(
+            (actual - expected).abs() < 1e-12,
+            "{component}: {actual} != {expected}"
+        );
+    }
+    assert_eq!(data.projection, Some(2.50));
+}
+
+#[tokio::test]
+async fn magic_container_estimates_apply_regional_egress_rates() {
     let mock = Mock::start().await;
     let client = mock.client(Duration::from_secs(2));
     let cfg = config();

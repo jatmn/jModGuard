@@ -14393,6 +14393,11 @@ test('Bot Resources hides Bunny costs without config and renders partial provide
   const panel = section();
   assert.ok(panel);
   assert.match(textOf(panel), /2026-11 \(UTC\)/);
+  assert.match(textOf(panel), /Bunny supplies the Magic Containers projection/);
+  assert.match(textOf(panel), /chart estimates.*sample units and bucket aggregation/);
+  assert.match(textOf(panel), /Month-to-date estimate \(USD\)/);
+  assert.match(textOf(panel), /Estimated costs/);
+  assert.ok(panel.querySelector('[aria-label="Magic Containers month-to-date estimate components"]'));
   assert.match(textOf(panel), /Magic Containers\$2.25\$4.75/);
   assert.match(textOf(panel), /Database \(1 database\)Not available/);
   assert.match(textOf(panel), /Storage<\$0.01 \(partial\)\$0.01.*last successful figures shown/);

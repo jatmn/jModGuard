@@ -86,13 +86,26 @@ does not trim or change ID case. The Bunny panel appears only when the API can
 start a collector for at least one valid key-and-ID pair. Scoped keys cannot
 read CDN statistics.
 
-All figures are estimates in USD on a UTC calendar month. Magic Containers uses
-Bunny's projected `monthlyCost` and estimates accrued costs from charted
+Costs use UTC calendar months and USD. The Magic Containers projection uses
+Bunny's app-summary `monthlyCost`. The summary schema leaves its accrual
+window unspecified. The month-to-date estimate, components, and historical
+cost estimates use a chart model for
 CPU, RAM, traffic, and allocated volume capacity. The [chart response schema](https://bunny.net/docs/api-reference/magic-containers/applications/get-application-statistics-charts.md)
-specifies numeric samples without units. The model assumes bytes for memory,
-volume capacity and per-bucket traffic, and average cores for CPU. The estimate
-applies 64 MiB RAM blocks to each pod's charted usage and uses daily averages
-for older buckets. Bunny's billed overhead and other charges can differ.
+defines numeric samples. Monitoring documents hourly and daily chart points
+and period summaries. The raw sample units, bucket reducers, timestamp
+alignment, and partial-bucket rules remain unspecified.
+
+| Chart field | Published chart scope | Estimate assumption |
+| --- | --- | --- |
+| `cpuUsageSplitChart` | CPU usage per pod | Average cores over the bucket |
+| `ramUsageSplitChart` | Memory usage per pod | Average bytes over the bucket, rounded into 64 MiB blocks |
+| `trafficSplitChart` | Traffic served per pod and region | Transferred egress bytes summed within each bucket |
+| `volumesSplitCapacityChart` | Allocated capacity per volume instance | Provisioned bytes applied for the bucket's duration |
+
+Missing values can leave gaps in these estimates. Bunny's billed RAM
+includes variable system overhead, and traffic billing covers egress
+outside the CDN. The chart schema leaves billing-specific traffic filters
+unspecified.
 See [Magic Containers pricing](https://bunny.net/docs/magic-containers/pricing)
 and [monitoring](https://bunny.net/docs/magic-containers/monitoring).
 

@@ -1789,7 +1789,7 @@ function BunnyCostHistory({ history }) {
       : h("div", { className: "table-scroll rounded-box", tabIndex: 0, role: "region", "aria-labelledby": "resources-bunny-history" },
         h("table", { className: "table table-sm" },
           h("thead", null, h("tr", null,
-            ...["Month", "Recorded costs", ...services.map(([, label]) => label)].map((label) =>
+            ...["Month", "Estimated costs", ...services.map(([, label]) => label)].map((label) =>
               h("th", { key: label, scope: "col" }, label)),
           )),
           h("tbody", null, ...history.map((month) => {
@@ -1820,12 +1820,12 @@ function BunnyCostPanel({ provider }) {
   const breakdown = provider.magic_breakdown;
   return analyticsPanel("Bunny cost estimates", "resources-bunny-costs", h("div", null,
     h("p", { className: "an-note muted" },
-      `${provider.month} (UTC). The Magic Containers projection comes from Bunny and includes overhead and traffic. Usage estimates use list prices and may have gaps.`,
+      `${provider.month} (UTC). Bunny supplies the Magic Containers projection. Magic Containers month-to-date costs, components, and history are chart estimates. The published chart schema leaves sample units and bucket aggregation unspecified, and the estimates may have gaps.`,
     ),
     h("div", { className: "table-scroll rounded-box", tabIndex: 0, role: "region", "aria-label": "Current Bunny costs" },
       h("table", { className: "table table-sm" },
         h("thead", null, h("tr", null,
-          ...["Service", "Month to date (USD)", "Projected month (USD)", "Last updated"].map((label) =>
+          ...["Service", "Month-to-date estimate (USD)", "Projected month (USD)", "Last updated"].map((label) =>
             h("th", { key: label, scope: "col" }, label)),
         )),
         h("tbody", null, ...BUNNY_COST_SERVICES.map(([key, label]) => {
@@ -1846,7 +1846,7 @@ function BunnyCostPanel({ provider }) {
         })),
       ),
     ),
-    breakdown && h("dl", { className: "du-facts", "aria-label": "Magic Containers month-to-date components" },
+    breakdown && h("dl", { className: "du-facts", "aria-label": "Magic Containers month-to-date estimate components" },
       ...[["CPU", "cpu"], ["RAM", "ram"], ["Egress", "egress"], ["Volumes", "volume"]].map(([label, key]) =>
         h("div", { key }, h("dt", null, label), h("dd", null, key === "egress" && breakdown[key] == null ? "Unknown regional rate" : bunnyUsd(breakdown[key]))),
       ),
