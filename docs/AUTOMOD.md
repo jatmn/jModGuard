@@ -239,10 +239,14 @@ delete, timeout, or warn. A pending action carries the dry-run setting from
 when the rule matched. Known spam requires the current rule and list before an
 action can proceed. Message deletion requires a current, enabled rule in live
 mode. This includes fallback deletes and tracked messages from a ban purge.
-Disabling a rule stops deletes that reach this check while it is disabled.
-Discord can still complete a request already dispatched. Re-enabling a rule
-allows new matches. For other built-in actions, a failed configuration read
-uses the match-time settings and exemptions, and prevents kicks and bans.
+For generic rules, the saved actions must also match the plan that selected
+the pending delete or purge. The bot skips a pending delete when the rule is
+disabled at the pre-dispatch check. Dispatch is the handoff to the Discord
+client. The client can wait on a rate limit before sending the first HTTP
+request, so a dispatched delete can first reach Discord or complete after the
+rule is disabled. Re-enabling a rule allows new matches. For other built-in
+actions, a failed configuration read uses the match-time settings and
+exemptions, and prevents kicks and bans.
 Whitelist your announcement channels and your mod/admin roles so @everyone pings
 in them never trigger.
 

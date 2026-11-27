@@ -1417,6 +1417,15 @@ async fn delete_rule_is_current(
     if let Some(preset) = preset {
         return preset.is_current(app);
     }
+    // The pending action came from the match. An edit before the first read
+    // can otherwise make both config reads agree on a different action plan.
+    if pending
+        .matched_rule
+        .as_ref()
+        .is_none_or(|matched| matched.actions != checked_rule.actions)
+    {
+        return false;
+    }
     recheck_live_rule(app, guild, &pending.rule_id, checked_rule, |cfg| {
         pending.rule_id != "known_spam"
             || cfg
@@ -5198,6 +5207,102 @@ mod tests {
                 crate::tenant::remove_sidecars(&path);
             }
         }
+    }
+
+    #[tokio::test]
+    async fn pending_destructive_action_stops_on_delete_to_log_edit_before_dispatch() {
+        pending_destructive_action_after_plan_edit("delete", "log", &[]).await;
+    }
+
+    #[tokio::test]
+    async fn pending_destructive_action_stops_on_purge_removal_before_dispatch() {
+        pending_destructive_action_after_plan_edit(
+            "ban",
+            "ban",
+            &["GET /api/v10/guilds/10/bans/99"],
+        )
+        .await;
+    }
+
+    async fn pending_destructive_action_after_plan_edit(
+        matched_action: &str,
+        saved_action: &str,
+        expected_requests: &[&str],
+    ) {
+        use serenity::all::{GuildId, User, UserId};
+        use std::sync::{Arc, atomic::AtomicBool};
+
+        const RULE: &str = "custom:0123456789abcdef";
+        let db_path = std::env::temp_dir().join(format!(
+            "stale_delete_plan_{:032x}.db",
+            rand::random::<u128>()
+        ));
+        let app = BotState::new(
+            Default::default(),
+            crate::db::Db::open(&db_path, 2).unwrap(),
+        )
+        .unwrap();
+        assert!(
+            crate::db::claim_active_bot(
+                &app.db,
+                app.activation.instance(),
+                jmodguard::control::now_ms(),
+                Arc::new(AtomicBool::new(false)),
+            )
+            .await
+            .unwrap()
+        );
+        app.activation.mark_lock_held(true);
+        let enrollment = crate::db::enroll_guild(&app.db, 10, 100)
+            .await
+            .unwrap()
+            .unwrap();
+        app.tenant.activate(enrollment).await.unwrap();
+
+        let mut rule = dry_run_word_ban();
+        rule.dry_run = false;
+        rule.log_automod = false;
+        rule.actions[0].action = matched_action.into();
+        rule.actions[0].purge_last_hour = matched_action == "ban";
+        crate::db::upsert_rule(&app.db, 10, RULE, &rule)
+            .await
+            .unwrap();
+        let cfg = app.configs.get(&app.db, 10).await.unwrap();
+        let pending = app.automod.evaluate(&cfg, &word_message(&[])).unwrap();
+        assert_eq!(pending.rule_id, RULE);
+        assert_eq!(pending.action.action, matched_action);
+        assert_eq!(
+            pending.action.ban_delete_message_seconds(),
+            if matched_action == "ban" { 3600 } else { 0 }
+        );
+
+        rule.actions[0].action = saved_action.into();
+        rule.actions[0].purge_last_hour = false;
+        crate::db::upsert_rule(&app.db, 10, RULE, &rule)
+            .await
+            .unwrap();
+
+        let stub = DiscordStub::start();
+        let mut user = User::default();
+        user.id = UserId::new(99);
+        execute_pending_with(
+            &app,
+            &stub.http,
+            &stub.cache,
+            GuildId::new(10),
+            &user,
+            None,
+            "member",
+            Some(42),
+            Some(70),
+            &pending,
+        )
+        .await;
+        let seen = stub.finish();
+        drop(app);
+        let _ = std::fs::remove_file(&db_path);
+        crate::tenant::remove_sidecars(&db_path);
+        assert_eq!(seen, expected_requests);
     }
 
     #[tokio::test]
