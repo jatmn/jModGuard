@@ -4067,6 +4067,7 @@ mod tests {
         Expire,
         OwnDeleteEcho,
         ExternalDeleteDuringRequest,
+        UnknownMessageWithoutEcho,
         OwnEchoAndExternalDelete,
         OwnEchoAndExternalBulkDelete,
         OwnEchoAndRemoveHash,
@@ -4396,9 +4397,20 @@ mod tests {
                                     .push(serde_json::from_str::<serde_json::Value>(body).unwrap());
                             }
                         }
-                        let status = (method == "DELETE"
-                            && matches!(change, DispatchChange::ExternalDeleteDuringRequest))
-                        .then_some(("404 Not Found", ""));
+                        let status = match change {
+                            DispatchChange::ExternalDeleteDuringRequest if method == "DELETE" => {
+                                Some(("404 Not Found", ""))
+                            }
+                            DispatchChange::UnknownMessageWithoutEcho
+                                if method == trigger.0 && path.ends_with(&trigger.1) =>
+                            {
+                                Some((
+                                    "404 Not Found",
+                                    r#"{"code":10008,"message":"Unknown Message"}"#,
+                                ))
+                            }
+                            _ => None,
+                        };
                         use serenity::client::EventHandler;
                         use serenity::model::id::{ChannelId, MessageId};
                         let handler = crate::handlers::Handler {
@@ -4450,6 +4462,7 @@ mod tests {
                             | DispatchChange::PurgeLastHour
                             | DispatchChange::DryRunPurge
                             | DispatchChange::OwnDeleteEcho
+                            | DispatchChange::UnknownMessageWithoutEcho
                             | DispatchChange::ExternalDeleteDuringRequest => {}
                             DispatchChange::EditRule => {
                                 rule.whitelist_users.push(99);
@@ -4630,6 +4643,10 @@ mod tests {
         );
         if matches!(change, DispatchChange::DryRunPurge) {
             assert!(seen.is_empty(), "{seen:?}");
+        }
+        if matches!(change, DispatchChange::UnknownMessageWithoutEcho) {
+            assert_eq!(app.image_spam.author_of(1, 100, 10), None);
+            assert!(seen.iter().all(|line| !line.contains("/bans/")), "{seen:?}");
         }
 
         if purge {
@@ -4880,6 +4897,21 @@ mod tests {
             0,
         )
         .await;
+    }
+
+    #[tokio::test]
+    async fn image_unknown_message_without_echo_invalidates_proof_and_stops() {
+        for known_bad in [false, true] {
+            image_dispatch_race(
+                known_bad,
+                DispatchChange::UnknownMessageWithoutEcho,
+                "DELETE",
+                "/messages/10",
+                1,
+                0,
+            )
+            .await;
+        }
     }
 
     #[tokio::test]

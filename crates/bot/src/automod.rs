@@ -1473,6 +1473,13 @@ async fn recheck_preset(
     dispatch.is_current(app).then_some(dispatch)
 }
 
+fn custom_text_kind(rule: &RuleDef) -> Option<&str> {
+    match rule.params["kind"].as_str() {
+        Some(kind @ ("pattern" | "word")) => Some(kind),
+        _ => None,
+    }
+}
+
 async fn recheck_message_rule(
     app: &BotState,
     guild: u64,
@@ -1501,15 +1508,16 @@ async fn recheck_message_rule(
                 .as_deref()
                 .is_some_and(|raw| MessageText::new(raw).matches_badword(&cfg.regexes)),
             "known_spam" => pending.known_spam_matches(cfg),
-            id if is_ban && jmodguard::custom_rules::is_custom_id(id) => {
-                let kind = checked_rule.params["kind"].as_str().unwrap_or("");
-                !matches!(kind, "pattern" | "word")
-                    || pending.match_content.as_deref().is_some_and(|raw| {
-                        let text = MessageText::new(raw);
-                        let lowercase = LazyCell::new(|| raw.to_lowercase());
-                        let words = LazyCell::new(|| text.word_forms(&lowercase));
-                        text.matches_custom_text(cfg, id, kind, || &words)
-                    })
+            id if jmodguard::custom_rules::is_custom_id(id) => {
+                let Some(kind) = custom_text_kind(checked_rule) else {
+                    return custom_text_kind(matched).is_none();
+                };
+                pending.match_content.as_deref().is_some_and(|raw| {
+                    let text = MessageText::new(raw);
+                    let lowercase = LazyCell::new(|| raw.to_lowercase());
+                    let words = LazyCell::new(|| text.word_forms(&lowercase));
+                    text.matches_custom_text(cfg, id, kind, || &words)
+                })
             }
             _ => true,
         }
@@ -1837,14 +1845,24 @@ async fn execute_live<'a>(
     } else {
         None
     };
+    let custom_text = jmodguard::custom_rules::is_custom_id(&pending.rule_id)
+        && pending
+            .matched_rule
+            .as_ref()
+            .and_then(custom_text_kind)
+            .is_some();
+    // Ban and reply recheck at their own dispatch boundaries below.
+    if ((rule.action == "delete" && msg_channel.zip(msg_id).is_some())
+        || (custom_text && matches!(rule.action.as_str(), "warn" | "kick" | "timeout")))
+        && (!message_rule_is_current().await || !app.activation.may_record())
+    {
+        return None;
+    }
     let mut publish_report = true;
     let outcome = match rule.action.as_str() {
         "log" => None,
         "delete" => {
             if let (Some(ch), Some(id)) = (msg_channel, msg_id) {
-                if !message_rule_is_current().await || !app.activation.may_record() {
-                    return None;
-                }
                 automod_try_delete_message(
                     app,
                     http,
@@ -5720,6 +5738,91 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn custom_actions_recheck_matchers_before_dispatch() {
+        use serenity::all::{GuildId, Member, UserId};
+        use std::sync::{Arc, atomic::AtomicBool};
+
+        const RULE: &str = "custom:0123456789abcdef";
+        let path = std::env::temp_dir().join(format!(
+            "custom_action_matcher_{:032x}.db",
+            rand::random::<u128>()
+        ));
+        let app =
+            BotState::new(Default::default(), crate::db::Db::open(&path, 2).unwrap()).unwrap();
+        assert!(
+            crate::db::claim_active_bot(
+                &app.db,
+                app.activation.instance(),
+                jmodguard::control::now_ms(),
+                Arc::new(AtomicBool::new(false)),
+            )
+            .await
+            .unwrap()
+        );
+        app.activation.mark_lock_held(true);
+        let guild = GuildId::new(10);
+        let mut member = Member::default();
+        member.guild_id = guild;
+        member.user.id = UserId::new(99);
+        for (action, request) in [
+            ("delete", "DELETE /api/v10/channels/70/messages/42"),
+            ("kick", "DELETE /api/v10/guilds/10/members/99"),
+            ("timeout", "PATCH /api/v10/guilds/10/members/99"),
+        ] {
+            for kind in ["pattern", "word"] {
+                let mut rule = dry_run_word_ban();
+                rule.dry_run = false;
+                rule.log_automod = false;
+                rule.open_case = false;
+                rule.actions[0].action = action.into();
+                if action == "timeout" {
+                    rule.actions[0].duration_minutes = 5;
+                }
+                if kind == "pattern" {
+                    rule.params = serde_json::json!({ "kind": kind, "pattern": "^spamword$" });
+                }
+                crate::db::upsert_rule(&app.db, 10, RULE, &rule)
+                    .await
+                    .unwrap();
+                let cfg = app.configs.get(&app.db, 10).await.unwrap();
+                let pending = AutomodEngine::new()
+                    .evaluate(&cfg, &word_message(&[]))
+                    .unwrap_or_else(|| panic!("{action} with {kind} must match before the edit"));
+                assert_eq!(pending.rule_id, RULE);
+                let stub = DiscordStub::start();
+                let execute = || {
+                    execute_pending_with(
+                        &app,
+                        &stub.http,
+                        &stub.cache,
+                        guild,
+                        &member.user,
+                        Some(member.clone()),
+                        "member",
+                        Some(42),
+                        Some(70),
+                        &pending,
+                    )
+                };
+                execute().await;
+                if kind == "pattern" {
+                    rule.params["pattern"] = "^safe$".into();
+                } else {
+                    rule.params["words"] = serde_json::json!(["safe"]);
+                }
+                crate::db::upsert_rule(&app.db, 10, RULE, &rule)
+                    .await
+                    .unwrap();
+                execute().await;
+                assert_eq!(stub.finish(), [request], "{action} with {kind}");
+            }
+        }
+        drop(app);
+        let _ = std::fs::remove_file(&path);
+        crate::tenant::remove_sidecars(&path);
+    }
+
+    #[tokio::test]
     async fn pending_custom_delete_rechecks_rule_after_wait() {
         use serenity::all::{GuildId, Member, User, UserId};
         use std::sync::{Arc, atomic::AtomicBool};
@@ -6041,7 +6144,11 @@ mod tests {
                     .expect("reply uses the updated expiry");
             }
             let seen = stub.finish();
-            assert_eq!(seen.first(), Some(&format!("DELETE {DELETE}")), "{edit:?}");
+            if edit == TriggerBeforeDispatch {
+                assert!(seen.is_empty(), "{edit:?}: {seen:?}");
+            } else {
+                assert_eq!(seen.first(), Some(&format!("DELETE {DELETE}")), "{edit:?}");
+            }
             let content: Vec<_> = observed
                 .iter()
                 .map(|post| post["content"].as_str())
