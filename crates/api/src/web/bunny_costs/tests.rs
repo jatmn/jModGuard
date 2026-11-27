@@ -282,6 +282,18 @@ async fn magic_container_mock_pins_chart_units_and_regional_egress() {
     close_enough(daily.days[&day].volume, costs.volume * 24.0);
     close_enough(daily.days[&day].egress, costs.egress);
 
+    let mut idle = priced.clone();
+    idle["placeholder-unmapped-idle"] =
+        json!({"region": "placeholder-unpriced", "chart": {date: 0}});
+    idle["placeholder-regionless-idle"] = json!({"chart": {date: 0}});
+    mock.state.lock().unwrap().traffic = Some(idle);
+    for (window, historical) in [(window, false), (historical, true)] {
+        let data = collect(&client, source, window, historical).await.unwrap();
+        assert!(!data.egress_rate_unknown());
+        assert!(data.month_to_date.is_some());
+        close_enough(data.days[&day].egress, costs.egress);
+    }
+
     let mut unpriced = priced;
     unpriced["placeholder-unknown"] =
         json!({"region": "placeholder-unpriced", "chart": {date: 1_000_000_000}});
@@ -417,6 +429,137 @@ impl Drop for DbFile {
     }
 }
 
+#[test]
+fn history_stays_partial_until_each_resource_covers_the_final_day() {
+    let cfg = config();
+    let cache = Cache::default();
+    cache.enable(&cfg);
+    let month = month_start(instant().date_naive());
+    let end = shift_month(month, 1);
+    let last_day = end.pred_opt().unwrap();
+    let late_snapshot = midnight(last_day) + chrono::TimeDelta::hours(12);
+    let after_rollover = midnight(end) + chrono::TimeDelta::hours(2);
+    let after_close_out = midnight(end) + chrono::TimeDelta::hours(6);
+    let completed_day = Cost {
+        complete: true,
+        ..Cost::default()
+    };
+    let mut data = MonthData {
+        days: month
+            .iter_days()
+            .take_while(|day| *day < last_day)
+            .map(|day| (day, completed_day))
+            .collect(),
+        ..MonthData::default()
+    };
+    let mut core_data = data.clone();
+    core_data.days.insert(last_day, completed_day);
+    core_data.summarize(Service::CoreDatabase, month, after_close_out);
+    let closed_core = BunnyCostSnapshot {
+        month,
+        fetched_at: after_close_out.timestamp(),
+        data: core_data,
+    };
+    for final_day in [None, Some(Cost::default()), Some(completed_day)] {
+        let complete = final_day.is_some_and(|cost| cost.complete);
+        let observed = if complete {
+            after_close_out
+        } else {
+            late_snapshot
+        };
+        if let Some(cost) = final_day {
+            data.days.insert(last_day, cost);
+        }
+        data.summarize(Service::GuildDatabase, month, observed);
+        assert!(!data.partial, "the snapshot covers all its elapsed days");
+        let guild = BunnyCostSnapshot {
+            month,
+            fetched_at: observed.timestamp(),
+            data: data.clone(),
+        };
+        let (core, viewed_at) = if final_day.is_none() {
+            (guild.clone(), after_rollover)
+        } else {
+            (closed_core.clone(), after_close_out)
+        };
+        cache.publish(
+            Service::CoreDatabase,
+            &Feed {
+                months: [(month, core)].into(),
+                ..Feed::default()
+            },
+        );
+        cache.publish(
+            Service::GuildDatabase,
+            &Feed {
+                months: [(month, guild)].into(),
+                ..Feed::default()
+            },
+        );
+        let report = cache.view(viewed_at).unwrap();
+        let database = report.history[0].database.as_ref().unwrap();
+        assert_eq!(database.usd, Some(0.0));
+        assert_eq!(database.partial, !complete);
+    }
+}
+
+#[tokio::test]
+async fn merged_snapshot_uses_pricing_status_of_the_selected_day() {
+    let file =
+        DbFile(std::env::temp_dir().join(format!("bunny_costs_{}.db", rand::random::<u64>())));
+    let mut api_cfg = ApiProcessConfig::default();
+    api_cfg.db.path = file.0.clone();
+    let app = ApiState::new(api_cfg, Db::open(&file.0, 2).unwrap()).unwrap();
+    let cfg = config();
+    let source = &cfg.sources[0];
+    let mut feed = Feed::default();
+    let month = month_start(instant().date_naive());
+    let closing = midnight(shift_month(month, 1));
+    let final_day = closing.date_naive().pred_opt().unwrap();
+    let other_day = final_day.pred_opt().unwrap();
+    let priced = Cost {
+        egress: 0.25,
+        complete: true,
+        ..Cost::default()
+    };
+    let unpriced = Cost {
+        egress_rate_unknown: true,
+        ..Cost::default()
+    };
+    let complete_unpriced = Cost {
+        complete: true,
+        ..unpriced
+    };
+
+    for (offset, date, cost, expected) in [
+        (-1, final_day, unpriced, None),
+        (0, final_day, priced, Some(0.25)),
+        (1, final_day, complete_unpriced, Some(0.25)),
+        (2, other_day, complete_unpriced, None),
+        (3, final_day, priced, None),
+    ] {
+        save(
+            &app,
+            source,
+            &mut feed,
+            month,
+            closing.timestamp() + offset,
+            MonthData {
+                days: [(date, cost)].into(),
+                ..MonthData::default()
+            },
+        )
+        .await
+        .unwrap();
+        let stored =
+            db::bunny_cost_snapshots(&app.db, source.service, source.digest(), month, month)
+                .await
+                .unwrap();
+        assert_eq!(stored[0].data.month_to_date, expected, "refresh {offset}");
+        assert_eq!(stored[0].data.egress_rate_unknown(), expected.is_none());
+    }
+}
+
 #[tokio::test]
 async fn close_out_preserves_saved_days_and_retries_gaps_after_restart() {
     let file =
@@ -509,6 +652,8 @@ async fn close_out_preserves_saved_days_and_retries_gaps_after_restart() {
             .unwrap();
     }
 
+    // Older snapshots could be marked closed even with missing days.
+    feed.months.get_mut(&last_month).unwrap().data.closed = true;
     // The response omits the already recorded first and last days.
     let new_day = last_month.succ_opt().unwrap();
     let bytes = 31_000_000_000;

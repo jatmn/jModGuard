@@ -96,8 +96,8 @@ See [Magic Containers pricing](https://bunny.net/docs/magic-containers/pricing)
 and [monitoring](https://bunny.net/docs/magic-containers/monitoring).
 
 Magic Containers traffic uses [Bunny’s published regional rates](https://bunny.net/docs/magic-containers/pricing#network-traffic-usage).
-An unrecognized or unpriced region leaves the chart-derived egress and
-total unavailable. Bunny’s summary projection remains available.
+Positive traffic in a region with an unknown rate leaves the chart-derived
+egress and total unavailable. Bunny’s summary projection remains available.
 Storage uses the single-region Standard rate and Database uses the
 public-preview rate. Estimates exclude the $1 monthly account minimum,
 taxes and credits. Storage projections extrapolate based on the fraction of the month

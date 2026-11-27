@@ -422,9 +422,10 @@ fn historic(feeds: &[&Feed], month: NaiveDate) -> Option<HistoricalCost> {
         .iter()
         .map(|row| row.data.month_to_date)
         .sum::<Option<f64>>();
+    let end = shift_month(month, 1);
     (usd.is_some() || egress_rate_unknown).then(|| HistoricalCost {
         usd,
-        partial: rows.iter().any(|row| row.data.partial),
+        partial: rows.iter().any(|row| !row.data.covers(month, end)),
         egress_rate_unknown,
     })
 }
@@ -510,10 +511,8 @@ async fn backfill(
 ) -> Result<(), Failure> {
     for window in backfill_windows(source.service, now) {
         if feed.months.get(&window.month).is_some_and(|row| {
-            row.data.closed
-                || row
-                    .data
-                    .covers(window.from.date_naive(), window.to.date_naive())
+            row.data
+                .covers(window.from.date_naive(), window.to.date_naive())
         }) {
             continue;
         }

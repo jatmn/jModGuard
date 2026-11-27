@@ -70,13 +70,11 @@ impl BunnyMonthData {
             self.days
                 .entry(date)
                 .and_modify(|day| {
-                    let egress_rate_unknown = saved.egress_rate_unknown || day.egress_rate_unknown;
                     // Keep a collected full day, including its original
                     // hourly detail, when a later rollup revisits that date.
                     if saved.complete {
                         *day = saved;
                     }
-                    day.egress_rate_unknown = egress_rate_unknown;
                 })
                 .or_insert(saved);
         }

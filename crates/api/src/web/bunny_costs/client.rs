@@ -135,7 +135,7 @@ impl Client {
                     let cost = days.entry(day).or_default();
                     if let Some(rate) = rate {
                         cost.egress += bytes / GB * rate;
-                    } else {
+                    } else if bytes > 0.0 {
                         cost.egress_rate_unknown = true;
                     }
                 }
