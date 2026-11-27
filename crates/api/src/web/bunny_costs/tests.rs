@@ -970,6 +970,111 @@ async fn merged_snapshot_uses_pricing_status_of_the_selected_day() {
 }
 
 #[tokio::test]
+async fn magic_close_out_and_backfill_preserve_completed_usage_days() {
+    let file =
+        DbFile(std::env::temp_dir().join(format!("bunny_costs_{}.db", rand::random::<u64>())));
+    let mut api_cfg = ApiProcessConfig::default();
+    api_cfg.db.path = file.0.clone();
+    let app = ApiState::new(api_cfg, Db::open(&file.0, 2).unwrap()).unwrap();
+    let cfg = config();
+    let source = &cfg.sources[0];
+    let mut feed = Feed::default();
+    let month = month_start(instant().date_naive());
+    let provisional_day = month.succ_opt().unwrap();
+    let closing = midnight(shift_month(month, 1));
+    let saved = Cost {
+        hourly_cpu_cost: Some(0.03125),
+        ram: 0.125,
+        egress: 0.0625,
+        complete: true,
+        ..Cost::default()
+    };
+    let current = MonthData {
+        days: [(month, saved), (provisional_day, saved)].into(),
+        magic_cpu_from_current_hours: true,
+        ..MonthData::default()
+    };
+    save(
+        &app,
+        source,
+        &mut feed,
+        month,
+        instant().timestamp(),
+        current,
+    )
+    .await
+    .unwrap();
+
+    // Close-out omits the first day and reports the second as provisional.
+    let close_out = MonthData {
+        days: [(
+            provisional_day,
+            Cost {
+                ram: 0.03125,
+                ..Cost::default()
+            },
+        )]
+        .into(),
+        magic_cpu_from_current_hours: true,
+        ..MonthData::default()
+    };
+    save(
+        &app,
+        source,
+        &mut feed,
+        month,
+        closing.timestamp(),
+        close_out,
+    )
+    .await
+    .unwrap();
+    let closed = feed.months[&month].data.clone();
+
+    // A later daily chart covers both dates, with lower RAM and no egress.
+    let mock = Mock::start().await;
+    mock.state.lock().unwrap().charts = Some(json!({
+        "ramUsageSplitChart": {"placeholder-pod": {"chart": {
+            (midnight(month).to_rfc3339()): 67_108_864,
+            (midnight(provisional_day).to_rfc3339()): 67_108_864
+        }}},
+        "trafficSplitChart": {}
+    }));
+    let client = mock.client(Duration::from_secs(2));
+    let window = Window {
+        month,
+        from: midnight(month),
+        to: closing,
+    };
+    let retry = collect(&client, source, window, true).await.unwrap();
+    for date in [month, provisional_day] {
+        assert!(retry.days[&date].complete);
+        assert!(retry.days[&date].ram < saved.ram);
+        assert_eq!(retry.days[&date].egress, 0.0);
+    }
+    save(
+        &app,
+        source,
+        &mut feed,
+        month,
+        closing.timestamp() + 1,
+        retry,
+    )
+    .await
+    .unwrap();
+    let stored = db::bunny_cost_snapshots(&app.db, source.service, source.digest(), month, month)
+        .await
+        .unwrap();
+    let usage = |data: &MonthData| {
+        [month, provisional_day].map(|date| {
+            let day = data.days[&date];
+            (day.complete, day.ram, day.egress, day.hourly_cpu_cost)
+        })
+    };
+    let expected = [(true, saved.ram, saved.egress, saved.hourly_cpu_cost); 2];
+    assert_eq!([usage(&closed), usage(&stored[0].data)], [expected; 2]);
+}
+
+#[tokio::test]
 async fn close_out_preserves_saved_days_and_retries_gaps_after_restart() {
     let file =
         DbFile(std::env::temp_dir().join(format!("bunny_costs_{}.db", rand::random::<u64>())));

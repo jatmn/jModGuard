@@ -107,13 +107,16 @@ impl BunnyMonthData {
     }
 
     fn merge_days(&mut self, previous: CostDays, close_out_current: bool) {
-        for (date, saved) in previous {
+        for (date, mut saved) in previous {
+            // CPU-only days still need a daily observation at close-out.
+            if close_out_current && saved.has_only_hourly_cpu() {
+                saved.complete = false;
+            }
             self.days
                 .entry(date)
                 .and_modify(|day| {
                     // Keep recorded rates and amounts from complete days.
-                    // At close-out only a daily observation confirms coverage.
-                    if saved.complete && !(close_out_current && saved.has_only_hourly_cpu()) {
+                    if saved.complete {
                         let hourly_cpu_cost = if day.complete {
                             saved.hourly_cpu_cost.or(day.hourly_cpu_cost)
                         } else {
@@ -121,7 +124,6 @@ impl BunnyMonthData {
                         };
                         *day = BunnyDayCost {
                             hourly_cpu_cost,
-                            complete: !close_out_current || day.complete,
                             ..saved
                         };
                     } else {
@@ -130,10 +132,7 @@ impl BunnyMonthData {
                         day.hourly_cpu_cost = day.hourly_cpu_cost.or(saved.hourly_cpu_cost);
                     }
                 })
-                .or_insert_with(|| BunnyDayCost {
-                    complete: saved.complete && !close_out_current,
-                    ..saved
-                });
+                .or_insert(saved);
         }
     }
 
