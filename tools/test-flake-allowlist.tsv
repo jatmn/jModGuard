@@ -236,8 +236,6 @@ sleep	crates/bot/tests/launcher_revision.rs	standalone_bot_without_launcher_mark
 clock	crates/integration-tests/tests/dual_process_smoke.rs	smoke_bot_and_api_executables_share_sqlite	1	#666
 clock	crates/runtime/src/cgroup.rs	cgroup::tests::first_cpu_sample_is_not_a_percentage	1	#666
 clock	crates/runtime/src/cgroup.rs	cgroup::tests::latest_sample_does_not_wait_and_starts_unavailable	1	#666
-clock	crates/updater/src/main.rs	tests::instant_launcher_errors_stop_before_the_deadline_with_the_last_error	2	#666
-sleep	crates/updater/src/main.rs	tests::launcher_reclaims_an_already_expired_window_without_waiting_for_a_tick	1	#666
 clock	crates/updater/src/main.rs	tests::launcher_rejects_ready_late_reply	1	#666
 sleep	crates/updater/src/main.rs	tests::launcher_rejects_ready_late_reply	1	#666
 clock	crates/updater/src/main.rs	tests::slow_launcher_error_retries_and_extends_the_fence	1	#666

@@ -317,22 +317,24 @@ where
     F: FnMut() -> Fut + Send,
     Fut: std::future::Future<Output = Result<bool>> + Send,
 {
+    let deadline = tokio::time::Instant::from_std(deadline);
     let mut backoff = Duration::from_millis(250);
     loop {
-        let requested_at = Instant::now();
+        let requested_at = tokio::time::Instant::now();
         let window = deadline.saturating_duration_since(requested_at);
         ensure!(!window.is_zero(), "launcher fence authority window expired");
-        let result = tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), renew())
+        let result = tokio::time::timeout_at(deadline, renew())
             .await
             .context("launcher fence renewal timed out")?;
         ensure!(
-            Instant::now() < deadline,
+            tokio::time::Instant::now() < deadline,
             "launcher fence renewal completed too late"
         );
         match result {
             Err(error)
                 if !db::is_database_operation_timeout(&error)
-                    && deadline.saturating_duration_since(Instant::now()) > backoff =>
+                    && deadline.saturating_duration_since(tokio::time::Instant::now())
+                        > backoff =>
             {
                 tokio::time::sleep(backoff).await;
                 backoff = backoff.saturating_mul(2).min(Duration::from_secs(1));
@@ -370,7 +372,7 @@ where
             } => {}
         }
         let result = match control.launcher_fence_deadline() {
-            Some(deadline) if Instant::now() < deadline => {
+            Some(deadline) if tokio::time::Instant::now().into_std() < deadline => {
                 let result = renew_launcher_fence_promptly(deadline, &mut renew).await;
                 // A spent window wakes the next iteration immediately, even if
                 // the next regular poll is still in the future.
@@ -385,7 +387,7 @@ where
                 // fall back to polling rather than spin on the elapsed timer.
                 reclaim_at = control
                     .launcher_fence_deadline()
-                    .filter(|deadline| Instant::now() < *deadline);
+                    .filter(|deadline| tokio::time::Instant::now().into_std() < *deadline);
                 result
             }
         };
@@ -3724,7 +3726,7 @@ mod tests {
         let path =
             std::env::temp_dir().join(format!("launcher_retry_{:032x}.db", rand::random::<u128>()));
         let db = db::Db::open(&path, 2).unwrap();
-        let control = UpdateControl::from_application(&db);
+        let control = paused_launcher_control(&db);
         control.arm_launcher_fence("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
         assert!(control.renew_launcher_fence().await.unwrap());
         // The confirmed fence horizon, as the periodic renewer passes it.
@@ -3839,12 +3841,12 @@ mod tests {
         remove_launcher_test_db(&path);
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn instant_launcher_errors_stop_before_the_deadline_with_the_last_error() {
         let attempts = std::sync::atomic::AtomicUsize::new(0);
-        let began = Instant::now();
+        let began = tokio::time::Instant::now();
         let deadline = began + Duration::from_secs(10);
-        let error = renew_launcher_fence_promptly(deadline, || async {
+        let error = renew_launcher_fence_promptly(deadline.into_std(), || async {
             attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Err(anyhow::anyhow!("connection refused"))
         })
@@ -3855,7 +3857,10 @@ mod tests {
             (9..=12).contains(&count),
             "250ms to 1s backoff: {count} attempts"
         );
-        assert!(Instant::now() < deadline, "must not sleep across deadline");
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "must not sleep across deadline"
+        );
         assert!(began.elapsed() >= Duration::from_secs(8));
         assert!(error.to_string().contains("connection refused"));
         eprintln!(
@@ -3869,12 +3874,17 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    fn paused_launcher_control(db: &Db) -> UpdateControl {
+        UpdateControl::from_application(db)
+            .with_launcher_fence_clock_for_test(|| tokio::time::Instant::now().into_std())
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn launcher_recovers_at_expiry_after_a_hung_tick_and_resumes_cas() {
         assert_launcher_recovers_at_expiry(true).await;
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn launcher_recovers_at_expiry_after_renewal_errors_and_resumes_cas() {
         assert_launcher_recovers_at_expiry(false).await;
     }
@@ -3885,11 +3895,11 @@ mod tests {
             rand::random::<u128>()
         ));
         let db = Db::open(&path, 2).unwrap();
-        let control = UpdateControl::from_application(&db);
+        let control = paused_launcher_control(&db);
         control.arm_launcher_fence(&"a".repeat(32));
         assert!(control.renew_launcher_fence().await.unwrap());
         let before = control.launcher_fence_deadline().unwrap();
-        // Offset the poll schedule from the real 20s authority deadline.
+        // Offset the poll schedule so the expiry timer must wake before the next tick.
         tokio::time::sleep(Duration::from_secs(2)).await;
         let renewing = control.clone();
         let renewal = tokio::spawn(async move {
@@ -3948,14 +3958,14 @@ mod tests {
         remove_launcher_test_db(&path);
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn launcher_reclaims_an_already_expired_window_without_waiting_for_a_tick() {
         let path = std::env::temp_dir().join(format!(
             "launcher_expired_{:032x}.db",
             rand::random::<u128>()
         ));
         let db = Db::open(&path, 2).unwrap();
-        let control = UpdateControl::from_application(&db);
+        let control = paused_launcher_control(&db);
         control.arm_launcher_fence(&"a".repeat(32));
         assert!(control.renew_launcher_fence().await.unwrap());
         let before = control.launcher_fence_deadline().unwrap();
@@ -3976,22 +3986,21 @@ mod tests {
         remove_launcher_test_db(&path);
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn launcher_periodic_tick_never_steals_a_live_foreign_fence_after_expiry() {
         let path = std::env::temp_dir().join(format!(
             "launcher_no_steal_{:032x}.db",
             rand::random::<u128>()
         ));
         let db = Db::open(&path, 2).unwrap();
-        let control = UpdateControl::from_application(&db);
+        let control = paused_launcher_control(&db);
         control.arm_launcher_fence(&"a".repeat(32));
         assert!(control.renew_launcher_fence().await.unwrap());
         let before = control.launcher_fence_deadline().unwrap();
         tokio::time::sleep_until(tokio::time::Instant::from_std(before)).await;
         let other_db = Db::open(&path, 2).unwrap();
-        // The stored expiry is wall-clock time read at commit, so it trails the
-        // monotonic horizon above by however long that acquisition took. End
-        // the stored window here instead of racing the two clocks.
+        // The database uses wall time. Expire the original row explicitly
+        // before the other launcher acquires its live fence.
         other_db
             .with_conn_sync(|conn| {
                 let tx = conn.transaction_immediate()?;

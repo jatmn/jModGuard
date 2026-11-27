@@ -6153,13 +6153,6 @@ async fn bind_reclaimable_health_port() -> tokio::net::TcpListener {
 }
 
 fn scan_origin(scan: &'static PortScan) -> u32 {
-    // The closed-port regression sets this so both children walk one sequence.
-    // Ordinary fixture allocation leaves it unset and keeps a random origin.
-    if let Ok(raw) = std::env::var("JMODGUARD_PORT_SCAN_ORIGIN")
-        && let Ok(origin) = raw.parse::<u32>()
-    {
-        return origin;
-    }
     *scan
         .origin
         .get_or_init(|| rand::random::<u32>() ^ std::process::id())
@@ -6639,6 +6632,7 @@ fn interrupted_reservation_rewrite_keeps_a_live_owners_claim() {
             "controller_tests::interrupted_reservation_rewrite_keeps_a_live_owners_claim",
             "--exact",
             "--test-threads=1",
+            "--no-capture",
         ])
         .env("JMODGUARD_PORT_RESERVATION_CRASH_BEFORE_RENAME", "1")
         .env("JMODGUARD_PORT_RESERVATION_DIR", &dir)
@@ -6747,6 +6741,13 @@ async fn concurrent_port_allocations_never_return_the_same_port() {
         let dir = std::path::PathBuf::from(
             std::env::var("JMODGUARD_PORT_ALLOC_DIR").expect("child directory"),
         );
+        if matches!(role.as_str(), "gap-owner" | "gap-other") {
+            let origin = std::env::var("JMODGUARD_PORT_GAP_ORIGIN")
+                .expect("gap scan origin")
+                .parse()
+                .expect("invalid gap scan origin");
+            OUTSIDE_EPHEMERAL_SCAN.origin.set(origin).unwrap();
+        }
         match role.as_str() {
             "hold" => hold_allocated_ports(&dir).await,
             "gap-owner" => gap_owner(&dir).await,
@@ -6789,8 +6790,8 @@ async fn concurrent_port_allocations_never_return_the_same_port() {
     std::fs::create_dir_all(&hold_a).unwrap();
     std::fs::create_dir_all(&hold_b).unwrap();
     let mut held_children = KillChildren(vec![
-        spawn_port_child("hold", &hold_a),
-        spawn_port_child("hold", &hold_b),
+        spawn_port_child("hold", &hold_a, None),
+        spawn_port_child("hold", &hold_b, None),
     ]);
     wait_for_file(&hold_a.join("ready"));
     wait_for_file(&hold_b.join("ready"));
@@ -6807,9 +6808,12 @@ async fn concurrent_port_allocations_never_return_the_same_port() {
 
     let gap = std::env::temp_dir().join(format!("port-gap-{:032x}", rand::random::<u128>()));
     std::fs::create_dir_all(&gap).unwrap();
+    // Force overlap within this pair, while independent harnesses start at
+    // different offsets in the shared, per-user reservation ledger.
+    let gap_origin = Some(rand::random::<u32>());
     let mut gap_children = KillChildren(vec![
-        spawn_port_child("gap-owner", &gap),
-        spawn_port_child("gap-other", &gap),
+        spawn_port_child("gap-owner", &gap, gap_origin),
+        spawn_port_child("gap-other", &gap, gap_origin),
     ]);
     wait_for_file(&gap.join("owner-ready"));
     wait_for_file(&gap.join("other-ready"));
@@ -6907,23 +6911,26 @@ async fn gap_other(dir: &std::path::Path) {
     wait_for_file(&dir.join("release"));
 }
 
-fn spawn_port_child(role: &str, dir: &std::path::Path) -> std::process::Child {
+fn spawn_port_child(
+    role: &str,
+    dir: &std::path::Path,
+    gap_origin: Option<u32>,
+) -> std::process::Child {
     let mut command = std::process::Command::new(std::env::current_exe().unwrap());
     command
         .args([
             "controller_tests::concurrent_port_allocations_never_return_the_same_port",
             "--exact",
             "--test-threads=1",
+            "--no-capture",
         ])
         .env("JMODGUARD_PORT_ALLOC_CHILD", role)
         .env("JMODGUARD_PORT_ALLOC_DIR", dir)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::inherit());
-    // Random origins make these two children miss each other, and the regression
-    // then passes with reservations disabled. Pin one shared walk for this pair.
-    if role == "gap-owner" || role == "gap-other" {
-        command.env("JMODGUARD_PORT_SCAN_ORIGIN", "0");
+    if let Some(origin) = gap_origin {
+        command.env("JMODGUARD_PORT_GAP_ORIGIN", origin.to_string());
     }
     command.spawn().unwrap()
 }
