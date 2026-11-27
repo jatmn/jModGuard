@@ -17,6 +17,7 @@ const MEMBER: u64 = 30;
 const REMOVAL_ROLES: [u64; 4] = [25, 24, 26, 27];
 const BOT_ROLE: u64 = 40;
 const BOT_KICK_ROLE: u64 = 41;
+const EXEMPT_ROLE: u64 = 29;
 const FIXTURE_NOW_MS: i64 = 1_767_225_600_000;
 const REASON: &str = "[Automod] Kicked for suspected bot (onboarding)";
 
@@ -54,7 +55,7 @@ fn guild(everyone: Permissions) -> Guild {
         (25, Permissions::empty()),
         (26, Permissions::empty()),
         (27, Permissions::empty()),
-        (29, Permissions::empty()),
+        (EXEMPT_ROLE, Permissions::empty()),
         (
             BOT_ROLE,
             Permissions::MANAGE_ROLES | Permissions::KICK_MEMBERS,
@@ -337,6 +338,47 @@ struct DelayedCleanupLog {
     next_delete: Notify,
 }
 
+struct DiscordLookupChange {
+    after_removal: bool,
+    changed: AtomicBool,
+    target_read: Notify,
+    target_json: String,
+    guild_json: String,
+}
+
+fn first_role_removal_attempted(calls: &Mutex<Vec<Call>>) -> bool {
+    calls
+        .lock()
+        .iter()
+        .any(|call| call.method == Method::DELETE && call.path.ends_with("/members/30/roles/25"))
+}
+
+async fn hold_core_connections(
+    app: &BotState,
+) -> Vec<(
+    tokio::sync::oneshot::Sender<()>,
+    tokio::task::JoinHandle<()>,
+)> {
+    let mut holders = Vec::new();
+    for _ in 0..2 {
+        let db = app.db.clone();
+        let (held, acquired) = tokio::sync::oneshot::channel();
+        let (release, resume) = tokio::sync::oneshot::channel::<()>();
+        let holder = tokio::spawn(async move {
+            db.with_conn(move |_| {
+                held.send(()).unwrap();
+                let _ = resume.blocking_recv();
+                Ok(())
+            })
+            .await
+            .unwrap();
+        });
+        acquired.await.unwrap();
+        holders.push((release, holder));
+    }
+    holders
+}
+
 async fn gateway_case(
     member: Member,
     discord_member: Member,
@@ -357,7 +399,19 @@ async fn gateway_case(
     let remove_roles = event_kind.starts_with("role removal");
     let removal_paused = event_kind == "role removal promotion";
     let revoke_bot_kick = event_kind == "role removal bot lost kick";
-    let removal_cancelled = removal_paused || revoke_bot_kick;
+    let owner_during_bot_lookup = event_kind == "role removal bot lookup new owner";
+    let target_during_bot_lookup = matches!(
+        event_kind,
+        "role removal bot lookup rejoin"
+            | "role removal bot lookup exempt role"
+            | "role removal bot lookup target unavailable"
+    );
+    let target_unavailable = event_kind == "role removal bot lookup target unavailable";
+    let target_during_guild_lookup = event_kind == "role removal guild lookup exempt role";
+    let stalled_guild = event_kind == "role removal guild lookup stalled";
+    let stalled_primary = event_kind == "role removal primary lookup stalled";
+    let removal_cancelled =
+        removal_paused || revoke_bot_kick || target_during_bot_lookup || target_during_guild_lookup;
     let removal_rejected = event_kind == "role removal partial";
     let bot_lookup_timeout = event_kind == "role removal bot lookup timeout";
     let bot_lookup_error = event_kind == "role removal bot lookup error";
@@ -400,6 +454,9 @@ async fn gateway_case(
         serde_json::json!({ "role_id": TRAP_ROLE.to_string(), "join_window_minutes": minutes });
     if remove_roles {
         rule.params["remove_role_ids"] = serde_json::json!(REMOVAL_ROLES.map(|id| id.to_string()));
+    }
+    if event_kind == "role removal bot lookup exempt role" || target_during_guild_lookup {
+        rule.whitelist_roles.push(EXEMPT_ROLE);
     }
     if event_kind.starts_with("cleanup") || event_kind == "role removal ordered" {
         if event_kind != "cleanup off" {
@@ -492,6 +549,30 @@ async fn gateway_case(
     let bot_json = serde_json::to_string(&bot).unwrap();
     let guild_json = serde_json::to_string(&guild).unwrap();
     let member_json = serde_json::to_string(&discord_member).unwrap();
+    let rest_change = (owner_during_bot_lookup
+        || target_during_bot_lookup
+        || target_during_guild_lookup)
+        .then(|| {
+            let mut guild = guild.clone();
+            let mut target = discord_member.clone();
+            match event_kind {
+                "role removal bot lookup new owner" => guild.owner_id = target.user.id,
+                "role removal bot lookup rejoin" => target.joined_at = Some(now()),
+                "role removal bot lookup exempt role" | "role removal guild lookup exempt role" => {
+                    target.roles.push(RoleId::new(EXEMPT_ROLE));
+                }
+                "role removal bot lookup target unavailable" => {}
+                _ => unreachable!(),
+            }
+            Arc::new(DiscordLookupChange {
+                after_removal: target_during_bot_lookup,
+                changed: AtomicBool::new(false),
+                target_read: Notify::new(),
+                target_json: serde_json::to_string(&target).unwrap(),
+                guild_json: serde_json::to_string(&guild).unwrap(),
+            })
+        });
+    let server_rest_change = rest_change.clone();
     let mut member_with_new_role = discord_member.clone();
     member_with_new_role.roles.push(RoleId::new(NEW_TRAP_ROLE));
     let member_with_new_role_json = serde_json::to_string(&member_with_new_role).unwrap();
@@ -501,15 +582,18 @@ async fn gateway_case(
         event_kind,
         "cleanup disabled during kick" | "cleanup user exemption" | "cleanup role exemption"
     );
-    let pause =
-        (event_kind.starts_with("during dispatch") || change_cleanup_on_kick || removal_paused)
-            .then(|| {
-                Arc::new((
-                    tokio::sync::Notify::new(),
-                    tokio::sync::Notify::new(),
-                    AtomicBool::new(true),
-                ))
-            });
+    let pause = (event_kind.starts_with("during dispatch")
+        || change_cleanup_on_kick
+        || removal_paused
+        || stalled_guild
+        || stalled_primary)
+        .then(|| {
+            Arc::new((
+                tokio::sync::Notify::new(),
+                tokio::sync::Notify::new(),
+                AtomicBool::new(true),
+            ))
+        });
     let server_pause = pause.clone();
     let server_delayed_log = delayed_log.clone();
     let server = tokio::spawn(server.serve(make_service_fn(move |_| {
@@ -517,6 +601,7 @@ async fn gateway_case(
         let (guild_json, member_json) = (guild_json.clone(), member_json.clone());
         let (bot_path, bot_json) = (bot_path.clone(), bot_json.clone());
         let bot_without_kick_json = bot_without_kick_json.clone();
+        let rest_change = server_rest_change.clone();
         let staff_json = staff_json.clone();
         let staff_veto = server_staff_veto.clone();
         let new_role_granted = Arc::clone(&server_new_role_granted);
@@ -529,6 +614,7 @@ async fn gateway_case(
                 let (guild_json, member_json) = (guild_json.clone(), member_json.clone());
                 let (bot_path, bot_json) = (bot_path.clone(), bot_json.clone());
                 let bot_without_kick_json = bot_without_kick_json.clone();
+                let rest_change = rest_change.clone();
                 let staff_json = staff_json.clone();
                 let staff_veto = staff_veto.clone();
                 let new_role_granted = Arc::clone(&new_role_granted);
@@ -546,8 +632,14 @@ async fn gateway_case(
                             .map(|value| value.to_str().unwrap().to_owned()).unwrap_or_default(),
                     };
                     let paused_method = if change_cleanup_on_kick || removal_paused { Method::DELETE } else { Method::GET };
+                    let paused_path = if stalled_guild {
+                        call.path.ends_with(&format!("/guilds/{GUILD}"))
+                    } else {
+                        call.path.contains("/members/")
+                    };
                     if let Some(pause) = pause
-                        && call.method == paused_method && call.path.contains("/members/")
+                        && call.method == paused_method
+                        && paused_path
                         && pause.2.swap(false, Ordering::Relaxed)
                     {
                         pause.0.notify_one();
@@ -563,22 +655,45 @@ async fn gateway_case(
                     }
                     let (status, body) = match call.method {
                         Method::GET if call.path.ends_with(&bot_path) => {
-                            let after_removal = (bot_lookup_failed || bot_without_kick_json.is_some())
-                                && captured.lock().iter().any(|previous| {
-                                    previous.method == Method::DELETE
-                                        && previous.path.ends_with("/members/30/roles/25")
-                                });
+                            let after_removal = first_role_removal_attempted(&captured);
+                            if let Some(change) = &rest_change
+                                && !target_during_guild_lookup
+                                && change.after_removal == after_removal
+                            {
+                                if after_removal {
+                                    // Let a concurrent target GET capture the old member before
+                                    // changing the REST state. A sequenced lookup starts only
+                                    // after the bot response and sees the changed member.
+                                    let _ = tokio::time::timeout(
+                                        Duration::from_secs(1), change.target_read.notified(),
+                                    ).await;
+                                }
+                                change.changed.store(true, Ordering::Relaxed);
+                            }
                             match (after_removal, bot_without_kick_json) {
                                 (true, _) if bot_lookup_timeout => std::future::pending().await,
-                                (true, _) if bot_lookup_error => (
+                                (true, _) if bot_lookup_error || target_during_bot_lookup => (
                                     403, r#"{"code":50013,"message":"Missing Permissions"}"#.into(),
                                 ),
                                 (true, Some(json)) => (200, json),
                                 _ => (200, bot_json),
                             }
                         }
+                        Method::GET if target_unavailable && call.path.contains("/members/")
+                            && rest_change.as_ref().is_some_and(|change| {
+                                change.changed.load(Ordering::Relaxed)
+                            }) => (404, r#"{"code":10007,"message":"Unknown Member"}"#.into()),
                         Method::GET if call.path.contains("/members/") => {
-                            let body = if staff_veto.load(Ordering::Relaxed) {
+                            let body = if let Some(change) = &rest_change {
+                                if change.changed.load(Ordering::Relaxed) {
+                                    change.target_json.clone()
+                                } else {
+                                    if first_role_removal_attempted(&captured) {
+                                        change.target_read.notify_one();
+                                    }
+                                    member_json
+                                }
+                            } else if staff_veto.load(Ordering::Relaxed) {
                                 staff_json
                             } else if new_role_granted.load(Ordering::Relaxed) {
                                 member_with_new_role_json
@@ -587,7 +702,22 @@ async fn gateway_case(
                             };
                             (200, body)
                         }
-                        Method::GET => (200, guild_json),
+                        Method::GET => {
+                            if target_during_guild_lookup
+                                && first_role_removal_attempted(&captured)
+                                && let Some(change) = &rest_change
+                            {
+                                let _ = tokio::time::timeout(
+                                    Duration::from_secs(1), change.target_read.notified(),
+                                ).await;
+                                change.changed.store(true, Ordering::Relaxed);
+                            }
+                            let body = rest_change
+                                .as_ref()
+                                .filter(|change| change.changed.load(Ordering::Relaxed))
+                                .map_or(guild_json, |change| change.guild_json.clone());
+                            (200, body)
+                        }
                         Method::DELETE if removal_rejected && call.path.ends_with("/roles/25") => (
                             403, r#"{"code":50013,"message":"Missing Permissions"}"#.into(),
                         ),
@@ -668,11 +798,35 @@ async fn gateway_case(
             trigger_finished.notify_one();
         };
         let contradict = async {
-            tokio::time::timeout(Duration::from_secs(5), pause.0.notified())
+            let wait_for_request = if stalled_guild || stalled_primary {
+                30
+            } else {
+                5
+            };
+            tokio::time::timeout(Duration::from_secs(wait_for_request), pause.0.notified())
                 .await
                 .unwrap();
             let mut latest = member.clone();
             match event_kind {
+                "role removal guild lookup stalled" => {
+                    tokio::time::timeout(Duration::from_secs(15), trigger_finished.notified())
+                        .await
+                        .expect("stalled guild lookup must cancel dispatch");
+                    return;
+                }
+                "role removal primary lookup stalled" => {
+                    let holders = hold_core_connections(&app).await;
+                    pause.1.notify_one();
+                    let finished =
+                        tokio::time::timeout(Duration::from_secs(15), trigger_finished.notified())
+                            .await;
+                    for (release, holder) in holders {
+                        release.send(()).unwrap();
+                        holder.await.unwrap();
+                    }
+                    finished.expect("stalled primary must cancel dispatch");
+                    return;
+                }
                 "during dispatch: role removed" | "during dispatch: regrant" => {
                     latest.roles.clear()
                 }
@@ -747,23 +901,7 @@ async fn gateway_case(
             if removed_before_claim {
                 // Occupy both core connections so the grant and removal record
                 // Gateway roles before either can enter trap matching.
-                let mut holders = Vec::new();
-                for _ in 0..2 {
-                    let db = app.db.clone();
-                    let (held, acquired) = tokio::sync::oneshot::channel();
-                    let (release, resume) = tokio::sync::oneshot::channel::<()>();
-                    let holder = tokio::spawn(async move {
-                        db.with_conn(move |_| {
-                            held.send(()).unwrap();
-                            let _ = resume.blocking_recv();
-                            Ok(())
-                        })
-                        .await
-                        .unwrap();
-                    });
-                    acquired.await.unwrap();
-                    holders.push((release, holder));
-                }
+                let holders = hold_core_connections(&app).await;
                 assert!(ctx.cache.guild(member.guild_id).is_none());
                 let mut grant = pin!(handler.guild_member_update(
                     ctx.clone(),
@@ -928,6 +1066,12 @@ async fn gateway_case(
     }
     server.abort();
     let _ = server.await;
+    if let Some(change) = rest_change {
+        assert!(
+            change.changed.load(Ordering::Relaxed),
+            "the lookup must change Discord state"
+        );
+    }
 
     let cases = store
         .case_ids(scope.clone(), None, 10, crate::tenant::case_limits())
@@ -1084,6 +1228,12 @@ async fn gateway_case(
             )));
         }
     } else {
+        assert!(
+            !effects.iter().any(|(method, path, _, _)| {
+                *method == Method::DELETE && path.ends_with(&format!("/members/{}", member.user.id))
+            }),
+            "{event_kind}: sent an ineligible kick"
+        );
         assert!(cases.is_empty(), "{event_kind}: {cases:?}");
         if dry {
             assert_eq!(effects.len(), 1, "{effects:?}");
@@ -1485,6 +1635,118 @@ async fn bot_member_lookup_timeout_skips_further_removal_and_kicks() {
 #[tokio::test]
 async fn bot_member_lookup_error_skips_further_removal_and_kicks() {
     bot_member_lookup_failure_case("role removal bot lookup error").await;
+}
+
+#[tokio::test]
+async fn fallback_kick_rechecks_a_rejoin_during_the_bot_lookup() {
+    let target = member(
+        MEMBER,
+        &[TRAP_ROLE, 24, 25],
+        Timestamp::from_millis(Timestamp::now().timestamp_millis() - 60_000).unwrap(),
+    );
+    gateway_case(
+        target.clone(),
+        target,
+        guild(Permissions::empty()),
+        "role removal bot lookup rejoin",
+        30,
+        false,
+        false,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn fallback_kick_rechecks_an_exempt_role_gained_during_the_bot_lookup() {
+    let target = member(MEMBER, &[TRAP_ROLE, 24, 25], Timestamp::now());
+    gateway_case(
+        target.clone(),
+        target,
+        guild(Permissions::empty()),
+        "role removal bot lookup exempt role",
+        30,
+        false,
+        false,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn fallback_kick_requires_a_successful_target_refresh() {
+    let target = member(MEMBER, &[TRAP_ROLE, 24, 25], Timestamp::now());
+    gateway_case(
+        target.clone(),
+        target,
+        guild(Permissions::empty()),
+        "role removal bot lookup target unavailable",
+        30,
+        false,
+        false,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn initial_dispatch_rechecks_ownership_after_the_bot_lookup() {
+    let target = member(MEMBER, &[TRAP_ROLE, 24, 25], Timestamp::now());
+    gateway_case(
+        target.clone(),
+        target,
+        guild(Permissions::empty()),
+        "role removal bot lookup new owner",
+        30,
+        false,
+        false,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn post_removal_dispatch_rechecks_an_exempt_role_gained_during_the_guild_lookup() {
+    let target = member(MEMBER, &[TRAP_ROLE, 24, 25], Timestamp::now());
+    gateway_case(
+        target.clone(),
+        target,
+        guild(Permissions::empty()),
+        "role removal guild lookup exempt role",
+        30,
+        false,
+        false,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn stalled_mandatory_evidence_prevents_mutation() {
+    for event_kind in [
+        "role removal guild lookup stalled",
+        "role removal primary lookup stalled",
+    ] {
+        let target = member(MEMBER, &[TRAP_ROLE, 24, 25], Timestamp::now());
+        gateway_case(
+            target.clone(),
+            target,
+            guild(Permissions::empty()),
+            event_kind,
+            30,
+            false,
+            false,
+        )
+        .await;
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_expired_dispatch_cannot_resume_a_parked_mutation() {
+    let attempted = AtomicBool::new(false);
+    let expires_at = tokio::time::Instant::now() + DISPATCH_EVIDENCE_WINDOW;
+    let result = before_evidence_expires(expires_at, async {
+        tokio::time::sleep_until(expires_at).await;
+        attempted.store(true, Ordering::Relaxed);
+    })
+    .await;
+    assert!(result.is_none());
+    assert!(!attempted.load(Ordering::Relaxed));
 }
 
 #[tokio::test]

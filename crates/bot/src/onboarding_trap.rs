@@ -24,6 +24,7 @@ use tokio::sync::{Notify, Semaphore};
 
 const MATCH_LIMIT: usize = 4096;
 const MATCH_RETENTION: Duration = Duration::from_secs(24 * 60 * 60);
+const DISPATCH_EVIDENCE_WINDOW: Duration = Duration::from_secs(5);
 
 #[cfg(test)]
 tokio::task_local! {
@@ -461,10 +462,12 @@ async fn check_event(app: &Arc<BotState>, http: &Arc<Http>, cache: &Cache, event
             RoleRemovals::default()
         }
         Dispatch::KickSkipped(removals) => {
-            vars.insert(
-                "action".into(),
-                "kick cancelled after role removal attempt".into(),
-            );
+            let action = if removals == RoleRemovals::default() {
+                "kick cancelled before dispatch"
+            } else {
+                "kick cancelled after role removal attempt"
+            };
+            vars.insert("action".into(), action.into());
             removals
         }
         Dispatch::Kick {
@@ -650,50 +653,50 @@ struct DispatchGuard<'a> {
 }
 
 struct PreparedMatch {
+    evidence: DispatchEvidence,
+    removal_roles: Vec<u64>,
+}
+
+struct DispatchEvidence {
     member: Member,
     guild: PartialGuild,
     rule: RuleDef,
     dry_run: bool,
     bot: Option<Member>,
-    removal_roles: Vec<u64>,
+    expires_at: tokio::time::Instant,
+}
+
+async fn before_evidence_expires<T>(
+    expires_at: tokio::time::Instant,
+    work: impl Future<Output = T>,
+) -> Option<T> {
+    tokio::select! {
+        biased;
+        _ = tokio::time::sleep_until(expires_at) => None,
+        result = work => Some(result),
+    }
 }
 
 impl DispatchGuard<'_> {
     async fn prepare(&self, enrollment: &db::GuildEnrollment) -> Option<PreparedMatch> {
-        let (guild_id, user_id) = (self.event.guild, self.event.user.id);
         let mut dry_run = self.matched.dry_run;
-        let removal_roles = removal_role_ids(guild_id.get(), self.matched).unwrap_or_default();
+        let removal_roles =
+            removal_role_ids(self.event.guild.get(), self.matched).unwrap_or_default();
 
-        // Keep the final primary read immediately before the membership checks
-        // and claim handoff. Check bot capability for live and dry-run removals.
-        refresh_rule(self.app, enrollment, self.matched, &mut dry_run).await?;
-        let guild = self.http.get_guild(guild_id).await.ok()?;
-        if guild.owner_id == user_id {
-            return None;
-        }
         refresh_rule(self.app, enrollment, self.matched, &mut dry_run).await?;
         let bot = if removal_roles.is_empty() {
             None
         } else {
-            let bot = self.bot_member().await;
-            refresh_rule(self.app, enrollment, self.matched, &mut dry_run).await?;
-            bot
+            self.bot_member().await
         };
-        let member = self.http.get_member(guild_id, user_id).await.ok()?;
-        let rule = refresh_rule(self.app, enrollment, self.matched, &mut dry_run).await?;
-        if !self.member_admits(&guild, &member, &rule, dry_run)
-            || !self
-                .claim
-                .complete(dry_run, |roles| self.roles_admit(&guild, &rule, roles))
-        {
+        let evidence = self.dispatch_evidence(enrollment, dry_run, bot).await?;
+        if !self.claim.complete(evidence.dry_run, |roles| {
+            self.roles_admit(&evidence.guild, &evidence.rule, roles)
+        }) {
             return None;
         }
         Some(PreparedMatch {
-            member,
-            guild,
-            rule,
-            dry_run,
-            bot,
+            evidence,
             removal_roles,
         })
     }
@@ -701,65 +704,74 @@ impl DispatchGuard<'_> {
     async fn execute(
         &self,
         enrollment: &db::GuildEnrollment,
-        mut prepared: PreparedMatch,
+        prepared: PreparedMatch,
         reason: &str,
     ) -> Dispatch {
         let (guild_id, user_id) = (self.event.guild, self.event.user.id);
+        let PreparedMatch {
+            mut evidence,
+            removal_roles,
+        } = prepared;
         let mut removals = RoleRemovals::default();
         let selection_matches = |rule: &RuleDef| {
-            removal_role_ids(guild_id.get(), rule).as_ref() == Some(&prepared.removal_roles)
+            removal_role_ids(guild_id.get(), rule).as_ref() == Some(&removal_roles)
         };
-        if prepared.dry_run {
+        if evidence.dry_run {
             return Dispatch::DryRun {
-                remove_roles: selection_matches(&prepared.rule)
-                    && prepared.can_remove_roles()
-                    && prepared
-                        .removal_roles
+                remove_roles: selection_matches(&evidence.rule)
+                    && evidence.can_remove_roles()
+                    && removal_roles
                         .iter()
-                        .any(|id| prepared.holds_unmanaged_role(RoleId::new(*id))),
+                        .any(|id| evidence.holds_unmanaged_role(RoleId::new(*id))),
             };
         }
-        for id in &prepared.removal_roles {
-            if !selection_matches(&prepared.rule) {
+        for id in &removal_roles {
+            if !selection_matches(&evidence.rule) {
                 break;
             }
             let id = RoleId::new(*id);
-            if !prepared.holds_unmanaged_role(id) {
+            if !evidence.holds_unmanaged_role(id) {
                 continue;
             }
-            if !prepared.can_remove_roles() {
+            if !evidence.can_remove_roles() {
                 removals.unconfirmed += 1;
                 continue;
             }
-            let result = tokio::time::timeout(
-                DISCORD_REST_TIMEOUT,
+            let result = before_evidence_expires(
+                evidence.expires_at,
                 self.http
                     .remove_member_role(guild_id, user_id, id, Some(reason)),
             )
             .await;
-            if matches!(result, Ok(Ok(()))) {
+            if matches!(result, Some(Ok(()))) {
                 removals.confirmed += 1;
             } else {
                 removals.unconfirmed += 1;
             }
 
             // Recheck membership, bot capability and configuration after the request.
-            let Some((guild, member, rule, bot)) = self.recheck(enrollment).await else {
+            let Some(current) = self.recheck(enrollment).await else {
                 return Dispatch::KickSkipped(removals);
             };
-            prepared.guild = guild;
-            prepared.member = member;
-            prepared.rule = rule;
-            prepared.bot = bot;
+            evidence = current;
         }
 
         let started_at_ms = now().timestamp_millis();
-        let error =
-            kick_with_recovery(self.app, self.http, guild_id, &prepared.member, reason).await;
+        let mut attempted = false;
+        let error = match before_evidence_expires(evidence.expires_at, async {
+            attempted = true;
+            kick_with_recovery(self.app, self.http, guild_id, &evidence.member, reason).await
+        })
+        .await
+        {
+            Some(error) => error,
+            None if attempted => Some(serenity::Error::Other("onboarding kick deadline elapsed")),
+            None => return Dispatch::KickSkipped(removals),
+        };
         Dispatch::Kick {
             started_at_ms,
             error,
-            role_exemptions: prepared.rule.whitelist_roles,
+            role_exemptions: evidence.rule.whitelist_roles,
             removals,
         }
     }
@@ -776,34 +788,59 @@ impl DispatchGuard<'_> {
         (member.user.id == bot_id).then_some(member)
     }
 
-    async fn recheck(
+    async fn dispatch_evidence(
         &self,
         enrollment: &db::GuildEnrollment,
-    ) -> Option<(PartialGuild, Member, RuleDef, Option<Member>)> {
+        mut dry_run: bool,
+        bot: Option<Member>,
+    ) -> Option<DispatchEvidence> {
+        // Read the target after both the optional bot lookup and the guild
+        // lookup. The final primary check can still veto a config change made
+        // during REST reads. Bound that handoff and the ensuing REST call.
+        let expires_at = tokio::time::Instant::now() + DISPATCH_EVIDENCE_WINDOW;
         let guild_id = self.event.guild;
-        let (guild_and_target, bot) = tokio::join!(
-            tokio::time::timeout(DISCORD_REST_TIMEOUT, async {
-                tokio::try_join!(
-                    self.http.get_guild(guild_id),
-                    self.http.get_member(guild_id, self.event.user.id),
-                )
-            }),
-            self.bot_member(),
-        );
-        let (guild, member) = guild_and_target.ok()?.ok()?;
-        let mut dry_run = false;
-        let rule = refresh_rule(self.app, enrollment, self.matched, &mut dry_run).await?;
+        before_evidence_expires(expires_at, async {
+            let guild = self.http.get_guild(guild_id).await.ok()?;
+            if guild.owner_id == self.event.user.id {
+                return None;
+            }
+            let member = self
+                .http
+                .get_member(guild_id, self.event.user.id)
+                .await
+                .ok()?;
+            let rule = refresh_rule(self.app, enrollment, self.matched, &mut dry_run).await?;
+            self.member_admits(&guild, &member, &rule, dry_run)
+                .then_some(DispatchEvidence {
+                    guild,
+                    member,
+                    rule,
+                    dry_run,
+                    bot,
+                    expires_at,
+                })
+        })
+        .await?
+    }
+
+    async fn recheck(&self, enrollment: &db::GuildEnrollment) -> Option<DispatchEvidence> {
+        let bot = self.bot_member().await;
+        let evidence = self.dispatch_evidence(enrollment, false, bot).await?;
         // Missing bot membership evidence skips later removals. A fresh member
         // without kick capability still vetoes the kick.
-        (!dry_run
-            && bot
-                .as_ref()
-                .is_none_or(|bot| bot_can_act(&guild, bot, &member, Permissions::KICK_MEMBERS))
-            && self.member_admits(&guild, &member, &rule, false)
-            && self
-                .claim
-                .dispatched_roles_admit(|roles| self.roles_admit(&guild, &rule, roles)))
-        .then_some((guild, member, rule, bot))
+        (!evidence.dry_run
+            && evidence.bot.as_ref().is_none_or(|bot| {
+                bot_can_act(
+                    &evidence.guild,
+                    bot,
+                    &evidence.member,
+                    Permissions::KICK_MEMBERS,
+                )
+            })
+            && self.claim.dispatched_roles_admit(|roles| {
+                self.roles_admit(&evidence.guild, &evidence.rule, roles)
+            }))
+        .then_some(evidence)
     }
 
     fn roles_admit(&self, guild: &PartialGuild, rule: &RuleDef, assigned: &[RoleId]) -> bool {
@@ -861,7 +898,7 @@ impl DispatchGuard<'_> {
     }
 }
 
-impl PreparedMatch {
+impl DispatchEvidence {
     fn holds_unmanaged_role(&self, id: RoleId) -> bool {
         self.member.roles.contains(&id)
             && self.guild.roles.get(&id).is_some_and(|role| !role.managed)
