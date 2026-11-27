@@ -1385,6 +1385,211 @@ async fn completed_coordinated_upgrade(root: &Path) -> (Db, UpdateControl, Compo
     (db, control, op.bot.release)
 }
 
+// The durable pair admission sees the recorded deployment. A redeployed
+// controller can differ from that observation before it publishes a new one.
+#[tokio::test]
+async fn preparing_pair_rechecks_local_self_update_and_base_abi() {
+    let root = std::env::temp_dir().join(format!("pair-admission-{:032x}", rand::random::<u128>()));
+    tokio::fs::create_dir_all(&root).await.unwrap();
+    let (db, control) = open_launcher_db(&root).await;
+    let mut objects = HashMap::new();
+    let image = image(&mut objects, "bot", b"\x7fELFpaired");
+    let mut bot = release_at("bot", 'a', db::CORE_SCHEMA_VERSION);
+    bot.digest = image.digest;
+    let api = release_at("api", 'b', db::CORE_SCHEMA_VERSION);
+    let stamp = now();
+    for target in [&bot, &api] {
+        control
+            .running(&target.component, None, fresh_observation(stamp), stamp)
+            .await
+            .unwrap();
+        control
+            .checked(
+                &target.component,
+                "latest",
+                Some(target.clone()),
+                None,
+                stamp,
+            )
+            .await
+            .unwrap();
+    }
+    let op = control
+        .request_upgrade(&bot.digest, &api.digest, false, stamp)
+        .await
+        .unwrap();
+    let (registry, server) = serve_objects(objects).await;
+    let mut service = controller(
+        "bot",
+        root.join("baked-bot"),
+        registry,
+        control.clone(),
+        &root,
+    );
+
+    for (enabled, abi, expected) in [
+        (
+            false,
+            bot.base_abi.as_str(),
+            "self-update was disabled during the paired upgrade",
+        ),
+        (true, TRIXIE, "paired release requires a different base ABI"),
+    ] {
+        service.enabled = enabled;
+        service.base_abi = abi.into();
+        let error = service.pair(&op.id).await.unwrap_err();
+        assert_eq!(error.to_string(), expected);
+        assert_nothing_staged(&root, &service.staging);
+        let pending = control.upgrade().await.unwrap().unwrap();
+        assert_eq!(pending.id, op.id);
+        assert_eq!(pending.phase, Phase::Preparing);
+        assert_eq!(pending.bot.prepared, db::UpgradeProof::Missing);
+    }
+
+    service.enabled = true;
+    service.base_abi = bot.base_abi;
+    assert!(!service.pair(&op.id).await.unwrap());
+    let prepared = control.upgrade().await.unwrap().unwrap();
+    assert_eq!(prepared.id, op.id);
+    assert_eq!(prepared.bot.prepared, db::UpgradeProof::Confirmed);
+    let artifact = service.prepared.as_ref().unwrap();
+    assert_eq!(
+        tokio::fs::read(&artifact.path).await.unwrap(),
+        b"\x7fELFpaired"
+    );
+    server.abort();
+    drop((service, control, db));
+    tokio::fs::remove_dir_all(root).await.unwrap();
+}
+
+#[tokio::test]
+async fn pair_admitted_during_independent_download_keeps_the_running_child() {
+    use tokio::sync::Notify;
+
+    let root = std::env::temp_dir().join(format!(
+        "pair-during-download-{:032x}",
+        rand::random::<u128>()
+    ));
+    tokio::fs::create_dir_all(&root).await.unwrap();
+    let (db, control) = open_launcher_db(&root).await;
+    let baked = executable(&root, "old-bot").await;
+    let replacement = executable(&root, "new-bot").await;
+    let bytes = tokio::fs::read(replacement).await.unwrap();
+    let mut objects = HashMap::new();
+    let image = image(&mut objects, "bot", &bytes);
+    let manifest: serde_json::Value = serde_json::from_slice(&objects[&image.digest]).unwrap();
+    let layer = manifest["layers"][0]["digest"].as_str().unwrap().to_owned();
+    let mut candidate = release_at("bot", 'c', db::CORE_SCHEMA_VERSION);
+    candidate.digest = image.digest;
+    let requested = Arc::new(Notify::new());
+    let resume = Arc::new(Notify::new());
+    let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+        .await
+        .unwrap();
+    let registry = Registry::new(&format!("http://{}", listener.local_addr().unwrap())).unwrap();
+    let server = tokio::spawn({
+        let requested = Arc::clone(&requested);
+        let resume = Arc::clone(&resume);
+        async move {
+            let serve = move |state, uri: Uri| {
+                let requested = Arc::clone(&requested);
+                let resume = Arc::clone(&resume);
+                let is_layer = uri.path().rsplit('/').next() == Some(layer.as_str());
+                async move {
+                    if is_layer {
+                        requested.notify_one();
+                        resume.notified().await;
+                    }
+                    object(state, uri).await
+                }
+            };
+            axum::serve(
+                listener,
+                Router::new()
+                    .fallback(get(serve))
+                    .with_state(Arc::new(objects)),
+            )
+            .await
+            .unwrap();
+        }
+    });
+
+    let mut service = controller("bot", baked, registry, control.clone(), &root);
+    wait_for_bot_ready(&mut service).await;
+    let pid = service.running.as_ref().unwrap().child.id().unwrap();
+    let stamp = now();
+    control
+        .running("api", None, fresh_observation(stamp), stamp)
+        .await
+        .unwrap();
+    control
+        .checked("bot", "latest", Some(candidate.clone()), None, stamp)
+        .await
+        .unwrap();
+    db::request_component_install(&db, "bot", &candidate.digest, stamp)
+        .await
+        .unwrap();
+    let admit_pair = async {
+        tokio::time::timeout(Duration::from_secs(10), requested.notified())
+            .await
+            .expect("the independent download must reach the image layer");
+        assert!(control.upgrade().await.unwrap().is_none());
+        // Release the durable independent selection while the existing
+        // download still holds its snapshot. Pair admission requires this.
+        control
+            .failed("bot", &candidate, "independent selection cleared")
+            .await
+            .unwrap();
+        let bot = release_at("bot", 'a', db::CORE_SCHEMA_VERSION);
+        let api = release_at("api", 'b', db::CORE_SCHEMA_VERSION);
+        for target in [&bot, &api] {
+            control
+                .checked(
+                    &target.component,
+                    "latest",
+                    Some(target.clone()),
+                    None,
+                    stamp,
+                )
+                .await
+                .unwrap();
+        }
+        let op = control
+            .request_upgrade(&bot.digest, &api.digest, false, stamp)
+            .await
+            .unwrap();
+        resume.notify_one();
+        op
+    };
+    let (result, op) = tokio::join!(service.tick(), admit_pair);
+    assert_eq!(
+        result.unwrap_err().to_string(),
+        "coordinated upgrade started"
+    );
+    let child = &mut service.running.as_mut().unwrap().child;
+    assert_eq!(child.id(), Some(pid));
+    assert!(child.try_wait().unwrap().is_none());
+    assert_eq!(
+        tokio::fs::read(service.staging.join(format!("bot-{}", sha256_hex(&bytes))))
+            .await
+            .unwrap(),
+        bytes,
+        "the independent download finished before the refusal"
+    );
+    assert_eq!(
+        control.component("bot").await.unwrap().desired,
+        Some(op.bot.release)
+    );
+    assert_eq!(
+        control.upgrade().await.unwrap().unwrap().phase,
+        Phase::Preparing
+    );
+    service.stop_application().await.unwrap();
+    server.abort();
+    drop((service, control, db));
+    tokio::fs::remove_dir_all(root).await.unwrap();
+}
+
 fn offline_controller(role: &str, control: UpdateControl, root: &Path) -> Supervisor {
     controller(
         role,
@@ -6201,7 +6406,7 @@ fn unlock_reservations(file: &std::fs::File) {
     unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_UN) };
 }
 
-#[derive(Debug)]
+#[derive(Clone, Copy, Debug)]
 enum ProcLookup {
     Gone,
     Unreadable,
@@ -6263,7 +6468,7 @@ fn read_reservation_claims(dir: &std::path::Path) -> Result<String, String> {
     Ok(text)
 }
 
-fn load_reservations(dir: &std::path::Path) -> Vec<Reservation> {
+fn parse_reservations(dir: &std::path::Path) -> Vec<Reservation> {
     let text = read_reservation_claims(dir).unwrap_or_else(|error| panic!("{error}"));
     text.lines()
         .filter_map(|line| {
@@ -6271,12 +6476,25 @@ fn load_reservations(dir: &std::path::Path) -> Vec<Reservation> {
             let port = parts.next()?.parse().ok()?;
             let pid = parts.next()?.parse().ok()?;
             let start = parts.next()?.parse().ok()?;
-            if !owner_still_reserved(process_start(pid), start) {
-                return None;
-            }
             Some(Reservation { port, pid, start })
         })
         .collect()
+}
+
+fn retain_live_reservations(rows: &mut Vec<Reservation>) {
+    let mut owners = HashMap::new();
+    rows.retain(|row| {
+        let observed = *owners
+            .entry(row.pid)
+            .or_insert_with(|| process_start(row.pid));
+        owner_still_reserved(observed, row.start)
+    });
+}
+
+fn load_reservations(dir: &std::path::Path) -> Vec<Reservation> {
+    let mut rows = parse_reservations(dir);
+    retain_live_reservations(&mut rows);
+    rows
 }
 
 fn reservation_text(rows: &[Reservation]) -> String {
@@ -6351,17 +6569,24 @@ fn claim_port(port: u16) -> bool {
 
 fn claim_port_in(dir: &std::path::Path, port: u16) -> bool {
     with_reservations_in(dir, |dir| {
-        let mut rows = load_reservations(dir);
-        let free = rows.iter().all(|row| row.port != port);
-        if free {
-            rows.push(Reservation {
-                port,
-                pid: std::process::id(),
-                start: our_start(),
-            });
+        let mut rows = parse_reservations(dir);
+        // An occupied slot needs only its owner's identity. Prune and publish
+        // the shared snapshot only when adding a claim.
+        if rows
+            .iter()
+            .any(|row| row.port == port && owner_still_reserved(process_start(row.pid), row.start))
+        {
+            return false;
         }
+        rows.retain(|row| row.port != port);
+        retain_live_reservations(&mut rows);
+        rows.push(Reservation {
+            port,
+            pid: std::process::id(),
+            start: our_start(),
+        });
         store_reservations(dir, &rows);
-        free
+        true
     })
 }
 
@@ -6461,6 +6686,11 @@ fn interrupted_reservation_rewrite_keeps_a_live_owners_claim() {
     assert!(
         !claim_port_in(&dir, port),
         "live owner's reserved port was handed out after the crashed rewrite"
+    );
+    assert_eq!(
+        std::fs::metadata(&claims).unwrap().ino(),
+        claims_inode,
+        "refusing a live owner's port rewrote the claims file"
     );
     assert_eq!(
         std::fs::metadata(dir.join("lock")).unwrap().ino(),
@@ -9405,6 +9635,106 @@ async fn boot_repair_download_refuses_bad_signatures_before_the_layer() {
 }
 
 #[tokio::test]
+async fn failed_launcher_marker_prevents_repeating_handoffs_for_the_same_digest() {
+    const CHILD: &str = "JMODGUARD_FAILED_LAUNCHER_TEST_CHILD";
+    let mut objects = HashMap::new();
+    let mut release = image(&mut objects, "bot", b"\x7fELFlauncher");
+    release.launcher.as_mut().unwrap().min_revision = db::LAUNCHER_REVISION;
+    if std::env::var_os(CHILD).is_none() {
+        let output = tokio::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "controller_tests::failed_launcher_marker_prevents_repeating_handoffs_for_the_same_digest",
+            ])
+            .env(CHILD, "1")
+            .env("JMODGUARD_LAUNCHER_FAILED", &release.digest)
+            .env_remove("JMODGUARD_LAUNCHER_RELEASE")
+            .output()
+            .await
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success() && stdout.contains("1 passed"),
+            "{stdout}{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+
+    let root =
+        std::env::temp_dir().join(format!("failed-launcher-{:032x}", rand::random::<u128>()));
+    tokio::fs::create_dir_all(&root).await.unwrap();
+    let (db, control) = open_launcher_db(&root).await;
+    let (registry, server) = serve_objects(objects).await;
+    let mut service = controller(
+        "bot",
+        root.join("baked-bot"),
+        registry,
+        control.clone(),
+        &root,
+    );
+    service.launcher_revision = db::LAUNCHER_REVISION - 1;
+    // Recreate the durable state a baked controller can encounter when
+    // PID 1 reports a failed installed launcher and no request is pending.
+    install_for_outage(&db, &control, &release, now()).await;
+    let stored = serde_json::to_string(&release).unwrap();
+    db.with_conn(move |conn| {
+        conn.execute_bounded(
+            "UPDATE component_updates SET installed_launcher=?1 WHERE component='bot'",
+            params![stored],
+            64 * 1024,
+        )?;
+        Ok(())
+    })
+    .await
+    .unwrap();
+
+    let state = control.component("bot").await.unwrap();
+    assert_eq!(state.installed_launcher.as_ref(), Some(&release));
+    assert!(state.desired_launcher.is_none());
+    let error = service
+        .required_launcher(&release, None)
+        .await
+        .err()
+        .expect("required launcher must refuse");
+    assert_eq!(
+        error.to_string(),
+        "required launcher failed; retry the selected pair from owner recovery"
+    );
+    assert!(matches!(
+        service.launcher(&state).await.unwrap(),
+        ControlStep::Proceed
+    ));
+    assert_nothing_staged(&root, &service.staging);
+    assert!(
+        control
+            .component("bot")
+            .await
+            .unwrap()
+            .desired_launcher
+            .is_none()
+    );
+
+    // An explicit selection of the same digest permits a retry.
+    control
+        .select_required_launcher(&release, None)
+        .await
+        .unwrap();
+    let selected = control.component("bot").await.unwrap();
+    assert!(matches!(
+        service.launcher(&selected).await.unwrap(),
+        ControlStep::Reexec
+    ));
+    let handoff = tokio::fs::read_to_string(root.join("jmodguard-launcher-next"))
+        .await
+        .unwrap();
+    assert_eq!(handoff.lines().nth(2), Some(release.digest.as_str()));
+    server.abort();
+    drop((service, control, db));
+    tokio::fs::remove_dir_all(root).await.unwrap();
+}
+
+#[tokio::test]
 async fn expired_installed_launcher_handoff_restores_only_the_recorded_release() {
     let root =
         std::env::temp_dir().join(format!("launcher-expired-{:032x}", rand::random::<u128>()));
@@ -10222,6 +10552,71 @@ async fn outage_fallback_immediate_rollback_recovers_schema_refusal() {
 }
 
 #[tokio::test]
+async fn failed_replacement_refuses_rollback_at_a_different_guild_schema() {
+    immediate_rollback(Some("guild_schema"), true).await;
+}
+
+#[tokio::test]
+async fn failed_spawn_refuses_rollback_at_a_different_guild_schema() {
+    let root = std::env::temp_dir().join(format!("spawn-rollback-{:032x}", rand::random::<u128>()));
+    tokio::fs::create_dir_all(&root).await.unwrap();
+    let (db, control) = open_launcher_db(&root).await;
+    let prior = release_at("bot", 'a', db::CORE_SCHEMA_VERSION);
+    let failed = release_at("bot", 'b', db::CORE_SCHEMA_VERSION);
+    let stamp = now();
+    install_for_outage(&db, &control, &prior, stamp).await;
+    control
+        .checked("bot", "latest", Some(failed.clone()), None, stamp)
+        .await
+        .unwrap();
+    db::request_component_install(&db, "bot", &failed.digest, stamp)
+        .await
+        .unwrap();
+
+    let mut service = offline_controller("bot", control.clone(), &root);
+    let path = executable(&root, "installed-bot").await;
+    service.standby = Some(RestartTarget {
+        path: path.clone(),
+        source_sha: prior.source_sha.clone(),
+        release: Some(prior.clone()),
+    });
+    let mut seen = fresh_observation(stamp);
+    seen.guild_schema = Some(db::guild_data::SCHEMA_VERSION + 1);
+    control.running("bot", None, seen, stamp).await.unwrap();
+
+    let state = control.component("bot").await.unwrap();
+    let error = service
+        .rollback_independent(&state, failed.clone(), "spawn failed".into())
+        .await
+        .unwrap_err();
+    assert_eq!(error.to_string(), "rollback guild schema is incompatible");
+    assert!(service.running.is_none());
+    assert!(!root.join("events").exists());
+    let kept = control.component("bot").await.unwrap();
+    assert_eq!(kept.installed, Some(prior.clone()));
+    assert_eq!(kept.desired, Some(failed.clone()));
+
+    control
+        .running("bot", None, fresh_observation(stamp), stamp)
+        .await
+        .unwrap();
+    let state = control.component("bot").await.unwrap();
+    service
+        .rollback_independent(&state, failed, "spawn failed".into())
+        .await
+        .unwrap();
+    wait_for_ready_file(&service).await;
+    assert_eq!(service.running.as_ref().unwrap().path, path);
+    assert!(service.report_ready().await.unwrap());
+    let settled = control.component("bot").await.unwrap();
+    assert_eq!(settled.installed, Some(prior));
+    assert!(settled.desired.is_none());
+    service.stop_application().await.unwrap();
+    drop((service, control, db));
+    tokio::fs::remove_dir_all(root).await.unwrap();
+}
+
+#[tokio::test]
 async fn baked_immediate_rollback_restarts_exited_fallback_before_settlement() {
     immediate_rollback(Some("fallback_exit"), false).await;
 }
@@ -10299,7 +10694,10 @@ async fn immediate_rollback(fault: Option<&str>, managed: bool) {
     wait_for_ready_file(&service).await;
     assert!(service.report_ready().await.unwrap());
     let seen = control.component("bot").await.unwrap().observed.unwrap();
-    control.running("api", None, seen, now()).await.unwrap();
+    control
+        .running("api", None, seen.clone(), now())
+        .await
+        .unwrap();
     control
         .checked("bot", "latest", Some(candidate.clone()), None, now())
         .await
@@ -10325,6 +10723,7 @@ async fn immediate_rollback(fault: Option<&str>, managed: bool) {
     );
     let elapsed = READY_TIMEOUT + Duration::from_secs(1);
     let child = service.running.as_mut().unwrap();
+    let replacement_pid = child.child.id().unwrap();
     child.started_at = now() - elapsed.as_secs() as i64;
     child.started = Instant::now() - elapsed;
     match fault {
@@ -10366,6 +10765,11 @@ async fn immediate_rollback(fault: Option<&str>, managed: bool) {
             })
             .await
             .unwrap();
+        }
+        Some("guild_schema") => {
+            let mut changed = seen.clone();
+            changed.guild_schema = Some(db::guild_data::SCHEMA_VERSION + 1);
+            control.running("bot", None, changed, now()).await.unwrap();
         }
         None => {}
         Some(other) => panic!("unknown fault {other}"),
@@ -10443,6 +10847,17 @@ async fn immediate_rollback(fault: Option<&str>, managed: bool) {
                 })
                 .await
                 .unwrap();
+                assert!(!service.normal().await.unwrap());
+            }
+            "guild_schema" => {
+                assert_eq!(error.to_string(), "rollback guild schema is incompatible");
+                let child = &mut service.running.as_mut().unwrap().child;
+                assert_eq!(child.id(), Some(replacement_pid));
+                assert!(child.try_wait().unwrap().is_none());
+                let blocked = control.component("bot").await.unwrap();
+                assert_eq!(blocked.installed, Some(release.clone()));
+                assert_eq!(blocked.desired, Some(candidate.clone()));
+                control.running("bot", None, seen, now()).await.unwrap();
                 assert!(!service.normal().await.unwrap());
             }
             _ => unreachable!(),
