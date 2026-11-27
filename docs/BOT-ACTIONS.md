@@ -92,9 +92,10 @@ must not replace captured-scope helpers in dashboard routes. Status reads hide
 old/unbound memberships. `bot_action_dispatch` rechecks running claim identity,
 current membership and persisted guild write fences at the primary, preserving whether
 dispatch was blocked by enrollment replacement or a write fence. It does not perform
-Discord validation or a mutation. Claim selection excludes fenced guilds; expiry of overdue `pending`/`claimed`
-work and `running`→`uncertain` still run when `expires_at` has passed, even if no other
-guild has claimable work. Local log-channel completion checks the write fence again in the same
+Discord validation or a mutation. Both the action poll advisory and claim selection
+exclude fenced guilds. Once an action poll opens a claim transaction, expiry processing
+can expire overdue `pending`/`claimed` work and mark overdue `running` work uncertain
+across guilds. Local log-channel completion checks the write fence again in the same
 transaction as the setting write so a fence raised during Discord channel validation
 still fails closed. Unban completion preserves the Discord result but skips its local
 ban-mirror and event writes if a write fence appeared after dispatch.
