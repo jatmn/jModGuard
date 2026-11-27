@@ -156,6 +156,17 @@ fn unset_and_partial_config_only_enable_complete_pairs() {
     cache.enable(&Config::load(|_| None));
     assert!(cache.view(instant()).is_none());
 
+    for (variable, value) in [
+        ("JMODGUARD_BUNNY_MC_APP_ID", MC),
+        ("JMODGUARD_BUNNY_MC_STATS_KEY", KEY),
+    ] {
+        let cfg = Config::load(|name| (name == variable).then(|| value.to_owned()));
+        assert!(cfg.sources.is_empty());
+        cache.enable(&cfg);
+        assert!(cache.0.read().unwrap().is_none(), "{variable}");
+        assert!(cache.view(instant()).is_none(), "{variable}");
+    }
+
     let cfg = Config::load(|name| match name {
         "JMODGUARD_BUNNY_DATA_STATS_KEY" => Some(KEY.into()),
         "JMODGUARD_BUNNY_DB_GUILD_ID" => Some(GUILD.into()),
@@ -427,6 +438,20 @@ impl Drop for DbFile {
         }
         jmodguard::tenant::remove_sidecars(&self.0);
     }
+}
+
+#[tokio::test]
+async fn startup_leaves_bunny_costs_unconfigured_when_client_creation_fails() {
+    let file =
+        DbFile(std::env::temp_dir().join(format!("bunny_costs_{}.db", rand::random::<u64>())));
+    let mut api_cfg = ApiProcessConfig::default();
+    api_cfg.db.path = file.0.clone();
+    let app = ApiState::new(api_cfg, Db::open(&file.0, 2).unwrap()).unwrap();
+
+    spawn_with_config(&app, config(), "invalid-url");
+
+    assert!(app.bunny_costs.0.read().unwrap().is_none());
+    assert!(app.bunny_costs.view(instant()).is_none());
 }
 
 #[test]

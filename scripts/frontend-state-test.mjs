@@ -14408,6 +14408,9 @@ test('Bot Resources hides Bunny costs without config and renders partial provide
   assert.match(textOf(section()), /EgressUnknown regional rate/);
   assert.match(textOf(section()), /2026-10Unknown egress rate \(partial\)/);
 
+  snapshot = resourceSnapshot();
+  await fire(h.nodes.get('#refresh-resources'), 'click');
+  assert.equal(section(), null);
 });
 
 test('Bot Resources rounds combined memory up from bytes, including zero and block boundaries', async () => {

@@ -82,8 +82,9 @@ keys restricted to the listed resources. Example values are placeholders.
 
 Set a matching key and ID for each service you want to see. Either database
 ID can be used by itself. Copy uppercase database IDs as issued. The API
-does not trim or change ID case. An entirely unset configuration hides the
-Bunny panel. Scoped keys cannot read CDN statistics.
+does not trim or change ID case. The Bunny panel appears only when the API can
+start a collector for at least one valid key-and-ID pair. Scoped keys cannot
+read CDN statistics.
 
 All figures are estimates in USD on a UTC calendar month. Magic Containers uses
 Bunny's projected `monthlyCost` and estimates accrued costs from charted

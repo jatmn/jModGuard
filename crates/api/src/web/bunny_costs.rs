@@ -64,7 +64,6 @@ impl Source {
 }
 
 struct Config {
-    enabled: bool,
     sources: Vec<Source>,
 }
 
@@ -76,9 +75,6 @@ impl Config {
         let core = get("JMODGUARD_BUNNY_DB_CORE_ID");
         let guild = get("JMODGUARD_BUNNY_DB_GUILD_ID");
         let storage = get("JMODGUARD_BUNNY_STORAGE_ZONE_ID");
-        let enabled = [&mc_key, &data_key, &mc, &core, &guild, &storage]
-            .into_iter()
-            .any(|value| value.as_ref().is_some_and(|value| !value.is_empty()));
         let guild = guild.filter(|id| Some(id) != core.as_ref());
         let sources = [
             (Service::MagicContainers, mc, mc_key.as_deref()),
@@ -89,7 +85,7 @@ impl Config {
         .into_iter()
         .filter_map(|(service, id, key)| Source::new(service, id?, key?))
         .collect();
-        Self { enabled, sources }
+        Self { sources }
     }
 }
 
@@ -257,7 +253,7 @@ pub(super) struct Cache(RwLock<Option<BTreeMap<Service, Feed>>>);
 impl Cache {
     fn enable(&self, config: &Config) {
         if let Ok(mut state) = self.0.write() {
-            *state = config.enabled.then(|| {
+            *state = (!config.sources.is_empty()).then(|| {
                 config
                     .sources
                     .iter()
@@ -555,14 +551,18 @@ async fn run(app: Arc<ApiState>, client: Arc<Client>, source: Source) {
 
 pub fn spawn(app: &Arc<ApiState>) {
     let config = Config::load(|name| std::env::var(name).ok());
-    app.bunny_costs.enable(&config);
+    spawn_with_config(app, config, "https://api.bunny.net");
+}
+
+fn spawn_with_config(app: &Arc<ApiState>, config: Config, base: &str) {
     if config.sources.is_empty() {
         return;
     }
-    let Ok(client) = Client::new("https://api.bunny.net", DEADLINE) else {
+    let Ok(client) = Client::new(base, DEADLINE) else {
         tracing::warn!("Bunny statistics client could not start");
         return;
     };
+    app.bunny_costs.enable(&config);
     let client = Arc::new(client);
     for source in config.sources {
         tokio::spawn(run(Arc::clone(app), Arc::clone(&client), source));

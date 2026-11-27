@@ -597,6 +597,31 @@ async fn unavailable_history_still_returns_live_api_values() {
 }
 
 #[tokio::test]
+async fn owner_response_reports_orphaned_bunny_settings_as_not_configured() {
+    let f = fixture();
+    for (variable, value) in [
+        ("JMODGUARD_BUNNY_MC_APP_ID", "placeholder-app"),
+        ("JMODGUARD_BUNNY_MC_STATS_KEY", "placeholder-stats-key"),
+    ] {
+        f.app
+            .bunny_costs
+            .configure_for_test(|name| (name == variable).then(|| value.to_owned()));
+        let owner = signed_in(&f.app, 99).await;
+        let body = response_json(
+            overview(State(f.app.clone()), owner, origin(&f.app), range("1h"))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(
+            body["provider"],
+            json!({"status": "not_configured", "reason": "no_scoped_read_only_key"}),
+            "{variable}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn owner_response_never_contains_bunny_credentials_or_resource_ids() {
     let f = fixture();
     let key = "placeholder-api-only-key";
