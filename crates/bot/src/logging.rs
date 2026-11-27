@@ -35,6 +35,7 @@ pub(crate) const REJOIN_NOTE_DELIVERY_LIMIT: usize = 4096;
 const REJOIN_NOTE_PRUNE_BATCH: usize = 64;
 const MEMBER_AUDIT_KEEP: Duration = Duration::from_secs(30);
 const MEMBER_AUDIT_LIMIT: usize = 4096;
+const MEMBER_AUDIT_LATEST_DELTA_MS: i64 = 3_000;
 const MEMBER_AUDIT_RETRY_DELAY: Duration = Duration::from_millis(500);
 const SHUTDOWN_NOTICE_PHASE: Duration = Duration::from_secs(3);
 
@@ -249,7 +250,7 @@ impl MemberAuditClaims {
         }
         let uncertain_through = state.subjects.get(&key).and_then(|previous| {
             let unresolved = (previous.attribution == AuditAttribution::Unresolved)
-                .then_some(previous.observed_ms + 3_000);
+                .then_some(previous.observed_ms + MEMBER_AUDIT_LATEST_DELTA_MS);
             previous.uncertain_through.max(unresolved)
         });
         state.next_generation = state.next_generation.wrapping_add(1);
@@ -270,6 +271,16 @@ impl MemberAuditClaims {
 
     fn has_unclaimed_subject(&self, observation: &MemberAuditObservation) -> bool {
         self.inner.lock().unclaimed_subject(observation).is_some()
+    }
+
+    pub(crate) fn window_is_fenced(&self, observation: &MemberAuditObservation) -> bool {
+        self.inner
+            .lock()
+            .unclaimed_subject(observation)
+            .and_then(|(_, subject)| subject.uncertain_through)
+            .is_some_and(|through| {
+                through >= observation.observed_ms + MEMBER_AUDIT_LATEST_DELTA_MS
+            })
     }
 
     fn join_page_request(
@@ -2058,7 +2069,7 @@ fn member_audit_vars(
         let delta = entry.id.created_at().timestamp_millis() - observed_ms;
         entry.action.num() == action.num()
             && entry.target_id.is_some_and(|id| id.get() == target)
-            && (-10_000..=3_000).contains(&delta)
+            && (-10_000..=MEMBER_AUDIT_LATEST_DELTA_MS).contains(&delta)
             && !already_claimed(entry.id.get())
     });
     let entry = matches.next()?;
@@ -4184,6 +4195,27 @@ pub(crate) async fn emit_member_event(
     extra: BTreeMap<String, String>,
     observation: Option<MemberAuditObservation>,
 ) -> (Delivery, Option<BTreeMap<String, String>>) {
+    emit_member_event_to(
+        app,
+        ctx.http.as_ref(),
+        guild_id,
+        event,
+        user,
+        extra,
+        observation,
+    )
+    .await
+}
+
+pub(crate) async fn emit_member_event_to(
+    app: &Arc<BotState>,
+    sink: &impl LogDelivery,
+    guild_id: GuildId,
+    event: &str,
+    user: &serenity::model::user::User,
+    extra: BTreeMap<String, String>,
+    observation: Option<MemberAuditObservation>,
+) -> (Delivery, Option<BTreeMap<String, String>>) {
     let account_created = user.created_at();
     let account_age_seconds =
         (chrono::Utc::now().timestamp() - account_created.unix_timestamp()).max(0) as u64;
@@ -4201,7 +4233,7 @@ pub(crate) async fn emit_member_event(
     vars.extend(extra);
     emit_to_observed_with_audit(
         app,
-        ctx.http.as_ref(),
+        sink,
         guild_id,
         event,
         vars,
