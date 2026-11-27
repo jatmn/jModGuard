@@ -6406,7 +6406,7 @@ fn unlock_reservations(file: &std::fs::File) {
     unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_UN) };
 }
 
-#[derive(Debug)]
+#[derive(Clone, Copy, Debug)]
 enum ProcLookup {
     Gone,
     Unreadable,
@@ -6468,7 +6468,7 @@ fn read_reservation_claims(dir: &std::path::Path) -> Result<String, String> {
     Ok(text)
 }
 
-fn load_reservations(dir: &std::path::Path) -> Vec<Reservation> {
+fn parse_reservations(dir: &std::path::Path) -> Vec<Reservation> {
     let text = read_reservation_claims(dir).unwrap_or_else(|error| panic!("{error}"));
     text.lines()
         .filter_map(|line| {
@@ -6476,12 +6476,25 @@ fn load_reservations(dir: &std::path::Path) -> Vec<Reservation> {
             let port = parts.next()?.parse().ok()?;
             let pid = parts.next()?.parse().ok()?;
             let start = parts.next()?.parse().ok()?;
-            if !owner_still_reserved(process_start(pid), start) {
-                return None;
-            }
             Some(Reservation { port, pid, start })
         })
         .collect()
+}
+
+fn retain_live_reservations(rows: &mut Vec<Reservation>) {
+    let mut owners = HashMap::new();
+    rows.retain(|row| {
+        let observed = *owners
+            .entry(row.pid)
+            .or_insert_with(|| process_start(row.pid));
+        owner_still_reserved(observed, row.start)
+    });
+}
+
+fn load_reservations(dir: &std::path::Path) -> Vec<Reservation> {
+    let mut rows = parse_reservations(dir);
+    retain_live_reservations(&mut rows);
+    rows
 }
 
 fn reservation_text(rows: &[Reservation]) -> String {
@@ -6556,17 +6569,24 @@ fn claim_port(port: u16) -> bool {
 
 fn claim_port_in(dir: &std::path::Path, port: u16) -> bool {
     with_reservations_in(dir, |dir| {
-        let mut rows = load_reservations(dir);
-        let free = rows.iter().all(|row| row.port != port);
-        if free {
-            rows.push(Reservation {
-                port,
-                pid: std::process::id(),
-                start: our_start(),
-            });
+        let mut rows = parse_reservations(dir);
+        // An occupied slot needs only its owner's identity. Prune and publish
+        // the shared snapshot only when adding a claim.
+        if rows
+            .iter()
+            .any(|row| row.port == port && owner_still_reserved(process_start(row.pid), row.start))
+        {
+            return false;
         }
+        rows.retain(|row| row.port != port);
+        retain_live_reservations(&mut rows);
+        rows.push(Reservation {
+            port,
+            pid: std::process::id(),
+            start: our_start(),
+        });
         store_reservations(dir, &rows);
-        free
+        true
     })
 }
 
@@ -6666,6 +6686,11 @@ fn interrupted_reservation_rewrite_keeps_a_live_owners_claim() {
     assert!(
         !claim_port_in(&dir, port),
         "live owner's reserved port was handed out after the crashed rewrite"
+    );
+    assert_eq!(
+        std::fs::metadata(&claims).unwrap().ino(),
+        claims_inode,
+        "refusing a live owner's port rewrote the claims file"
     );
     assert_eq!(
         std::fs::metadata(dir.join("lock")).unwrap().ino(),
@@ -10698,6 +10723,7 @@ async fn immediate_rollback(fault: Option<&str>, managed: bool) {
     );
     let elapsed = READY_TIMEOUT + Duration::from_secs(1);
     let child = service.running.as_mut().unwrap();
+    let replacement_pid = child.child.id().unwrap();
     child.started_at = now() - elapsed.as_secs() as i64;
     child.started = Instant::now() - elapsed;
     match fault {
@@ -10825,10 +10851,9 @@ async fn immediate_rollback(fault: Option<&str>, managed: bool) {
             }
             "guild_schema" => {
                 assert_eq!(error.to_string(), "rollback guild schema is incompatible");
-                assert_eq!(
-                    independent_exit_starts(&root).await,
-                    ["installed-bot.start", "desired-bot.start"]
-                );
+                let child = &mut service.running.as_mut().unwrap().child;
+                assert_eq!(child.id(), Some(replacement_pid));
+                assert!(child.try_wait().unwrap().is_none());
                 let blocked = control.component("bot").await.unwrap();
                 assert_eq!(blocked.installed, Some(release.clone()));
                 assert_eq!(blocked.desired, Some(candidate.clone()));
