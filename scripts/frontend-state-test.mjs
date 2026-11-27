@@ -14386,7 +14386,7 @@ test('Bot Resources hides Bunny costs without config and renders partial provide
     status: 'configured', month: '2026-11',
     magic_containers: { status: 'available', month_to_date_usd: 2.25, projected_usd: 4.75, last_updated_secs: RESOURCE_NOW_MS / 1000 },
     magic_breakdown: { cpu: 0.02, ram: 0.30, egress: 0.75, volume: null },
-    magic_cpu_hourly_averages: { sampled_at: sampledAt, min: 0.08, max: 0.1 },
+    magic_cpu_hourly_averages: { sampled_at: sampledAt, min: 1.04 * 0.08, max: 1.23 * 0.08 },
     database: { status: 'unavailable', configured_resources: 1 },
     storage: { status: 'unavailable', month_to_date_usd: 0.005, projected_usd: 0.01, last_updated_secs: RESOURCE_NOW_MS / 1000, partial: true },
     cdn: { status: 'unavailable' },
@@ -14419,6 +14419,7 @@ test('Bot Resources hides Bunny costs without config and renders partial provide
   snapshot.provider.magic_breakdown.egress = null;
   snapshot.provider.magic_breakdown.egress_rate_unknown = true;
   snapshot.provider.magic_breakdown.volume = 0;
+  snapshot.provider.magic_cpu_hourly_averages.max = snapshot.provider.magic_cpu_hourly_averages.min;
   delete snapshot.provider.magic_cpu_hourly_averages.sampled_at;
   snapshot.provider.history[0].magic_containers = { usd: null, egress_rate_unknown: true, partial: true };
   await fire(h.nodes.get('#refresh-resources'), 'click');
@@ -14426,7 +14427,7 @@ test('Bot Resources hides Bunny costs without config and renders partial provide
   assert.match(textOf(section()), /EgressUnknown regional rate/);
   assert.match(textOf(detail()), /Volumes\$0\.00/);
   assert.match(textOf(section()), /2026-10Unknown egress rate \(partial\)/);
-  assert.match(textOf(detail()), /0\.08–0\.1 · Sample time unavailable/);
+  assert.match(textOf(detail()), /0\.08 · Sample time unavailable/);
   assert.equal(detail().querySelector('time'), null);
 
   const volume = 0.60 * 0.5 / 720;

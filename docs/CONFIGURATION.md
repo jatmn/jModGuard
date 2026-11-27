@@ -96,9 +96,14 @@ buckets contribute to chart estimates and displayed averages.
 
 | Chart field | Observed or published scope | Treatment |
 | --- | --- | --- |
-| `cpuUsageSplitChart` | Mean percentage of the standard 8-CPU pod allocation. The unit is inferred from a match with billed costs. The public chart docs omit the unit. | Convert to estimated cores as `percent / 100 × 8` and price closed hours at $0.02 per core-hour. The latest closed hour also shows the estimated average cores per pod. |
+| `cpuUsageSplitChart` | Mean percentage of the standard 8-CPU pod allocation, inferred from a cost comparison | Convert to estimated cores as `percent / 100 × 8` and price closed hours at $0.02 per core-hour. The latest closed hour also shows the estimated average cores per pod. |
 | `ramUsageSplitChart` | Sample-weighted mean bytes per pod, including daily buckets | Rounded up to whole 64 MiB blocks per pod and priced per hour. |
 | `trafficSplitChart` | Bytes summed per bucket, with daily values equal to the sum of hourly values | Priced as egress at the rate for the reporting pod's region |
+
+The reconstructed month-to-date total matched one standard app's
+`/summary.monthlyCost` projection. The public chart docs omit the CPU unit,
+and the conversion is unverified for
+[one-CPU trial pods](https://bunny.net/docs/magic-containers/limits#trial-accounts).
 
 Daily CPU and RAM values are sample-weighted means of the underlying readings.
 Current CPU cost uses closed hourly observations. Historical backfill reads

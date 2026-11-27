@@ -1772,6 +1772,8 @@ const BUNNY_COST_SERVICES = [
   ["cdn", "CDN"],
 ];
 
+const bunnyCpuFormat = new Intl.NumberFormat("en-US", { maximumFractionDigits: 2 });
+
 function bunnyUsd(amount) {
   if (!Number.isFinite(amount) || amount < 0) return "Not available";
   if (amount > 0 && amount < 0.01) return "<$0.01";
@@ -1823,7 +1825,9 @@ function BunnyCostPanel({ provider }) {
   const cpuSampleTime = formatInstant(Date.parse(cpu?.sampled_at ?? ""));
   let cpuAverage = "Not available";
   if (cpu) {
-    cpuAverage = cpu.min === cpu.max ? String(cpu.min) : `${cpu.min}–${cpu.max}`;
+    const min = bunnyCpuFormat.format(cpu.min);
+    const max = bunnyCpuFormat.format(cpu.max);
+    cpuAverage = min === max ? min : `${min}–${max}`;
   }
   return analyticsPanel("Bunny cost estimates", "resources-bunny-costs", h("div", null,
     h("p", { className: "an-note muted" },

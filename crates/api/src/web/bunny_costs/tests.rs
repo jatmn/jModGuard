@@ -358,6 +358,40 @@ async fn magic_container_chart_fixtures_price_closed_hourly_and_daily_buckets() 
 }
 
 #[tokio::test]
+async fn magic_container_reconstructed_total_compares_to_summary_projection() {
+    let mock = Mock::start().await;
+    {
+        let mut state = mock.state.lock().unwrap();
+        let hourly = include_str!("fixtures/magic_containers_hourly_representative.json");
+        state.charts = Some(serde_json::from_str(hourly).unwrap());
+        state.allocated_volume_gb = Some(6.0);
+    }
+    let client = mock.client(Duration::from_secs(2));
+    let cfg = config();
+    let to = Utc.with_ymd_and_hms(2026, 11, 2, 0, 30, 0).unwrap();
+    let month = month_start(to.date_naive());
+    let window = Window {
+        month,
+        from: midnight(month),
+        to,
+    };
+    // The hourly fixture totals $0.0068 CPU, $0.005625 RAM, $0.0002 egress
+    // and $0.60 × 24.5 / 720 of allocated volume.
+    let expected_total = 0.033_041_666_666_666_67;
+    for (monthly_cost, matches) in [(expected_total, true), (2.38, false)] {
+        mock.state.lock().unwrap().monthly_cost = Some(monthly_cost);
+        let data = collect(&client, &cfg.sources[0], window, false)
+            .await
+            .unwrap();
+        let total = data.month_to_date.unwrap();
+        let projection = data.projection.unwrap();
+        assert_eq!(projection, monthly_cost);
+        assert!((total - expected_total).abs() < 1e-12);
+        assert_eq!((total - projection).abs() < 1e-12, matches);
+    }
+}
+
+#[tokio::test]
 async fn magic_container_cpu_counts_the_utc_midnight_bucket_only_after_it_closes() {
     let mock = Mock::start().await;
     let charts = include_str!("fixtures/magic_containers_hourly_representative.json");
