@@ -301,6 +301,7 @@ pub(crate) async fn enforce(
     if app.poll_config_version().await.is_err() {
         return ReportDisposition::Retryable;
     }
+    let write_generation = app.db.config_write_generation();
     let Ok(cfg) = app.configs.get(&app.db, found.guild).await else {
         return ReportDisposition::Retryable;
     };
@@ -370,7 +371,11 @@ pub(crate) async fn enforce(
         .await;
         return ReportDisposition::Consumed;
     }
-    punish_proven_match(app, http, cache, found, rule, name, rule_def, enrollment).await
+    let dispatch = crate::automod::ConfigDispatch::new(found.guild, &cfg, write_generation);
+    punish_proven_match(
+        app, http, cache, found, rule, name, rule_def, enrollment, dispatch,
+    )
+    .await
 }
 
 // Member lookup, earlier deletes, and ban preparation can all outlive the
@@ -405,6 +410,7 @@ async fn punish_proven_match(
     name: &str,
     rule_def: &jmodguard::types::RuleDef,
     enrollment: crate::db::GuildEnrollment,
+    dispatch: crate::automod::ConfigDispatch,
 ) -> ReportDisposition {
     let member = tokio::time::timeout(
         Duration::from_secs(10),
@@ -554,11 +560,17 @@ async fn punish_proven_match(
     let mut delete_notes = Vec::new();
     let mut own_deletes = Vec::new();
     let mut proof_stale = false;
+    let rule_is_current = || async {
+        dispatch.is_current(app)
+            || (found.kind == Kind::Text
+                && crate::automod::recheck_live_rule(app, found.guild, rule, rule_def, |_| true)
+                    .await)
+    };
     for (channel, message) in &found.messages {
         if !app.activation.may_record() {
             break;
         }
-        if !image_match_still_current(app, &found, &own_deletes).await {
+        if !image_match_still_current(app, &found, &own_deletes).await || !rule_is_current().await {
             proof_stale = true;
             break;
         }
@@ -874,7 +886,10 @@ async fn punish_proven_match(
                             }
                             Err(_) => None,
                         };
-                        if !image_match_still_current(app, &found, &own_deletes).await {
+                        let purge_seconds = ban_action.ban_delete_message_seconds();
+                        if !image_match_still_current(app, &found, &own_deletes).await
+                            || (purge_seconds > 0 && !rule_is_current().await)
+                        {
                             app.spam_gate
                                 .finish_ban(found.guild, found.author, now, false);
                             pending_ban.finish(app, CaseOutcome::Failed).await;
@@ -887,8 +902,6 @@ async fn punish_proven_match(
                                 &found.reason,
                                 attempted.as_ref(),
                             );
-                            let purge_seconds = ban_action.ban_delete_message_seconds();
-                            let write_generation = app.db.config_write_generation();
                             if let Some(cleanup) = &cleanup {
                                 cleanup.begin_purge(
                                     purge_seconds,
@@ -914,32 +927,22 @@ async fn punish_proven_match(
                             )
                             .await
                             {
-                                if outcome == CaseOutcome::Succeeded && purge_seconds > 0 {
+                                if outcome == CaseOutcome::Succeeded
+                                    && purge_seconds > 0
+                                    && dispatch.is_current(app)
+                                {
                                     let sweep_at_ms = chrono::Utc::now().timestamp_millis();
-                                    let dispatch_is_current = || {
-                                        write_generation & 1 == 0
-                                            && found.token.1 >= app.db.required_config_version()
-                                            && app.configs.last_known(found.guild).is_some_and(
-                                                |cfg| {
-                                                    (cfg.version, cfg.durable_version)
-                                                        == found.token
-                                                },
-                                            )
-                                            && write_generation == app.db.config_write_generation()
-                                    };
-                                    if dispatch_is_current() {
-                                        deleted_count += crate::recent_messages::sweep_after_ban(
-                                            app,
-                                            http.as_ref(),
-                                            &enrollment,
-                                            found.author,
-                                            purge_seconds,
-                                            sweep_at_ms,
-                                            cleanup.as_ref(),
-                                            dispatch_is_current,
-                                        )
-                                        .await;
-                                    }
+                                    deleted_count += crate::recent_messages::sweep_after_ban(
+                                        app,
+                                        http.as_ref(),
+                                        &enrollment,
+                                        found.author,
+                                        purge_seconds,
+                                        sweep_at_ms,
+                                        cleanup.as_ref(),
+                                        || std::future::ready(dispatch.is_current(app)),
+                                    )
+                                    .await;
                                 }
                                 ban_outcome = Some(outcome);
                             }
@@ -1774,14 +1777,17 @@ pub(crate) mod tests {
     async fn ban_purge_repeated_text_uses_saved_selection_and_keeps_matched_deletes() {
         use std::sync::atomic::{AtomicBool, Ordering};
         let ban = ("PUT", "/api/v10/guilds/10/bans/99");
+        let member = ("GET", "/api/v10/guilds/10/members/99");
         let first_sweep = ("DELETE", "/api/v10/channels/16/messages/46");
         let second_sweep = ("DELETE", "/api/v10/channels/15/messages/45");
-        for (purge, dry, disable_on, expected, swept) in [
-            (false, false, None, 0, 0),
-            (true, false, None, 3600, 2),
-            (true, false, Some(ban), 3600, 0),
-            (true, false, Some(first_sweep), 3600, 1),
-            (true, true, None, 3600, 0),
+        for (purge, dry, mut disable_on, expected, swept, matched) in [
+            (false, false, None, 0, 0, 3),
+            (true, false, None, 3600, 2, 3),
+            (true, false, Some(ban), 3600, 0, 3),
+            (true, false, Some(first_sweep), 3600, 1, 3),
+            (true, false, Some(member), 3600, 0, 0),
+            (true, false, None, 3600, 0, 1),
+            (true, true, None, 3600, 0, 0),
         ] {
             let path = std::env::temp_dir()
                 .join(format!("text_ban_purge_{:032x}.db", rand::random::<u128>()));
@@ -1841,6 +1847,13 @@ pub(crate) mod tests {
                     &[(42, 11, text), (43, 12, text), (44, 13, text)],
                 )
                 .expect("real text detector match");
+            let first_match = format!(
+                "/api/v10/channels/{}/messages/{}",
+                messages[0].0, messages[0].1
+            );
+            if matched == 1 {
+                disable_on = Some(("DELETE", first_match.as_str()));
+            }
             let found = Match {
                 kind: Kind::Text,
                 guild: 10,
@@ -1863,13 +1876,17 @@ pub(crate) mod tests {
             let writer = Arc::clone(&app);
             let runtime = tokio::runtime::Handle::current();
             rule.enabled = false;
+            let disable_route = disable_on.map(|(method, path)| (method, path.to_owned()));
             let server = std::thread::spawn(move || {
                 serve_discord_stub(
                     listener,
                     server_lines,
                     server_stop,
                     move |method, path, _| {
-                        if disable_on == Some((method, path)) {
+                        if disable_route
+                            .as_ref()
+                            .is_some_and(|(m, p)| *m == method && p == path)
+                        {
                             let saved = runtime
                                 .block_on(crate::db::apply_control(
                                     &writer.db,
@@ -1914,13 +1931,28 @@ pub(crate) mod tests {
                 crate::db::active_ban_recorded(&app.db, 10, 99)
                     .await
                     .unwrap(),
-                !dry,
+                matched == 3,
                 "{seen:?}"
             );
             if dry {
                 assert!(
                     seen.is_empty(),
                     "dry-run must not delete, ban, purge or fetch history: {seen:?}"
+                );
+            } else if matched == 0 {
+                assert_eq!(
+                    seen,
+                    ["GET /api/v10/guilds/10/members/99"],
+                    "disabling during member lookup must stop matched deletes: {seen:?}"
+                );
+            } else if matched == 1 {
+                assert_eq!(
+                    seen,
+                    [
+                        "GET /api/v10/guilds/10/members/99".to_owned(),
+                        format!("DELETE {first_match}"),
+                    ],
+                    "a dispatched DELETE can finish, but remaining actions must stop: {seen:?}"
                 );
             } else {
                 let bans: Vec<_> = seen
@@ -2023,17 +2055,21 @@ pub(crate) mod tests {
             .await
             .unwrap()
             .unwrap();
-        app.tenant.activate(enrollment.clone()).await.unwrap();
+        app.tenant.activate(enrollment).await.unwrap();
         let mut rule = crate::defaults::default_rules().remove(2);
         rule.enabled = true;
         rule.skip_moderators = true;
-        let policy = jmodguard::text_spam::Policy {
-            mode: "exact_text".into(),
-            window_secs: 60,
-            min_channels: 3,
-            min_length: 20,
-            enforce: true,
-        };
+        rule.dry_run = false;
+        rule.actions =
+            serde_json::from_value(serde_json::json!([{"action":"delete"}, {"action":"ban"}]))
+                .unwrap();
+        crate::db::upsert_rule(&app.db, 10, "repeat_text", &rule)
+            .await
+            .unwrap();
+        app.poll_config_version().await.unwrap();
+        let cfg = app.configs.get(&app.db, 10).await.unwrap();
+        let token = (cfg.version, cfg.durable_version);
+        let policy = jmodguard::text_spam::Policy::parse(&cfg.rules["repeat_text"]).unwrap();
         let now = Instant::now();
         let text = "abcdefghijklmnopqrst";
         let messages = app
@@ -2041,7 +2077,7 @@ pub(crate) mod tests {
             .seed_exact_text(
                 10,
                 99,
-                (0, 0),
+                token,
                 &policy,
                 now,
                 &[(42, 11, text), (43, 12, text), (44, 13, text)],
@@ -2053,7 +2089,7 @@ pub(crate) mod tests {
             author: 99,
             channel: 11,
             policy: MatchPolicy::Text(policy),
-            token: (0, 0),
+            token,
             messages,
             excerpts: Vec::new(),
             proving_hashes: Vec::new(),
@@ -2074,15 +2110,13 @@ pub(crate) mod tests {
                 .with_writer(move || writer.clone())
                 .finish(),
         );
-        let disposition = punish_proven_match(
+        let disposition = enforce(
             &app,
             Arc::new(http),
             &cache,
             found,
             "repeat_text",
             "Repeated text",
-            &rule,
-            enrollment,
         )
         .with_subscriber(subscriber)
         .await;
