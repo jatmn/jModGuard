@@ -4398,7 +4398,7 @@ mod tests {
                         }
                         let status = (method == "DELETE"
                             && matches!(change, DispatchChange::ExternalDeleteDuringRequest))
-                        .then_some("404 Not Found");
+                        .then_some(("404 Not Found", ""));
                         use serenity::client::EventHandler;
                         use serenity::model::id::{ChannelId, MessageId};
                         let handler = crate::handlers::Handler {

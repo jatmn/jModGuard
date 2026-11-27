@@ -514,11 +514,15 @@ impl Detector {
         });
         let watermark = g.watermarks.remove(&author);
         let b = g.authors.entry(author).or_insert_with(|| Bucket {
-            retired_before: watermark.map(|w| w.retired_before).unwrap_or(0),
+            retired_before: watermark.as_ref().map_or(0, |w| w.retired_before),
             window: Duration::from_secs(policy.window_secs),
             last_seen: now,
             token,
-            proof_lifetime: Arc::default(),
+            proof_lifetime: watermark
+                .and_then(|w| w.proof)
+                .filter(|(proof_token, _)| *proof_token == token)
+                .map(|(_, lifetime)| lifetime)
+                .unwrap_or_default(),
             posts: vec![],
             report: ReportCooldown::ReadyAt(now),
         });
@@ -1637,38 +1641,67 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn echoed_text_deletes_expire_and_lose_proof_after_author_invalidation() {
-        let detector = Detector::default();
+    async fn echoed_text_deletes_keep_proof_only_for_live_same_token_author() {
         let now = tokio::time::Instant::now().into_std();
         let policy = policy();
         let token = (1, 2);
-        let messages = detector
-            .seed_exact_text(
-                1,
-                2,
+        for (restored_token, revoke_before_restore) in
+            [(token, false), ((1, 3), false), (token, true)]
+        {
+            let detector = Detector::default();
+            let messages = detector
+                .seed_exact_text(
+                    1,
+                    2,
+                    token,
+                    &policy,
+                    now,
+                    &[(10, 1, "spam"), (11, 2, "spam"), (12, 3, "spam")],
+                )
+                .unwrap();
+            let confirmed: Vec<_> = messages
+                .iter()
+                .map(|(channel, message)| {
+                    let mut delete = detector
+                        .begin_delete(1, 2, token, *channel, *message)
+                        .unwrap();
+                    detector.deleted(1, *channel, *message);
+                    delete.finish(true);
+                    delete
+                })
+                .collect();
+            let proves_at = |proof_token, at| {
+                detector.match_still_proving(
+                    (1, 2),
+                    proof_token,
+                    &messages,
+                    &policy,
+                    at,
+                    &confirmed,
+                )
+            };
+            assert!(proves_at(token, now));
+            if revoke_before_restore {
+                detector.invalidate_author(1, 2);
+                assert!(!proves_at(token, now));
+            }
+            assert!(
+                detector
+                    .seed_exact_text(1, 2, restored_token, &policy, now, &[(13, 4, "other")])
+                    .is_none()
+            );
+            assert_eq!(detector.author_of(1, 4, 13), Some(2));
+            assert_eq!(
+                proves_at(restored_token, now),
+                restored_token == token && !revoke_before_restore
+            );
+            assert!(!proves_at(
                 token,
-                &policy,
-                now,
-                &[(10, 1, "spam"), (11, 2, "spam"), (12, 3, "spam")],
-            )
-            .unwrap();
-        let confirmed: Vec<_> = messages
-            .iter()
-            .map(|(channel, message)| {
-                let mut delete = detector
-                    .begin_delete(1, 2, token, *channel, *message)
-                    .unwrap();
-                detector.deleted(1, *channel, *message);
-                delete.finish(true);
-                delete
-            })
-            .collect();
-        let proves_at =
-            |at| detector.match_still_proving((1, 2), token, &messages, &policy, at, &confirmed);
-        assert!(proves_at(now));
-        assert!(!proves_at(now + Duration::from_secs(policy.window_secs)));
-        detector.invalidate_author(1, 2);
-        assert!(!proves_at(now));
+                now + Duration::from_secs(policy.window_secs)
+            ));
+            detector.invalidate_author(1, 2);
+            assert!(!proves_at(token, now));
+        }
     }
 
     #[tokio::test(start_paused = true)]
