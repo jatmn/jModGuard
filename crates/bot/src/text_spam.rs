@@ -55,7 +55,7 @@ struct Post {
 }
 
 /// A deleted post can still prove this dispatch if REST succeeded and Gateway
-/// echoed its single-message delete. The observation itself is retired normally.
+/// echoed the deletion. The observation itself is retired normally.
 pub(crate) struct OwnDelete {
     post: Post,
     proof_lifetime: Weak<()>,
