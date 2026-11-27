@@ -1244,7 +1244,7 @@ pub(crate) async fn execute_pending_with(
             msg_channel,
             pending,
             action,
-            pending.matched_rule.as_ref().unwrap_or(settings),
+            settings,
             enrollment.clone(),
             vars,
             &reason,
@@ -1329,23 +1329,32 @@ fn preset_scope_allows(
         })
 }
 
-/// A scope seen after asynchronous admission. The version checks are
-/// synchronous so a later I/O wait cannot authorize a stale dispatch.
-struct PresetDispatch {
+/// A configuration snapshot admitted for Discord dispatch.
+#[derive(Clone, Copy)]
+pub(crate) struct ConfigDispatch {
     guild_id: u64,
     cache_version: u64,
     durable_version: u64,
     write_generation: u64,
 }
 
-impl PresetDispatch {
-    fn is_current(&self, app: &BotState) -> bool {
+impl ConfigDispatch {
+    pub(crate) fn new(guild_id: u64, cfg: &CachedGuildConfig, write_generation: u64) -> Self {
+        Self {
+            guild_id,
+            cache_version: cfg.version,
+            durable_version: cfg.durable_version,
+            write_generation,
+        }
+    }
+
+    pub(crate) fn is_current(&self, app: &BotState) -> bool {
         self.write_generation & 1 == 0
-            && self.write_generation == app.db.config_write_generation()
             && self.durable_version >= app.db.required_config_version()
             && app.configs.last_known(self.guild_id).is_some_and(|cfg| {
                 cfg.version == self.cache_version && cfg.durable_version == self.durable_version
             })
+            && self.write_generation == app.db.config_write_generation()
     }
 }
 
@@ -1358,7 +1367,7 @@ async fn recheck_preset(
     channel: Option<u64>,
     pending: &PendingAction,
     member: Option<&Member>,
-) -> Option<PresetDispatch> {
+) -> Option<ConfigDispatch> {
     let write_generation = app.db.config_write_generation();
     // The cache honors the bot writer's committed-version floor and falls
     // back to the primary when a replica is behind an acknowledged save.
@@ -1394,13 +1403,47 @@ async fn recheck_preset(
     if !preset_scope_allows(current, user, channel, &roles, moderator) {
         return None;
     }
-    let dispatch = PresetDispatch {
-        guild_id: guild_id.get(),
-        cache_version: cfg.version,
-        durable_version: cfg.durable_version,
-        write_generation,
-    };
+    let dispatch = ConfigDispatch::new(guild_id.get(), &cfg, write_generation);
     dispatch.is_current(app).then_some(dispatch)
+}
+
+async fn delete_rule_is_current(
+    app: &BotState,
+    guild: u64,
+    pending: &PendingAction,
+    checked_rule: &RuleDef,
+    preset: Option<&ConfigDispatch>,
+) -> bool {
+    if let Some(preset) = preset {
+        return preset.is_current(app);
+    }
+    recheck_live_rule(app, guild, &pending.rule_id, checked_rule, |cfg| {
+        pending.rule_id != "known_spam"
+            || cfg
+                .known_spam
+                .matches(pending.evidence["content"].as_str().unwrap_or(""))
+    })
+    .await
+}
+
+pub(crate) async fn recheck_live_rule(
+    app: &BotState,
+    guild: u64,
+    rule_id: &str,
+    checked_rule: &RuleDef,
+    extra_admission: impl FnOnce(&CachedGuildConfig) -> bool,
+) -> bool {
+    let write_generation = app.db.config_write_generation();
+    let Ok(cfg) = app.configs.get(&app.db, guild).await else {
+        return false;
+    };
+    // Earlier exemption checks used this rule. An unrelated save can advance
+    // the configuration version without changing the admission decision.
+    cfg.rules
+        .get(rule_id)
+        .is_some_and(|current| current.enabled && !current.dry_run && current == checked_rule)
+        && extra_admission(&cfg)
+        && ConfigDispatch::new(guild, &cfg, write_generation).is_current(app)
 }
 
 enum RuleExemption {
@@ -1548,17 +1591,17 @@ async fn execute_live<'a>(
     msg_channel: Option<u64>,
     pending: &PendingAction,
     rule: &'a ActionDef,
-    matched_settings: &RuleDef,
+    settings: &RuleDef,
     enrollment: Option<db::GuildEnrollment>,
     mut vars: std::collections::BTreeMap<String, String>,
     reason: &str,
-    preset_dispatch: Option<&PresetDispatch>,
+    preset_dispatch: Option<&ConfigDispatch>,
     config_unknown: bool,
     log_automod: bool,
     open_case: bool,
 ) -> Option<(&'a str, CaseOutcome)> {
     let warning = if config_unknown {
-        Some("rule configuration unavailable; deleting the message and skipping kick or ban")
+        Some("rule configuration unavailable; skipping kick or ban and fallback delete")
     } else if pending.mention_permission_unknown {
         Some(jmodguard::custom_rules::UNKNOWN_MENTION_PERMISSION_WARNING)
     } else {
@@ -1584,6 +1627,8 @@ async fn execute_live<'a>(
     if !dispatch_is_current() {
         return None;
     }
+    let delete_is_current =
+        || delete_rule_is_current(app, guild_id.get(), pending, settings, preset_dispatch);
 
     if let Some(warning) = warning
         && matches!(rule.action.as_str(), "kick" | "ban")
@@ -1595,7 +1640,7 @@ async fn execute_live<'a>(
             "{warning}"
         );
         let outcome = if let (Some(ch), Some(id)) = (msg_channel, msg_id) {
-            if !app.activation.may_record() {
+            if config_unknown || !delete_is_current().await || !app.activation.may_record() {
                 return None;
             }
             automod_try_delete_message(
@@ -1673,7 +1718,7 @@ async fn execute_live<'a>(
         "log" => None,
         "delete" => {
             if let (Some(ch), Some(id)) = (msg_channel, msg_id) {
-                if !app.activation.may_record() {
+                if !delete_is_current().await || !app.activation.may_record() {
                     return None;
                 }
                 automod_try_delete_message(
@@ -1695,9 +1740,9 @@ async fn execute_live<'a>(
         }
         "channel_reply" => {
             let outcome = if let Some(channel) = msg_channel
-                && let Ok((template, delete_after)) =
-                    jmodguard::custom_rules::channel_reply(matched_settings)
-            {
+                && let Ok((template, delete_after)) = jmodguard::custom_rules::channel_reply(
+                    pending.matched_rule.as_ref().unwrap_or(settings),
+                ) {
                 app.automod
                     .replies
                     .send(
@@ -2043,7 +2088,8 @@ async fn execute_live<'a>(
                             } else {
                                 None
                             };
-                            let raced = if !dispatch_is_current()
+                            let raced = if (purge_seconds > 0 && !delete_is_current().await)
+                                || !dispatch_is_current()
                                 || automod_member_blocked(
                                     app,
                                     guild_id.get(),
@@ -2185,7 +2231,7 @@ async fn execute_live<'a>(
                                                 purge_seconds,
                                                 chrono::Utc::now().timestamp_millis(),
                                                 cleanup.as_ref(),
-                                                dispatch_is_current,
+                                                delete_is_current,
                                             )
                                             .await;
                                             vars.insert(
@@ -4740,24 +4786,39 @@ mod tests {
         use std::sync::{Arc, atomic::AtomicBool};
 
         for id in ["mention_spam", "custom:0123456789abcdef"] {
-            for (stored_purge, days, dry, seconds) in [
-                (None, 0, false, 0),
-                (Some(false), 0, false, 0),
-                (Some(true), 0, false, 3600),
-                (None, 1, false, 86400),
-                (None, 7, false, 604800),
-                (Some(true), 1, false, 3600),
-                (Some(true), 0, true, 3600),
+            for (stored_purge, days, dry, seconds, disable_on) in [
+                (None, 0, false, 0, None),
+                (Some(false), 0, false, 0, None),
+                (Some(true), 0, false, 3600, None),
+                (None, 1, false, 86400, None),
+                (None, 7, false, 604800, None),
+                (Some(true), 1, false, 3600, None),
+                (Some(true), 0, true, 3600, None),
+                (
+                    Some(true),
+                    0,
+                    false,
+                    3600,
+                    Some(("GET", "/api/v10/guilds/10/bans/99")),
+                ),
+                (
+                    Some(true),
+                    0,
+                    false,
+                    3600,
+                    Some(("DELETE", "/api/v10/channels/71/messages/41")),
+                ),
             ] {
                 let path = std::env::temp_dir()
                     .join(format!("ban_purge_{:032x}.db", rand::random::<u128>()));
                 let app = BotState::new(Default::default(), crate::db::Db::open(&path, 2).unwrap())
                     .unwrap();
+                let now_ms = jmodguard::control::now_ms();
                 assert!(
                     crate::db::claim_active_bot(
                         &app.db,
                         app.activation.instance(),
-                        jmodguard::control::now_ms(),
+                        now_ms,
                         Arc::new(AtomicBool::new(false))
                     )
                     .await
@@ -4815,15 +4876,26 @@ mod tests {
                 let mut user = User::default();
                 user.id = UserId::new(99);
                 user.name = "member".into();
-                app.recent_messages.remember(
-                    10,
-                    99,
-                    71,
-                    41,
-                    chrono::Utc::now().timestamp_millis() - 1_800_000,
-                );
-                let stub = DiscordStub::start();
-                execute_pending_with(
+                app.recent_messages
+                    .remember(10, 99, 71, 41, now_ms - 1_800_000);
+                let (release, release_rx) = tokio::sync::oneshot::channel();
+                let requests = disable_on.map(|(method, path)| {
+                    std::sync::Arc::new(ReplyRequests {
+                        gate: Some(DiscordRequestGate {
+                            method,
+                            path,
+                            entered: tokio::sync::Notify::new(),
+                            release: std::sync::Mutex::new(Some(release_rx)),
+                        }),
+                        ..Default::default()
+                    })
+                });
+                if matches!(disable_on, Some(("DELETE", _))) {
+                    app.recent_messages
+                        .remember(10, 99, 72, 40, now_ms - 2_000_000);
+                }
+                let stub = DiscordStub::bind(requests.clone());
+                let execute = execute_pending_with(
                     &app,
                     &stub.http,
                     &stub.cache,
@@ -4834,9 +4906,25 @@ mod tests {
                     Some(42),
                     Some(70),
                     &pending,
-                )
-                .await;
+                );
+                let disable = async {
+                    if let Some(requests) = &requests {
+                        let gate = requests.gate.as_ref().unwrap();
+                        tokio::time::timeout(
+                            std::time::Duration::from_secs(5),
+                            gate.entered.notified(),
+                        )
+                        .await
+                        .unwrap();
+                        rule.enabled = false;
+                        let saved = crate::db::upsert_rule(&app.db, 10, id, &rule).await;
+                        release.send(()).unwrap();
+                        saved.unwrap();
+                    }
+                };
+                tokio::join!(execute, disable);
                 let seen = stub.finish();
+                let disabled_before_ban = matches!(disable_on, Some(("GET", _)));
                 let bans: Vec<_> = seen
                     .iter()
                     .filter(|line| line.starts_with("PUT ") && line.contains("/bans/99"))
@@ -4846,6 +4934,8 @@ mod tests {
                         seen.is_empty(),
                         "dry-run must not ban, purge or fetch history: {seen:?}"
                     );
+                } else if disabled_before_ban {
+                    assert_eq!(seen, ["GET /api/v10/guilds/10/bans/99"]);
                 } else {
                     assert_eq!(
                         bans.len(),
@@ -4857,8 +4947,14 @@ mod tests {
                 assert_eq!(
                     seen.iter()
                         .any(|line| line == "DELETE /api/v10/channels/71/messages/41"),
-                    !dry && seconds > 0,
+                    !dry && seconds > 0 && !disabled_before_ban,
                     "{seen:?}"
+                );
+                assert!(
+                    !seen
+                        .iter()
+                        .any(|line| line == "DELETE /api/v10/channels/72/messages/40"),
+                    "disabling after one tracked delete stops the next: {seen:?}"
                 );
                 assert!(
                     !seen
@@ -5101,6 +5197,149 @@ mod tests {
                 let _ = std::fs::remove_file(&path);
                 crate::tenant::remove_sidecars(&path);
             }
+        }
+    }
+
+    #[tokio::test]
+    async fn pending_custom_delete_rechecks_rule_after_wait() {
+        use serenity::all::{GuildId, Member, User, UserId};
+        use std::sync::{Arc, atomic::AtomicBool};
+
+        const RULE: &str = "custom:0123456789abcdef";
+        const OTHER: &str = "custom:fedcba9876543210";
+        for (method, path) in [
+            ("GET", "/api/v10/guilds/10/members/99"),
+            ("POST", "/api/v10/channels/90/messages"),
+        ] {
+            let db_path = std::env::temp_dir().join(format!(
+                "delete_disabled_{:032x}.db",
+                rand::random::<u128>()
+            ));
+            let db = crate::db::Db::open(&db_path, 2).unwrap();
+            let app = BotState::new(Default::default(), db).unwrap();
+            assert!(
+                crate::db::claim_active_bot(
+                    &app.db,
+                    app.activation.instance(),
+                    jmodguard::control::now_ms(),
+                    Arc::new(AtomicBool::new(false)),
+                )
+                .await
+                .unwrap()
+            );
+            app.activation.mark_lock_held(true);
+            let guild = GuildId::new(10);
+            let mut user = User::default();
+            user.id = UserId::new(99);
+            user.name = "member".into();
+            let mut member = Member::default();
+            member.guild_id = guild;
+            member.user = user.clone();
+
+            let mut rule = dry_run_word_ban();
+            rule.dry_run = false;
+            rule.log_automod = false;
+            rule.actions[0].action = "delete".into();
+            rule.include_channels = vec![70];
+            let mut other = rule.clone();
+            other.include_channels = vec![71];
+            if method == "GET" {
+                rule.whitelist_roles = vec![77];
+                // Unknown mention permission uses the same delete as its only fallback.
+                rule.actions[0].action = "ban".into();
+            } else {
+                let mut log = rule.actions[0].clone();
+                log.action = "log".into();
+                rule.actions.insert(0, log);
+                crate::db::upsert_log_channel(&app.db, 10, "automod", 90)
+                    .await
+                    .unwrap();
+            }
+            crate::db::upsert_rule(&app.db, 10, RULE, &rule)
+                .await
+                .unwrap();
+            crate::db::upsert_rule(&app.db, 10, OTHER, &other)
+                .await
+                .unwrap();
+            let mut message = word_message(&[]);
+            let cfg = app.configs.get(&app.db, 10).await.unwrap();
+            let engine = AutomodEngine::new();
+            let mut pending = engine.evaluate(&cfg, &message).unwrap();
+            assert_eq!(pending.rule_id, RULE);
+            pending.mention_permission_unknown = method == "GET";
+            message.channel_id = 71;
+            message.message_id = 43;
+            let unrelated = engine.evaluate(&cfg, &message).unwrap();
+            assert_eq!(unrelated.rule_id, OTHER);
+
+            let (release, release_rx) = tokio::sync::oneshot::channel();
+            let requests = Arc::new(ReplyRequests {
+                gate: Some(DiscordRequestGate {
+                    method,
+                    path,
+                    entered: tokio::sync::Notify::new(),
+                    release: std::sync::Mutex::new(Some(release_rx)),
+                }),
+                member: Some(member),
+                ..Default::default()
+            });
+            let stub = DiscordStub::bind(Some(Arc::clone(&requests)));
+            let execute = |pending, channel, message| {
+                execute_pending_with(
+                    &app,
+                    &stub.http,
+                    &stub.cache,
+                    guild,
+                    &user,
+                    None,
+                    "member",
+                    Some(message),
+                    Some(channel),
+                    pending,
+                )
+            };
+            let disable = async {
+                let gate = requests.gate.as_ref().unwrap();
+                tokio::time::timeout(std::time::Duration::from_secs(5), gate.entered.notified())
+                    .await
+                    .unwrap();
+                rule.enabled = false;
+                let saved = crate::db::upsert_rule(&app.db, 10, RULE, &rule).await;
+                release.send(()).unwrap();
+                saved.unwrap();
+            };
+            tokio::join!(execute(&pending, 70, 42), disable);
+            execute(&unrelated, 71, 43).await;
+
+            message.channel_id = 70;
+            message.message_id = 44;
+            let cfg = app.configs.get(&app.db, 10).await.unwrap();
+            assert!(engine.evaluate(&cfg, &message).is_none());
+            rule.enabled = true;
+            crate::db::upsert_rule(&app.db, 10, RULE, &rule)
+                .await
+                .unwrap();
+            let cfg = app.configs.get(&app.db, 10).await.unwrap();
+            let mut fresh = engine.evaluate(&cfg, &message).unwrap();
+            fresh.mention_permission_unknown = method == "GET";
+            execute(&fresh, 70, 44).await;
+
+            let seen = stub.finish();
+            let deletes: Vec<_> = seen
+                .iter()
+                .filter(|line| line.starts_with("DELETE "))
+                .collect();
+            assert_eq!(
+                deletes,
+                [
+                    "DELETE /api/v10/channels/71/messages/43",
+                    "DELETE /api/v10/channels/70/messages/44",
+                ],
+                "{method} {path}: {seen:?}"
+            );
+            drop(app);
+            let _ = std::fs::remove_file(&db_path);
+            crate::tenant::remove_sidecars(&db_path);
         }
     }
 
@@ -6268,6 +6507,11 @@ mod tests {
                 output.contains("automod enforcement skipped") && output.contains(reason),
                 "{output}"
             );
+        } else if matches!(config_lookup, ConfigLookup::UnreadableBuiltin) {
+            assert_eq!(
+                deletes, 0,
+                "deletion requires readable configuration: {seen:?}"
+            );
         } else if expect_withheld || action == "delete" {
             assert_eq!(deletes, 1, "delete must run exactly once: {seen:?}");
         } else {
@@ -6435,7 +6679,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unreadable_builtin_config_withholds_only_kick_and_ban() {
+    async fn unreadable_builtin_config_withholds_delete_kick_and_ban() {
         for action in ["delete", "ban", "kick", "timeout", "warn", "log"] {
             lookup_fallback_case(
                 action,
@@ -6698,7 +6942,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn builtin_rule_uses_matched_settings_when_config_read_fails() {
+    async fn builtin_delete_requires_current_settings_for_live_and_dry_run_matches() {
         use std::sync::Arc;
         use std::sync::atomic::AtomicBool;
 
@@ -6776,9 +7020,9 @@ mod tests {
             let deleted = seen
                 .iter()
                 .any(|line| line.starts_with("DELETE ") && line.contains("/messages/42"));
-            assert_eq!(
-                deleted, !dry_run,
-                "dry_run={dry_run}: a failed config read must keep the matched rule settings: {seen:?}"
+            assert!(
+                !deleted,
+                "dry_run={dry_run}: a failed config read must withhold deletes: {seen:?}"
             );
             drop(app);
             let _ = std::fs::remove_file(&path);

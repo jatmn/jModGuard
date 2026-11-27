@@ -5,7 +5,7 @@ use crate::state::BotState;
 use parking_lot::Mutex;
 use serenity::http::Http;
 use std::collections::BTreeMap;
-use std::future::{Future, ready};
+use std::future::Future;
 use std::ops::RangeInclusive;
 use std::sync::Arc;
 use std::time::Duration;
@@ -129,7 +129,7 @@ impl RecentMessages {
 /// A successful ban supplies Discord's server-side deletion window. Sweep any
 /// remaining tracked messages for the same enrollment without fetching history.
 #[allow(clippy::too_many_arguments)]
-pub(crate) async fn sweep_after_ban(
+pub(crate) async fn sweep_after_ban<F: Future<Output = bool>>(
     app: &std::sync::Arc<BotState>,
     http: &Http,
     enrollment: &GuildEnrollment,
@@ -137,7 +137,7 @@ pub(crate) async fn sweep_after_ban(
     seconds: u32,
     sweep_at_ms: i64,
     cleanup: Option<&crate::logging::Cleanup<'_>>,
-    still_admitted: impl Fn() -> bool,
+    still_admitted: impl Fn() -> F,
 ) -> usize {
     if seconds == 0 {
         return 0;
@@ -151,7 +151,7 @@ pub(crate) async fn sweep_after_ban(
         cutoff..=sweep_at_ms,
         TrackedDelete::BanPurge,
         cleanup,
-        || ready(still_admitted()),
+        still_admitted,
     )
     .await
 }

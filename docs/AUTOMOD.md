@@ -237,9 +237,12 @@ If a custom rule is deleted, or its configuration cannot be read, before a
 pending action runs, the bot logs a warning and takes no Discord action, including
 delete, timeout, or warn. A pending action carries the dry-run setting from
 when the rule matched. Known spam requires the current rule and list before an
-action can proceed. For other built-in rules, a failed configuration read uses
-the rule's settings from the match, including its exemptions. A live kick or ban
-then uses the fallback. Other actions keep their normal paths.
+action can proceed. Message deletion requires a current, enabled rule in live
+mode. This includes fallback deletes and tracked messages from a ban purge.
+Disabling a rule stops deletes that reach this check while it is disabled.
+Discord can still complete a request already dispatched. Re-enabling a rule
+allows new matches. For other built-in actions, a failed configuration read
+uses the match-time settings and exemptions, and prevents kicks and bans.
 Whitelist your announcement channels and your mod/admin roles so @everyone pings
 in them never trigger.
 
