@@ -384,6 +384,7 @@ pub async fn clear_erased_placement(
     let revision = expected.revision().to_owned();
     db.with_conn(move |conn| {
         let mut tx = conn.transaction_primary_write()?;
+        refuse_fenced_write(&tx, guild)?;
         match placement_conn(&tx, guild)? {
             Some(current)
                 if current.store_id.as_str() == store_id && current.revision == revision =>

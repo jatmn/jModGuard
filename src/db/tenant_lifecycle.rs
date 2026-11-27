@@ -123,6 +123,7 @@ pub async fn finish_guild_erasure(db: &Db, job: &GuildErasureJob) -> Result<()> 
     let guild = job.guild_id;
     db.with_conn(move |conn| {
         let mut tx = conn.transaction_primary_write()?;
+        super::guild_stores::refuse_fenced_write(&tx, guild)?;
         tx.prepare_reclaim()?;
         tx.execute_reclaim(
             "DELETE FROM guild_erasure_jobs WHERE guild_id=?1",
@@ -135,13 +136,14 @@ pub async fn finish_guild_erasure(db: &Db, job: &GuildErasureJob) -> Result<()> 
 
 /// Delete a departed guild's directory-owned configuration and core moderation rows.
 ///
-/// The active-enrollment check and deletes share one primary transaction. A stale
-/// erasure job may still remove its closed guild-store scope, but it must not wipe
-/// directory data after a newer membership has become active.
+/// The write-fence check, active-enrollment check and deletes share one primary
+/// transaction. A stale erasure job may still remove its closed guild-store scope,
+/// but it must not wipe directory data after a newer membership has become active.
 pub async fn wipe_departed_directory_guild_data(db: &Db, guild: i64) -> Result<bool> {
     anyhow::ensure!(guild > 0, "invalid guild id");
     db.with_conn(move |conn| {
         let mut tx = conn.transaction_primary_write()?;
+        super::guild_stores::refuse_fenced_write(&tx, guild)?;
         if super::enrollments::active_enrollment_conn(&tx, guild)?.is_some() {
             tx.finish_read()?;
             return Ok(false);
