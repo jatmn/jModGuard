@@ -1079,10 +1079,9 @@ async fn apply_control_inner(
             service,
             source_digest,
             snapshot,
-        } => {
-            bunny_costs::store_bunny_cost_snapshot(db, service, source_digest, snapshot).await?;
-            saved_null()
-        }
+        } => saved_value(
+            bunny_costs::store_bunny_cost_snapshot(db, service, source_digest, snapshot).await?,
+        ),
         ControlOp::ClaimUpdateLease {
             component,
             owner,

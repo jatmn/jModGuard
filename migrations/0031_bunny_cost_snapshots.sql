@@ -6,5 +6,5 @@ CREATE TABLE bunny_cost_snapshots (
     source_digest BLOB NOT NULL CHECK(length(source_digest) = 32),
     fetched_at INTEGER NOT NULL,
     data TEXT NOT NULL CHECK(length(data) <= 16384),
-    PRIMARY KEY (service, month)
+    PRIMARY KEY (service, source_digest, month)
 ) WITHOUT ROWID;

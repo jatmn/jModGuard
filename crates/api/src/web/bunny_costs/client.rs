@@ -11,10 +11,9 @@ const MAX_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
 const GB: f64 = 1_000_000_000.0;
 const RAM_BLOCK: f64 = 64.0 * 1024.0 * 1024.0;
 // List prices checked 2026-11-26. See docs/CONFIGURATION.md for the sources
-// and assumptions, including the region/tier used for storage and traffic.
+// and assumptions, including the Storage tier.
 const RAM_BLOCK_HOUR: f64 = 0.0003125;
 const CORE_HOUR: f64 = 0.02;
-const EGRESS_GB: f64 = 0.01;
 const VOLUME_GB_MONTH: f64 = 0.10;
 const STORAGE_GB_MONTH: f64 = 0.01;
 
@@ -107,6 +106,10 @@ impl Client {
                 ],
             )
             .await?;
+        // Bunny's chart schema describes numeric values without raw units:
+        // https://bunny.net/docs/api-reference/magic-containers/applications/get-application-statistics-charts.md
+        // Model CPU as average cores, RAM and provisioned volume as bytes,
+        // and traffic as bytes transferred per bucket. The mock pins this model.
         let hours = if hourly { 1.0 } else { 24.0 };
         let month_hours = window.month_days() * 24.0;
         for series in charts.cpu.into_values() {
@@ -125,9 +128,16 @@ impl Client {
             }
         }
         for series in charts.traffic.into_values() {
+            let rate = series.region.as_deref().and_then(egress_usd_per_gb);
             for (time, value) in series.chart {
                 if let Some(day) = window.day(time) {
-                    days.entry(day).or_default().egress += nonnegative(value)? / GB * EGRESS_GB;
+                    let bytes = nonnegative(value)?;
+                    let cost = days.entry(day).or_default();
+                    if let Some(rate) = rate {
+                        cost.egress += bytes / GB * rate;
+                    } else {
+                        cost.egress_rate_unknown = true;
+                    }
                 }
             }
         }
@@ -200,6 +210,60 @@ impl Client {
     }
 }
 
+// Magic Containers list prices in USD/GB, also listed for Standard CDN:
+// https://bunny.net/docs/magic-containers/pricing#network-traffic-usage
+// https://bunny.net/pricing/
+// Match published city names, documented MC CLI IDs, and Bunny's geography codes:
+// https://bunny.net/docs/magic-containers/regions
+// https://bunny.net/docs/cli/commands/sandbox
+// https://bunny.net/docs/api-reference/core/pull-zone/add-pull-zone
+fn egress_usd_per_gb(region: &str) -> Option<f64> {
+    match region.trim().to_lowercase().as_str() {
+        "eu"
+        | "europe"
+        | "us"
+        | "north america"
+        | "europe & north america"
+        | "ams"
+        | "ny"
+        | "la"
+        | "ashburn"
+        | "atlanta"
+        | "boston"
+        | "chicago"
+        | "dallas"
+        | "denver"
+        | "los angeles"
+        | "miami"
+        | "new york city"
+        | "san jose"
+        | "seattle"
+        | "toronto"
+        | "amsterdam"
+        | "athens"
+        | "bucharest"
+        | "copenhagen"
+        | "frankfurt"
+        | "london"
+        | "madrid"
+        | "milan"
+        | "paris"
+        | "prague"
+        | "stockholm"
+        | "vienna"
+        | "warsaw"
+        | "zagreb" => Some(0.01),
+        "sa" | "south america" | "bogota" | "bogotá" | "mexico city" | "sao paulo"
+        | "são paulo" => Some(0.045),
+        "asia" | "oceania" | "asia & oceania" | "bangkok" | "hong kong" | "jakarta"
+        | "kuala lumpur" | "manila" | "singapore" | "tokyo" | "sydney" => Some(0.03),
+        "af" | "africa" | "middle east" | "middle east & africa" | "johannesburg" | "lagos" => {
+            Some(0.06)
+        }
+        _ => None,
+    }
+}
+
 fn transport_failure(error: reqwest::Error) -> Failure {
     if error.is_timeout() {
         Failure::Timeout
@@ -250,6 +314,7 @@ struct McCharts {
 
 #[derive(Deserialize)]
 struct McSeries {
+    region: Option<String>,
     chart: BTreeMap<DateTime<Utc>, f64>,
 }
 

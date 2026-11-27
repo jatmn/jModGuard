@@ -1793,15 +1793,21 @@ function BunnyCostHistory({ history }) {
               h("th", { key: label, scope: "col" }, label)),
           )),
           h("tbody", null, ...history.map((month) => {
-            const parts = services.map(([key, label, tone]) => ({ key, label, tone, value: month[key]?.usd }));
+            const parts = services.map(([key, label, tone]) => {
+              const cost = month[key];
+              return {
+                key, label, tone, value: cost?.usd, partial: cost?.partial,
+                display: cost?.egress_rate_unknown ? "Unknown egress rate" : bunnyUsd(cost?.usd),
+              };
+            });
             return h("tr", { key: month.month },
               h("th", { scope: "row" }, month.month),
               h("td", null, h(ShareBar, {
                 parts, total: max || 1,
-                summary: parts.map((part) => `${part.label} ${bunnyUsd(part.value)}`).join(", "),
+                summary: parts.map((part) => `${part.label} ${part.display}`).join(", "),
               })),
               ...parts.map((part) => h("td", { key: part.key },
-                bunnyUsd(part.value), month[part.key]?.partial ? " (partial)" : "",
+                part.display, part.partial ? " (partial)" : "",
               )),
             );
           })),
@@ -1842,10 +1848,10 @@ function BunnyCostPanel({ provider }) {
     ),
     breakdown && h("dl", { className: "du-facts", "aria-label": "Magic Containers month-to-date components" },
       ...[["CPU", "cpu"], ["RAM", "ram"], ["Egress", "egress"], ["Volumes", "volume"]].map(([label, key]) =>
-        h("div", { key }, h("dt", null, label), h("dd", null, bunnyUsd(breakdown[key]))),
+        h("div", { key }, h("dt", null, label), h("dd", null, key === "egress" && breakdown[key] == null ? "Unknown regional rate" : bunnyUsd(breakdown[key]))),
       ),
     ),
-    h("p", { className: "an-note muted" }, "Database uses Bunny’s free public-preview rate. Storage assumes one Standard region. Magic Containers egress uses the North America and Europe rate. Estimates exclude Bunny’s $1 monthly account minimum."),
+    h("p", { className: "an-note muted" }, "Database uses Bunny’s free public-preview rate. Storage assumes one Standard region. Magic Containers egress uses Bunny’s regional rates. An unknown egress rate leaves the usage total unavailable. Estimates exclude Bunny’s $1 monthly account minimum."),
     h(BunnyCostHistory, { history: provider.history ?? [] }),
   ));
 }

@@ -8,7 +8,7 @@ use axum::{
 use chrono::TimeZone as _;
 use jmodguard::config::ApiProcessConfig;
 use jmodguard::db::Db;
-use serde_json::json;
+use serde_json::{Value, json};
 use std::{
     io::{self, Write},
     path::PathBuf,
@@ -47,6 +47,8 @@ struct MockData {
     status: Option<StatusCode>,
     delay: Duration,
     requests: Vec<Uri>,
+    traffic: Option<Value>,
+    storage: Option<BTreeMap<NaiveDate, u64>>,
 }
 
 struct Mock {
@@ -86,16 +88,21 @@ async fn mock_reply(
     headers: HeaderMap,
 ) -> Response {
     assert_eq!(headers.get("accesskey").unwrap(), KEY);
-    let (status, delay) = {
+    let (status, delay, traffic, storage) = {
         let mut state = state.lock().unwrap();
         state.requests.push(uri.clone());
-        (state.status, state.delay)
+        (
+            state.status,
+            state.delay,
+            state.traffic.clone(),
+            state.storage.clone(),
+        )
     };
     tokio::time::sleep(delay).await;
     if let Some(status) = status {
         return (status, format!("reflected request {uri} with {KEY}")).into_response();
     }
-    let date = "2026-11-17T10:00:00Z";
+    let date = "2026-11-17T00:00:00Z";
     let body = match uri.path() {
         path if path == format!("/mc/apps/{MC}/summary") => {
             json!({"monthlyCost": 2.50, "unused": KEY, "unusedId": MC})
@@ -103,7 +110,9 @@ async fn mock_reply(
         path if path == format!("/mc/apps/{MC}/statistics/charts") => json!({
             "cpuUsageSplitChart": {"placeholder-pod": {"chart": {date: 0.5}}},
             "ramUsageSplitChart": {"placeholder-pod": {"chart": {date: 67_108_865}}},
-            "trafficSplitChart": {"placeholder-pod": {"chart": {date: 500_000_000}}},
+            "trafficSplitChart": traffic.unwrap_or_else(|| json!({
+                "placeholder-pod": {"region": "EU", "chart": {date: 500_000_000}}
+            })),
             "volumesSplitCapacityChart": {"placeholder-volume": {"chart": {date: 1_000_000_000}}},
             "releases": [{"secret": KEY}],
         }),
@@ -127,7 +136,14 @@ async fn mock_reply(
                 .unwrap()
                 .1
                 .into_owned();
-            json!({"StorageUsedChart": {&from[..10]: 30_000_000_000_u64}, "ignored": KEY})
+            let storage = storage.unwrap_or_else(|| {
+                [(
+                    NaiveDate::parse_from_str(&from[..10], "%Y-%m-%d").unwrap(),
+                    30_000_000_000,
+                )]
+                .into()
+            });
+            json!({"StorageUsedChart": storage, "ignored": KEY})
         }
         _ => panic!("unexpected mock route {uri}"),
     };
@@ -219,6 +235,84 @@ async fn allowed_routes_keep_identifier_case_and_send_required_query_windows() {
             }
         }
     }
+}
+
+#[tokio::test]
+async fn magic_container_mock_pins_chart_units_and_regional_egress() {
+    let mock = Mock::start().await;
+    let client = mock.client(Duration::from_secs(2));
+    let cfg = config();
+    let source = &cfg.sources[0];
+    let date = "2026-11-17T00:00:00Z";
+    let day = instant().date_naive();
+    let month = month_start(day);
+    let window = Window {
+        month,
+        from: midnight(month),
+        to: instant(),
+    };
+
+    // The public API schema leaves these units unspecified. The mock's raw
+    // values represent 0.5 average cores, just over 64 MiB RAM, a 1 GB volume,
+    // and one decimal GB transferred per traffic series in a single bucket.
+    let priced = json!({
+        "placeholder-eu": {"region": "AMS", "chart": {date: 1_000_000_000}},
+        "placeholder-sa": {"region": "SA", "chart": {date: 1_000_000_000}},
+        "placeholder-asia": {"region": "asia", "chart": {date: 1_000_000_000}},
+        "placeholder-af": {"region": "Africa", "chart": {date: 1_000_000_000}},
+    });
+    mock.state.lock().unwrap().traffic = Some(priced.clone());
+    let close_enough = |actual: f64, expected: f64| assert!((actual - expected).abs() < 1e-10);
+    let current = collect(&client, source, window, false).await.unwrap();
+    let costs = current.days[&day];
+    close_enough(costs.cpu, 0.5 * 0.02);
+    close_enough(costs.ram, 2.0 * 0.0003125);
+    close_enough(costs.volume, 0.10 / (30.0 * 24.0));
+    close_enough(costs.egress, 0.01 + 0.045 + 0.03 + 0.06);
+    assert!(!current.egress_rate_unknown());
+    assert_eq!(current.projection, Some(2.50));
+
+    let historical = Window {
+        to: midnight(shift_month(month, 1)),
+        ..window
+    };
+    let daily = collect(&client, source, historical, true).await.unwrap();
+    close_enough(daily.days[&day].cpu, costs.cpu * 24.0);
+    close_enough(daily.days[&day].ram, costs.ram * 24.0);
+    close_enough(daily.days[&day].volume, costs.volume * 24.0);
+    close_enough(daily.days[&day].egress, costs.egress);
+
+    let mut unpriced = priced;
+    unpriced["placeholder-unknown"] =
+        json!({"region": "placeholder-unpriced", "chart": {date: 1_000_000_000}});
+    mock.state.lock().unwrap().traffic = Some(unpriced);
+    let current = collect(&client, source, window, false).await.unwrap();
+    assert!(current.egress_rate_unknown());
+    assert_eq!(current.month_to_date, None);
+    assert_eq!(current.projection, Some(2.50));
+
+    let prev = month;
+    let cache = Cache::default();
+    cache.enable(&cfg);
+    let daily = collect(&client, source, historical, true).await.unwrap();
+    let feed = Feed {
+        months: [(
+            prev,
+            BunnyCostSnapshot {
+                month: prev,
+                fetched_at: historical.to.timestamp(),
+                data: daily,
+            },
+        )]
+        .into(),
+        failed: false,
+    };
+    cache.publish(source.service, &feed);
+    let value = serde_json::to_value(cache.view(historical.to).unwrap()).unwrap();
+    let history = &value["history"][0]["magic_containers"];
+    assert_eq!(history["egress_rate_unknown"], true);
+    assert!(history["usd"].is_null());
+    assert!(!value.to_string().contains("placeholder-unpriced"));
 }
 
 #[derive(Clone, Default)]
@@ -324,7 +418,7 @@ impl Drop for DbFile {
 }
 
 #[tokio::test]
-async fn backfill_survives_api_restart_and_does_not_repeat_completed_requests() {
+async fn close_out_preserves_saved_days_and_retries_gaps_after_restart() {
     let file =
         DbFile(std::env::temp_dir().join(format!("bunny_costs_{}.db", rand::random::<u64>())));
     let mut api_cfg = ApiProcessConfig::default();
@@ -349,36 +443,89 @@ async fn backfill_survives_api_restart_and_does_not_repeat_completed_requests() 
     let client = mock.client(Duration::from_secs(2));
     let mut feed = Feed::default();
 
-    // Produce the first saved month via the real path and seed the others as
-    // completed checkpoints so this test only waits for one paced request.
     let windows = backfill_windows(source.service, now);
     let last_month = windows[0].month;
+    let last_day = windows[0].to.date_naive().pred_opt().unwrap();
     refresh_current(&app, &client, source, &mut feed, now)
         .await
         .unwrap();
+
+    // Roll over with a full day and a provisional last day from a previous
+    // current-month refresh. Seed older months with the days still retained.
+    let prior = MonthData {
+        days: [
+            (
+                last_month,
+                Cost {
+                    storage: 0.25,
+                    complete: true,
+                    ..Cost::default()
+                },
+            ),
+            (
+                last_day,
+                Cost {
+                    storage: 0.125,
+                    ..Cost::default()
+                },
+            ),
+        ]
+        .into(),
+        ..MonthData::default()
+    };
+    let before_rollover = midnight(last_day) + chrono::TimeDelta::hours(12);
+    save(
+        &app,
+        source,
+        &mut feed,
+        last_month,
+        before_rollover.timestamp(),
+        prior,
+    )
+    .await
+    .unwrap();
     for window in &windows[1..] {
+        let days = window
+            .from
+            .date_naive()
+            .iter_days()
+            .take_while(|day| *day < window.to.date_naive())
+            .map(|day| {
+                (
+                    day,
+                    Cost {
+                        complete: true,
+                        ..Cost::default()
+                    },
+                )
+            })
+            .collect();
         let data = MonthData {
-            days: Days::new(),
-            month_to_date: None,
-            projection: None,
-            closed: true,
-            partial: true,
+            days,
+            ..MonthData::default()
         };
         save(&app, source, &mut feed, window.month, now.timestamp(), data)
             .await
             .unwrap();
     }
+
+    // The response omits the already recorded first and last days.
+    let new_day = last_month.succ_opt().unwrap();
+    let bytes = 31_000_000_000;
+    mock.state.lock().unwrap().storage = Some([(new_day, bytes)].into());
     backfill(&app, &client, source, &mut feed, now)
         .await
         .unwrap();
     assert_eq!(mock.state.lock().unwrap().requests.len(), 2);
+    let partial = &feed.months[&last_month].data;
+    assert!(!partial.closed && partial.partial);
+    assert!((partial.month_to_date.unwrap() - 0.385).abs() < 1e-10);
+    assert!(!partial.days[&last_day].complete);
     let expected = serde_json::to_value(app.bunny_costs.view(now).unwrap()).unwrap();
     assert_eq!(
-        expected["history"][0]["month"],
-        last_month.format("%Y-%m").to_string()
+        expected["history"].as_array().unwrap().last().unwrap()["storage"]["partial"],
+        true
     );
-    assert_eq!(expected["history"][0]["storage"]["partial"], true);
-    assert!(expected["history"][0]["storage"]["usd"].as_f64().unwrap() > 0.0);
     assert_eq!(expected["cdn"]["status"], "unavailable");
     assert!(!expected.to_string().contains(KEY));
     drop(app);
@@ -389,14 +536,41 @@ async fn backfill_survives_api_restart_and_does_not_repeat_completed_requests() 
     refresh_current(&restarted, &client, source, &mut feed, now)
         .await
         .unwrap();
-    backfill(&restarted, &client, source, &mut feed, now)
-        .await
-        .unwrap();
     assert_eq!(
         serde_json::to_value(restarted.bunny_costs.view(now).unwrap()).unwrap(),
         expected
     );
     assert_eq!(mock.state.lock().unwrap().requests.len(), 2);
+
+    // A later result covers the remaining days, including the previously
+    // provisional last day, and tries to replace the already completed first day.
+    mock.state.lock().unwrap().storage = Some(
+        last_month
+            .iter_days()
+            .take_while(|day| *day <= last_day)
+            .map(|day| (day, bytes))
+            .collect(),
+    );
+    backfill(&restarted, &client, source, &mut feed, now)
+        .await
+        .unwrap();
+    let complete = &feed.months[&last_month].data;
+    assert!(complete.closed && !complete.partial);
+    assert!((complete.month_to_date.unwrap() - 0.55).abs() < 1e-10);
+    assert!(complete.days[&last_day].complete);
+    backfill(&restarted, &client, source, &mut feed, now)
+        .await
+        .unwrap();
+    assert_eq!(
+        mock.state.lock().unwrap().requests.len(),
+        3,
+        "completed and retention-truncated months are settled"
+    );
+    let complete_view = serde_json::to_value(restarted.bunny_costs.view(now).unwrap()).unwrap();
+    assert_eq!(
+        complete_view["history"].as_array().unwrap().last().unwrap()["storage"]["partial"],
+        false
+    );
 
     mock.state.lock().unwrap().status = Some(StatusCode::FORBIDDEN);
     let later = now + chrono::TimeDelta::hours(7);
@@ -409,5 +583,5 @@ async fn backfill_survives_api_restart_and_does_not_repeat_completed_requests() 
     let stale = serde_json::to_value(restarted.bunny_costs.view(later).unwrap()).unwrap();
     assert_eq!(stale["storage"]["status"], "unavailable");
     assert_eq!(stale["storage"]["last_updated_secs"], now.timestamp());
-    assert_eq!(stale["history"], expected["history"]);
+    assert_eq!(stale["history"], complete_view["history"]);
 }

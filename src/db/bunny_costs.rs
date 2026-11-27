@@ -2,10 +2,11 @@
 
 use std::collections::BTreeMap;
 
-use chrono::{Datelike as _, NaiveDate};
+use anyhow::Context as _;
+use chrono::{DateTime, Datelike as _, Months, NaiveDate, Utc};
 use serde::{Deserialize, Serialize};
 
-use super::{BoundedWrites as _, Db, Result, SqlExecutor, params};
+use super::{BoundedWrites as _, Db, OptionalExtension as _, Result, SqlExecutor, params};
 
 pub type SourceDigest = [u8; 32];
 pub type CostDays = BTreeMap<NaiveDate, BunnyDayCost>;
@@ -37,15 +38,87 @@ pub struct BunnyDayCost {
     pub egress: f64,
     pub volume: f64,
     pub storage: f64,
+    #[serde(default)]
+    pub complete: bool,
+    #[serde(default)]
+    pub egress_rate_unknown: bool,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct BunnyMonthData {
     pub days: CostDays,
     pub month_to_date: Option<f64>,
     pub projection: Option<f64>,
     pub closed: bool,
     pub partial: bool,
+}
+
+impl BunnyMonthData {
+    /// Coverage is based on completed observations for each UTC day.
+    pub fn covers(&self, from: NaiveDate, to: NaiveDate) -> bool {
+        from.iter_days()
+            .take_while(|day| *day < to)
+            .all(|day| self.days.get(&day).is_some_and(|cost| cost.complete))
+    }
+
+    pub fn egress_rate_unknown(&self) -> bool {
+        self.days.values().any(|day| day.egress_rate_unknown)
+    }
+
+    fn merge_days(&mut self, previous: CostDays) {
+        for (date, saved) in previous {
+            self.days
+                .entry(date)
+                .and_modify(|day| {
+                    let egress_rate_unknown = saved.egress_rate_unknown || day.egress_rate_unknown;
+                    // Keep a collected full day, including its original
+                    // hourly detail, when a later rollup revisits that date.
+                    if saved.complete {
+                        *day = saved;
+                    }
+                    day.egress_rate_unknown = egress_rate_unknown;
+                })
+                .or_insert(saved);
+        }
+    }
+
+    /// Recompute billing fields after assembling the day's observations.
+    pub fn summarize(&mut self, service: BunnyService, month: NaiveDate, observed: DateTime<Utc>) {
+        let next = month + Months::new(1);
+        let completed_to = observed.date_naive().min(next);
+        self.partial = !self.covers(month, completed_to);
+        self.closed = !self.partial && completed_to == next;
+        self.month_to_date = match service {
+            BunnyService::MagicContainers
+                if !self.days.is_empty() && !self.egress_rate_unknown() =>
+            {
+                Some(
+                    self.days
+                        .values()
+                        .map(|day| day.cpu + day.ram + day.egress + day.volume)
+                        .sum(),
+                )
+            }
+            BunnyService::Storage if !self.days.is_empty() => {
+                Some(self.days.values().map(|day| day.storage).sum())
+            }
+            BunnyService::CoreDatabase | BunnyService::GuildDatabase
+                if completed_to < next || !self.days.is_empty() =>
+            {
+                Some(0.0)
+            }
+            _ => None,
+        };
+        if completed_to == next {
+            self.projection = None;
+        } else if service != BunnyService::MagicContainers {
+            let elapsed = (observed.timestamp() - midnight_secs(month)) as f64;
+            self.projection = self
+                .month_to_date
+                .filter(|_| elapsed > 0.0)
+                .map(|cost| cost * (midnight_secs(next) - midnight_secs(month)) as f64 / elapsed);
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -89,25 +162,28 @@ pub async fn bunny_cost_snapshots(
 }
 
 /// The bot writes a typed source/month snapshot on the fenced control link.
-/// Replays replace the same row and cannot overwrite a newer observation.
+/// Merge observed days under the write lock before computing completeness.
 pub(super) async fn store_bunny_cost_snapshot(
     db: &Db,
     service: BunnyService,
     digest: SourceDigest,
-    row: BunnyCostSnapshot,
-) -> Result<()> {
+    mut row: BunnyCostSnapshot,
+) -> Result<BunnyCostSnapshot> {
     let month = midnight_secs(row.month);
-    let observed = chrono::DateTime::from_timestamp(row.fetched_at, 0);
+    let observed =
+        DateTime::from_timestamp(row.fetched_at, 0).context("invalid Bunny snapshot time")?;
     let valid_amount = |amount: f64| (0.0..=1e18).contains(&amount);
     anyhow::ensure!(
         row.month.day() == 1
-            && observed.is_some_and(|time| {
-                row.fetched_at >= month && (time.date_naive() - row.month).num_days() <= 400
-            })
+            && row.month.checked_add_months(Months::new(1)).is_some()
+            && row.fetched_at >= month
+            && (observed.date_naive() - row.month).num_days() <= 400
             && row.data.days.len() <= 31
             && row.data.days.iter().all(|(date, cost)| {
                 date.year() == row.month.year()
                     && date.month() == row.month.month()
+                    && *date <= observed.date_naive()
+                    && (!cost.complete || *date < observed.date_naive())
                     && [cost.cpu, cost.ram, cost.egress, cost.volume, cost.storage]
                         .into_iter()
                         .all(valid_amount)
@@ -116,20 +192,41 @@ pub(super) async fn store_bunny_cost_snapshot(
             && row.data.projection.is_none_or(valid_amount),
         "invalid Bunny cost snapshot"
     );
-    let data = serde_json::to_string(&row)?;
-    anyhow::ensure!(data.len() <= 16_384, "Bunny cost snapshot too large");
     db.with_conn(move |conn| {
         let mut tx = conn.transaction_primary_write()?;
+        let digest = digest.to_vec();
+        let previous = tx
+            .query_row(
+                "SELECT data FROM bunny_cost_snapshots WHERE service=?1 AND source_digest=?2 AND month=?3",
+                params![service.name(), digest.clone(), month],
+                |stored| Ok(stored.get::<String>(0)?),
+            )
+            .optional()?;
+        if let Some(previous) = previous {
+            let previous: BunnyCostSnapshot = serde_json::from_str(&previous)?;
+            if previous.fetched_at > row.fetched_at {
+                tx.finish_read()?;
+                return Ok(previous);
+            }
+            row.data.merge_days(previous.data.days);
+        }
+        row.data.summarize(service, row.month, observed);
+        anyhow::ensure!(
+            row.data.month_to_date.is_none_or(valid_amount) && row.data.projection.is_none_or(valid_amount),
+            "invalid merged Bunny cost snapshot"
+        );
+        let data = serde_json::to_string(&row)?;
+        anyhow::ensure!(data.len() <= 16_384, "Bunny cost snapshot too large");
         tx.ensure_mutation_receipt()?;
         tx.execute_rows(
             "INSERT INTO bunny_cost_snapshots (service, month, source_digest, fetched_at, data) \
-             VALUES (?1, ?2, ?3, ?4, ?5) ON CONFLICT(service, month) DO UPDATE SET \
-             source_digest=excluded.source_digest, fetched_at=excluded.fetched_at, data=excluded.data \
-             WHERE excluded.fetched_at >= bunny_cost_snapshots.fetched_at",
-            params![service.name(), month, digest.to_vec(), row.fetched_at, data],
+             VALUES (?1, ?2, ?3, ?4, ?5) ON CONFLICT(service, source_digest, month) DO UPDATE SET \
+             fetched_at=excluded.fetched_at, data=excluded.data",
+            params![service.name(), month, digest, row.fetched_at, data],
             1,
         )?;
-        tx.commit()
+        tx.commit()?;
+        Ok(row)
     })
     .await
 }

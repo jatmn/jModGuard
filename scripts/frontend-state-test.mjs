@@ -14399,6 +14399,15 @@ test('Bot Resources hides Bunny costs without config and renders partial provide
   assert.match(textOf(panel), /CDN.*Not available with scoped Bunny keys/);
   assert.match(textOf(panel), /2026-10\$3.25 \(partial\)\$0.00Not available/);
   assert.ok(h.nodes.get('#content').querySelector('[aria-labelledby="resources-memory-billing"]'));
+
+  snapshot.provider.magic_containers.month_to_date_usd = null;
+  snapshot.provider.magic_breakdown.egress = null;
+  snapshot.provider.history[0].magic_containers = { usd: null, egress_rate_unknown: true, partial: true };
+  await fire(h.nodes.get('#refresh-resources'), 'click');
+  assert.match(textOf(section()), /Magic ContainersNot available\$4.75/);
+  assert.match(textOf(section()), /EgressUnknown regional rate/);
+  assert.match(textOf(section()), /2026-10Unknown egress rate \(partial\)/);
+
 });
 
 test('Bot Resources rounds combined memory up from bytes, including zero and block boundaries', async () => {

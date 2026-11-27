@@ -87,24 +87,28 @@ Bunny panel. Scoped keys cannot read CDN statistics.
 
 All figures are estimates in USD on a UTC calendar month. Magic Containers uses
 Bunny's projected `monthlyCost` and estimates accrued costs from charted
-CPU, RAM, traffic, and allocated volume capacity. I/O chart values for traffic,
-memory and volumes are interpreted as bytes, and CPU as cores. The estimate
+CPU, RAM, traffic, and allocated volume capacity. The [chart response schema](https://bunny.net/docs/api-reference/magic-containers/applications/get-application-statistics-charts.md)
+specifies numeric samples without units. The model assumes bytes for memory,
+volume capacity and per-bucket traffic, and average cores for CPU. The estimate
 applies 64 MiB RAM blocks to each pod's charted usage and uses daily averages
 for older buckets. Bunny's billed overhead and other charges can differ.
 See [Magic Containers pricing](https://bunny.net/docs/magic-containers/pricing)
 and [monitoring](https://bunny.net/docs/magic-containers/monitoring).
 
-As of 2026-11-26, Storage is modeled at the single-region Standard rate,
-Magic Containers traffic at the North America and Europe rate, and Database
-at the public-preview rate. Estimates exclude the $1 monthly account minimum,
+Magic Containers traffic uses [Bunny’s published regional rates](https://bunny.net/docs/magic-containers/pricing#network-traffic-usage).
+An unrecognized or unpriced region leaves the chart-derived egress and
+total unavailable. Bunny’s summary projection remains available.
+Storage uses the single-region Standard rate and Database uses the
+public-preview rate. Estimates exclude the $1 monthly account minimum,
 taxes and credits. Storage projections extrapolate based on the fraction of the month
 elapsed. See [Storage pricing](https://bunny.net/docs/storage/pricing)
 and [Database pricing](https://bunny.net/database/#pricing).
 
 Successful figures refresh about every six hours. API failures keep the last
 successful same-month figures with their timestamp and trigger bounded retries.
-History uses daily estimates grouped into monthly core snapshots. Backfill uses
-up to 365 days for Magic Containers and Storage and 180 days for Database.
+History groups daily estimates into monthly snapshots for each configured
+resource. It preserves collected days as missing days fill in. Backfill uses up
+to 365 days for Magic Containers and Storage and 180 days for Database.
 The authenticated bot writer link must be configured to save snapshots. The
 backup for the core database includes this history.
 

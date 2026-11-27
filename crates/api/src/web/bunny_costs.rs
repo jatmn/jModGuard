@@ -174,31 +174,17 @@ fn backfill_windows(service: Service, now: DateTime<Utc>) -> Vec<Window> {
         .collect()
 }
 
-fn estimate(service: Service, days: &Days) -> Option<f64> {
-    if days.is_empty() {
-        return None;
-    }
-    Some(match service {
-        Service::MagicContainers => days
-            .values()
-            .map(|day| day.cpu + day.ram + day.egress + day.volume)
-            .sum(),
-        Service::Storage => days.values().map(|day| day.storage).sum(),
-        Service::CoreDatabase | Service::GuildDatabase => 0.0,
-    })
-}
-
 async fn collect(
     client: &Client,
     source: &Source,
     window: Window,
-    closed: bool,
+    historical: bool,
 ) -> Result<MonthData, Failure> {
     let mut projection = None;
-    let days = match source.service {
+    let mut days = match source.service {
         Service::MagicContainers => {
             let mut days = Days::new();
-            if closed {
+            if historical {
                 client.mc_days(source, window, false, &mut days).await?;
             } else {
                 projection = Some(client.mc_projection(source).await?);
@@ -236,35 +222,27 @@ async fn collect(
             days
         }
         Service::CoreDatabase | Service::GuildDatabase => {
-            client.database_days(source, window, !closed).await?
+            client.database_days(source, window, !historical).await?
         }
         Service::Storage => client.storage_days(source, window).await?,
     };
-    let mut month_to_date = estimate(source.service, &days);
-    if !closed {
-        if matches!(
-            source.service,
-            Service::CoreDatabase | Service::GuildDatabase
-        ) {
-            month_to_date = Some(0.0); // A successful /usage confirms the preview rate applies.
-        }
-        let elapsed = (window.to - midnight(window.month)).num_seconds() as f64 / 86_400.0;
-        if projection.is_none() && elapsed > 0.0 {
-            projection = month_to_date.map(|cost| cost * window.month_days() / elapsed);
-        }
+    // Allow the same publication lag for a day at the end of a live
+    // window as for the final day at month rollover.
+    let complete_to = if historical {
+        window.to
+    } else {
+        window.to - REFRESH
+    };
+    for (date, day) in &mut days {
+        day.complete = *date < complete_to.date_naive();
     }
-    let expected_days = (window.to.date_naive() - window.month).num_days();
-    let covered_days = days
-        .keys()
-        .filter(|day| **day < window.to.date_naive())
-        .count() as i64;
-    Ok(MonthData {
+    let mut data = MonthData {
         days,
-        month_to_date,
         projection,
-        closed,
-        partial: covered_days < expected_days,
-    })
+        ..MonthData::default()
+    };
+    data.summarize(source.service, window.month, window.to);
+    Ok(data)
 }
 
 #[derive(Clone, Default)]
@@ -330,17 +308,16 @@ impl Cache {
             }
         }
         let mc_days = magic.first().and_then(|feed| feed.months.get(&month));
-        let breakdown = mc_days
-            .filter(|row| row.data.month_to_date.is_some())
-            .map(|row| {
-                let days = row.data.days.values();
-                MagicBreakdown {
-                    cpu: days.clone().map(|day| day.cpu).sum(),
-                    ram: days.clone().map(|day| day.ram).sum(),
-                    egress: days.clone().map(|day| day.egress).sum(),
-                    volume: days.map(|day| day.volume).sum(),
-                }
-            });
+        let breakdown = mc_days.filter(|row| !row.data.days.is_empty()).map(|row| {
+            let days = row.data.days.values();
+            MagicBreakdown {
+                cpu: days.clone().map(|day| day.cpu).sum(),
+                ram: days.clone().map(|day| day.ram).sum(),
+                egress: (!row.data.egress_rate_unknown())
+                    .then(|| days.clone().map(|day| day.egress).sum()),
+                volume: days.map(|day| day.volume).sum(),
+            }
+        });
         Some(Report {
             status: "configured",
             month: month.format("%Y-%m").to_string(),
@@ -370,7 +347,7 @@ pub(super) struct Report {
 struct MagicBreakdown {
     cpu: f64,
     ram: f64,
-    egress: f64,
+    egress: Option<f64>,
     volume: f64,
 }
 
@@ -421,8 +398,9 @@ fn current(feeds: &[&Feed], month: NaiveDate) -> Current {
 
 #[derive(Serialize)]
 struct HistoricalCost {
-    usd: f64,
+    usd: Option<f64>,
     partial: bool,
+    egress_rate_unknown: bool,
 }
 
 #[derive(Serialize)]
@@ -439,15 +417,15 @@ fn historic(feeds: &[&Feed], month: NaiveDate) -> Option<HistoricalCost> {
     }
     let rows: Option<Vec<_>> = feeds.iter().map(|feed| feed.months.get(&month)).collect();
     let rows = rows?;
-    if rows.iter().any(|row| !row.data.closed) {
-        return None;
-    }
-    Some(HistoricalCost {
-        usd: rows
-            .iter()
-            .map(|row| row.data.month_to_date)
-            .sum::<Option<f64>>()?,
+    let egress_rate_unknown = rows.iter().any(|row| row.data.egress_rate_unknown());
+    let usd = rows
+        .iter()
+        .map(|row| row.data.month_to_date)
+        .sum::<Option<f64>>();
+    (usd.is_some() || egress_rate_unknown).then(|| HistoricalCost {
+        usd,
         partial: rows.iter().any(|row| row.data.partial),
+        egress_rate_unknown,
     })
 }
 
@@ -468,14 +446,15 @@ async fn save(
         .commit(ControlOp::StoreBunnyCostSnapshot {
             service: source.service,
             source_digest: source.digest(),
-            snapshot: snapshot.clone(),
+            snapshot,
         })
         .await
         .map_err(|_| Failure::Persistence)?;
-    if !matches!(reply, ControlReply::Saved { .. }) {
+    let ControlReply::Saved { body } = reply else {
         return Err(Failure::Persistence);
-    }
-    feed.months.insert(month, snapshot);
+    };
+    let stored = serde_json::from_value(body).map_err(|_| Failure::Persistence)?;
+    feed.months.insert(month, stored);
     app.bunny_costs.publish(source.service, feed);
     Ok(())
 }
@@ -530,11 +509,12 @@ async fn backfill(
     now: DateTime<Utc>,
 ) -> Result<(), Failure> {
     for window in backfill_windows(source.service, now) {
-        if feed
-            .months
-            .get(&window.month)
-            .is_some_and(|row| row.data.closed)
-        {
+        if feed.months.get(&window.month).is_some_and(|row| {
+            row.data.closed
+                || row
+                    .data
+                    .covers(window.from.date_naive(), window.to.date_naive())
+        }) {
             continue;
         }
         // Pace historical requests and prioritize the current cycle.
