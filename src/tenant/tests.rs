@@ -265,9 +265,16 @@ async fn erasure_clears_owned_rows_without_backup_jobs() {
         .unwrap();
     db::retire_guild_enrollment(&f.db, 10, 100).await.unwrap();
     f.tenant.schedule_erasure(enrollment.clone()).await.unwrap();
+    let config_version = db::get_config_version(&f.db).await.unwrap();
     assert!(f.tenant.drive_erasure().await.unwrap());
+    assert!(!db::guild_erasure_queued(&f.db, 10).await.unwrap());
     assert!(guild_placement(&f.db, 10).await.unwrap().is_none());
     assert_eq!(db::get_settings(&f.db, 10).await.unwrap().prefix, "!");
+    assert_eq!(
+        db::get_config_version(&f.db).await.unwrap(),
+        config_version + 1
+    );
+    assert!(!f.tenant.drive_erasure().await.unwrap());
     assert!(
         f.tenant
             .record_selected_case(enrollment, case_data(9))
@@ -413,6 +420,92 @@ async fn fence_after_erasure_selection_defers_completion_until_retry() {
     assert!(guild_placement(&f.db, 10).await.unwrap().is_none());
     assert_eq!(db::get_settings(&f.db, 10).await.unwrap().prefix, "!");
     assert!(!f.tenant.drive_erasure().await.unwrap());
+}
+
+tokio::task_local! {
+    static FENCE_BEFORE_ERASURE_PHASE: ErasurePhase;
+}
+
+pub(super) async fn maybe_fence_erasure_phase(db: &Db, guild: i64, phase: &ErasurePhase) {
+    if FENCE_BEFORE_ERASURE_PHASE
+        .try_with(|target| target == phase)
+        .unwrap_or(false)
+    {
+        fence_guild_erasure(db, guild).await;
+    }
+}
+
+async fn assert_late_erasure_fence_defers(phase: ErasurePhase) {
+    let f = Fixture::new();
+    let enrollment = enroll(&f, 10, 100).await;
+    f.tenant
+        .record_selected_case(enrollment, case_data(9))
+        .await
+        .unwrap();
+    let placement = guild_placement(&f.db, 10).await.unwrap().unwrap();
+    db::patch_settings(&f.db, 10, Some(Some("?".into())), None, None)
+        .await
+        .unwrap();
+    db::retire_guild_enrollment(&f.db, 10, 100).await.unwrap();
+    let config_version = db::get_config_version(&f.db).await.unwrap();
+    let directory_done = phase != ErasurePhase::Directory;
+    let placement_done = phase == ErasurePhase::FinishJob;
+
+    // Commit a real fence immediately before the selected core write.
+    let completed = FENCE_BEFORE_ERASURE_PHASE
+        .scope(phase, f.tenant.drive_erasure())
+        .await
+        .unwrap();
+    assert_eq!(
+        db::get_settings(&f.db, 10).await.unwrap().prefix,
+        if directory_done { "!" } else { "?" }
+    );
+    assert_eq!(
+        db::get_config_version(&f.db).await.unwrap(),
+        config_version + u64::from(directory_done)
+    );
+    assert_eq!(
+        guild_placement(&f.db, 10).await.unwrap(),
+        (!placement_done).then_some(placement)
+    );
+    assert!(db::guild_erasure_queued(&f.db, 10).await.unwrap());
+    assert!(!completed, "a fenced attempt completed no job");
+
+    assert!(!f.tenant.drive_erasure().await.unwrap());
+    f.db.with_conn(|conn| {
+        conn.execute_bounded(
+            "DELETE FROM guild_write_fences WHERE guild_id=10",
+            (),
+            64 * 1024 * 1024,
+        )
+    })
+    .await
+    .unwrap();
+    assert!(f.tenant.drive_erasure().await.unwrap());
+    assert!(!db::guild_erasure_queued(&f.db, 10).await.unwrap());
+    assert!(guild_placement(&f.db, 10).await.unwrap().is_none());
+    assert_eq!(db::get_settings(&f.db, 10).await.unwrap().prefix, "!");
+    assert_eq!(
+        db::get_config_version(&f.db).await.unwrap(),
+        config_version + 1,
+        "directory cleanup advanced the configuration version only once"
+    );
+    assert!(!f.tenant.drive_erasure().await.unwrap());
+}
+
+#[tokio::test]
+async fn late_erasure_fence_before_directory_preserves_directory_and_placement() {
+    assert_late_erasure_fence_defers(ErasurePhase::Directory).await;
+}
+
+#[tokio::test]
+async fn late_erasure_fence_before_placement_preserves_placement() {
+    assert_late_erasure_fence_defers(ErasurePhase::Placement).await;
+}
+
+#[tokio::test]
+async fn late_erasure_fence_before_finish_preserves_job() {
+    assert_late_erasure_fence_defers(ErasurePhase::FinishJob).await;
 }
 
 #[tokio::test]

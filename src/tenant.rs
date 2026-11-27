@@ -73,6 +73,7 @@ impl ErasureCursor {
 
 // Process-local progress only. On failure/cancellation the durable job is replayed
 // from its captured identities; each operation rechecks its own prerequisites.
+#[cfg_attr(test, derive(PartialEq))]
 enum ErasurePhase {
     CloseMembership,
     CancelEvidence,
@@ -1012,6 +1013,8 @@ impl TenantRuntime {
             ErasureProgress::Remaining => ErasurePhase::CloseMembership,
         };
         loop {
+            #[cfg(test)]
+            tests::maybe_fence_erasure_phase(&self.core, job.guild_id, &phase).await;
             phase = match phase {
                 ErasurePhase::CloseMembership => {
                     handle.close_membership(scope.clone()).await?;
