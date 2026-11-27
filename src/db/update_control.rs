@@ -2532,11 +2532,8 @@ mod tests {
     #[tokio::test]
     async fn forwarded_unsaved_receipts_are_logged_only_by_the_caller() {
         let f = Fixture::new(CORE_SCHEMA_VERSION, guild_data::SCHEMA_VERSION).await;
-        // Reserve a loopback port and close the listener, so the link is
-        // refused exactly as during a rolling swap before the new bot starts.
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let refused = listener.local_addr().unwrap();
-        drop(listener);
+        let (refused, _reservation) =
+            crate::control::test_support::reserve_refused_endpoint().await;
         // A writer that answers with a transient refusal, as a bot that is
         // not the writer yet does.
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();

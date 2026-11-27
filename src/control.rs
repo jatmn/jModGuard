@@ -619,6 +619,29 @@ struct Wire {
     op: ControlOp,
 }
 
+#[cfg(any(test, feature = "test-support"))]
+pub mod test_support {
+    use std::io::ErrorKind;
+    use std::net::{Ipv4Addr, SocketAddr};
+    use tokio::net::{TcpListener, TcpSocket};
+
+    /// Keep the returned socket alive. Binding without listening reserves the
+    /// port against parallel tests while incoming connections are refused.
+    pub async fn reserve_refused_endpoint() -> (SocketAddr, TcpSocket) {
+        let socket = TcpSocket::new_v4().unwrap();
+        socket
+            .bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+            .unwrap();
+        let addr = socket.local_addr().unwrap();
+        assert_eq!(
+            TcpListener::bind(addr).await.unwrap_err().kind(),
+            ErrorKind::AddrInUse,
+            "the refused endpoint must stay reserved until the request completes"
+        );
+        (addr, socket)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

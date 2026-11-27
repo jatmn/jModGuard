@@ -2285,9 +2285,7 @@ async fn api_role_startup_receipts_log_one_info_line_per_unreachable_link_attemp
     let db_path = root.join("core.db");
     let _db = Db::open(&db_path, 2).unwrap();
     // A configured link with no listener is the swap state from the issue.
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let addr = listener.local_addr().unwrap();
-    drop(listener);
+    let (addr, _reservation) = jmodguard::control::test_support::reserve_refused_endpoint().await;
     let secret = "x".repeat(32);
     let link = jmodguard::control::try_writer_link(&addr.to_string(), &secret)
         .unwrap()
@@ -2376,9 +2374,7 @@ async fn api_role_paired_step_over_an_unreachable_launcher_link_warns_once_per_a
         .unwrap();
     // A configured bot launcher link with no listener: the bot launcher is
     // re-executing or still waiting for the fence.
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let addr = listener.local_addr().unwrap();
-    drop(listener);
+    let (addr, _reservation) = jmodguard::control::test_support::reserve_refused_endpoint().await;
     let link = jmodguard::control::try_writer_link(&addr.to_string(), &"x".repeat(32))
         .unwrap()
         .expect("launcher link");
@@ -9620,13 +9616,7 @@ async fn status_registry(status: u16) -> (String, tokio::task::JoinHandle<()>) {
 }
 
 async fn refused_registry() -> (String, tokio::net::TcpSocket) {
-    let socket = tokio::net::TcpSocket::new_v4().unwrap();
-    socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
-    let address = socket.local_addr().unwrap();
-    assert!(
-        tokio::net::TcpListener::bind(address).await.is_err(),
-        "the refused endpoint must stay reserved until the request completes"
-    );
+    let (address, socket) = jmodguard::control::test_support::reserve_refused_endpoint().await;
     (format!("http://{address}"), socket)
 }
 
