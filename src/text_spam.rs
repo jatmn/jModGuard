@@ -1,46 +1,69 @@
 //! Independent exact-text spam policy. Matching is trim-only equality.
-use anyhow::{Result, ensure};
-use serde::Deserialize;
+use anyhow::{Context, Result, bail, ensure};
+use serde_json::Value;
 
 pub const MODE: &str = "exact_text";
 pub const DEFAULT_MIN_LENGTH: usize = 20;
 
-#[derive(Clone, Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Clone, Debug)]
 pub struct Policy {
     pub mode: String,
     pub window_secs: u64,
     pub min_channels: usize,
     pub min_length: usize,
-    #[serde(default, skip_deserializing)]
     pub enforce: bool,
 }
 
 impl Policy {
     pub fn parse(rule: &crate::types::RuleDef) -> Result<Self> {
-        let mut value: Self = serde_json::from_value(rule.params.clone())?;
+        let [mode, window_secs, min_channels, min_length] = match &rule.params {
+            Value::Object(params) => {
+                ensure!(
+                    params.len() == 4,
+                    "repeat-text parameters must contain exactly mode, window_secs, min_channels, and min_length"
+                );
+                let field = |key: &str| {
+                    params
+                        .get(key)
+                        .with_context(|| format!("missing repeat-text parameter `{key}`"))
+                };
+                [
+                    field("mode")?,
+                    field("window_secs")?,
+                    field("min_channels")?,
+                    field("min_length")?,
+                ]
+            }
+            // The previous struct decoder also accepted fields in declaration order.
+            Value::Array(params) => {
+                let [mode, window_secs, min_channels, min_length] = params.as_slice() else {
+                    bail!("repeat-text parameter arrays must contain four elements");
+                };
+                [mode, window_secs, min_channels, min_length]
+            }
+            _ => bail!("repeat-text parameters must be an object or a four-element array"),
+        };
         ensure!(
-            value.mode == MODE,
+            mode.as_str() == Some(MODE),
             "repeat-text detection requires exact_text"
         );
-        ensure!(
-            (1..=600).contains(&value.window_secs),
-            "text window must be 1–600 seconds"
-        );
-        ensure!(
-            (2..=10).contains(&value.min_channels),
-            "text channel threshold must be 2–10"
-        );
-        ensure!(
-            (1..=2000).contains(&value.min_length),
-            "text minimum length must be 1–2000 Unicode scalars"
-        );
+        let window_secs = window_secs
+            .as_u64()
+            .filter(|secs| (1..=600).contains(secs))
+            .context("text window must be 1–600 seconds")?;
+        let min_channels = min_channels
+            .as_u64()
+            .filter(|channels| (2..=10).contains(channels))
+            .context("text channel threshold must be 2–10")?;
+        let min_length = min_length
+            .as_u64()
+            .filter(|length| (1..=2000).contains(length))
+            .context("text minimum length must be 1–2000 Unicode scalars")?;
         if rule.dry_run {
             ensure!(
                 rule.actions.iter().all(|a| a.action == "log"),
                 "repeat-text test mode cannot configure punitive actions"
             );
-            value.enforce = false;
         } else {
             let actions: std::collections::BTreeSet<_> =
                 rule.actions.iter().map(|a| a.action.as_str()).collect();
@@ -54,9 +77,14 @@ impl Policy {
                     .all(|a| matches!(*a, "delete" | "ban" | "log")),
                 "text enforcement cannot use the generic punishment table"
             );
-            value.enforce = true;
         }
-        Ok(value)
+        Ok(Self {
+            mode: MODE.into(),
+            window_secs,
+            min_channels: min_channels as usize,
+            min_length: min_length as usize,
+            enforce: !rule.dry_run,
+        })
     }
 }
 
@@ -71,6 +99,8 @@ pub fn long_enough(text: &str, minimum: usize) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
+
     #[test]
     fn trim_only_equality_and_minimum_length() {
         assert_eq!(normalize("  Hello  "), "Hello");
@@ -116,5 +146,27 @@ mod tests {
         assert!(Policy::parse(&r).unwrap().enforce);
         r.actions[0].action = "timeout".into();
         assert!(Policy::parse(&r).is_err());
+    }
+
+    #[test]
+    fn policy_checks_parameter_keys_types_and_arity() {
+        let mut rule = crate::defaults::rule("repeat_text");
+        rule.params = json!([MODE, 600, 2, 2000]);
+        let positional = Policy::parse(&rule).unwrap();
+        assert_eq!(positional.window_secs, 600);
+        assert_eq!(positional.min_channels, 2);
+        assert_eq!(positional.min_length, 2000);
+        assert!(!positional.enforce);
+
+        for params in [
+            json!({"mode": MODE, "window_secs": 60, "min_channels": 3, "enforce": true}),
+            json!({"mode": MODE, "window_secs": 60, "min_channels": 3, "min_length": 20, "extra": 0}),
+            json!({"mode": MODE, "window_secs": 60, "min_channels": 3.0, "min_length": 20}),
+            json!([MODE, 60, 3]),
+            json!([MODE, 60, 3, 20, true]),
+        ] {
+            rule.params = params;
+            assert!(Policy::parse(&rule).is_err(), "accepted {}", rule.params);
+        }
     }
 }

@@ -1,8 +1,9 @@
 //! Shared exact-image test policy and bounded Discord attachment hashing.
 //! No image decoding, arbitrary URL fetch, archive, or punishment API.
-use anyhow::{Result, ensure};
+use anyhow::{Context, Result, bail, ensure};
 use hyper::{Body, Client, body::HttpBody};
 use serde::Deserialize;
+use serde_json::Value;
 use std::collections::BTreeSet;
 use std::path::Path;
 use std::sync::Arc;
@@ -23,16 +24,13 @@ pub const TEST_MODE: &str = "exact_image_test";
 pub const ENFORCE_MODE: &str = "exact_image";
 pub const MODE: &str = TEST_MODE;
 
-#[derive(Clone, Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Clone, Debug)]
 pub struct Policy {
     pub mode: String,
     pub window_secs: u64,
     pub min_channels: usize,
     pub min_attachments: usize,
-    #[serde(default, skip_deserializing)]
     pub enforce: bool,
-    #[serde(default, skip_deserializing)]
     pub known_bad_hashes: Option<Arc<BTreeSet<Hash>>>,
 }
 impl Policy {
@@ -43,36 +41,60 @@ impl Policy {
     }
 
     pub fn parse(rule: &crate::types::RuleDef) -> Result<Self> {
-        let mut value: Self = serde_json::from_value(rule.params.clone())?;
-        ensure!(
-            (1..=600).contains(&value.window_secs),
-            "image window must be 1–600 seconds"
-        );
-        ensure!(
-            (2..=10).contains(&value.min_channels),
-            "image channel threshold must be 2–10"
-        );
-        ensure!(
-            (1..=10).contains(&value.min_attachments),
-            "common distinct images must be 1–10"
-        );
-        match value.mode.as_str() {
+        let [mode, window_secs, min_channels, min_attachments] = match &rule.params {
+            Value::Object(params) => {
+                let field = |name| {
+                    params
+                        .get(name)
+                        .with_context(|| format!("missing image spam parameter `{name}`"))
+                };
+                let fields = [
+                    field("mode")?,
+                    field("window_secs")?,
+                    field("min_channels")?,
+                    field("min_attachments")?,
+                ];
+                ensure!(params.len() == fields.len(), "unknown image spam parameter");
+                fields
+            }
+            // Preserve the positional form previously accepted by Serde.
+            Value::Array(params) => {
+                let [mode, window_secs, min_channels, min_attachments] = params.as_slice() else {
+                    bail!("image spam parameter array must contain four fields");
+                };
+                [mode, window_secs, min_channels, min_attachments]
+            }
+            _ => bail!("image spam parameters must be an object or an array"),
+        };
+        let mode = mode.as_str().context("image spam mode must be a string")?;
+        let window_secs = window_secs
+            .as_u64()
+            .filter(|value| (1..=600).contains(value))
+            .context("image window must be 1–600 seconds")?;
+        let min_channels = min_channels
+            .as_u64()
+            .filter(|value| (2..=10).contains(value))
+            .context("image channel threshold must be 2–10")?;
+        let min_attachments = min_attachments
+            .as_u64()
+            .filter(|value| (1..=10).contains(value))
+            .context("common distinct images must be 1–10")?;
+        let enforce = match mode {
             TEST_MODE => {
                 ensure!(
                     rule.dry_run && rule.actions.iter().all(|a| a.action == "log"),
                     "exact-image test mode requires log-only actions"
                 );
-                value.enforce = false;
+                false
             }
             ENFORCE_MODE if rule.dry_run => {
                 ensure!(
                     rule.actions.iter().all(|a| a.action == "log"),
                     "exact-image test mode cannot configure punitive actions"
                 );
-                value.enforce = false;
+                false
             }
             ENFORCE_MODE => {
-                ensure!(!rule.dry_run, "image enforcement cannot be dry-run");
                 let actions: std::collections::BTreeSet<_> =
                     rule.actions.iter().map(|a| a.action.as_str()).collect();
                 ensure!(
@@ -85,11 +107,18 @@ impl Policy {
                         .all(|a| matches!(*a, "delete" | "ban" | "log")),
                     "image enforcement cannot use the generic punishment table"
                 );
-                value.enforce = true;
+                true
             }
-            _ => anyhow::bail!("unsupported exact-image mode"),
-        }
-        Ok(value)
+            _ => bail!("unsupported exact-image mode"),
+        };
+        Ok(Self {
+            mode: mode.to_owned(),
+            window_secs,
+            min_channels: min_channels as usize,
+            min_attachments: min_attachments as usize,
+            enforce,
+            known_bad_hashes: None,
+        })
     }
 }
 
@@ -847,6 +876,40 @@ mod tests {
     fn download_transport_anyhow_is_unchanged() {
         let message = format!("{:#}", download_anyhow(DownloadError::Transport));
         assert_eq!(message, "image download failed");
+    }
+
+    #[test]
+    fn policy_preserves_positional_params_and_rejects_non_schema_fields() {
+        use serde_json::json;
+
+        let mut rule = crate::defaults::default_rules()
+            .into_iter()
+            .find(|rule| rule.params.get("mode").and_then(Value::as_str) == Some(TEST_MODE))
+            .unwrap();
+        rule.params = json!([TEST_MODE, 60, 3, 2]);
+        let parsed = Policy::parse(&rule).unwrap();
+        assert_eq!(
+            (
+                parsed.window_secs,
+                parsed.min_channels,
+                parsed.min_attachments
+            ),
+            (60, 3, 2)
+        );
+        assert!(!parsed.enforce);
+        assert!(parsed.known_bad_hashes.is_none());
+
+        for params in [
+            json!([TEST_MODE, 60, 3]),
+            json!([TEST_MODE, 60, 3, 2, true]),
+            json!({"mode": TEST_MODE, "min_channels": 3, "min_attachments": 2}),
+            json!({"mode": TEST_MODE, "window_secs": 60, "min_channels": 3, "min_attachments": 2.0}),
+            json!({"mode": TEST_MODE, "window_secs": 60, "min_channels": 3, "min_attachments": 2, "enforce": true}),
+            json!({"mode": TEST_MODE, "window_secs": 60, "min_channels": 3, "min_attachments": 2, "known_bad_hashes": []}),
+        ] {
+            rule.params = params;
+            assert!(Policy::parse(&rule).is_err(), "{}", rule.params);
+        }
     }
 
     #[test]
