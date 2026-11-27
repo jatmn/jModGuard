@@ -14372,6 +14372,81 @@ test('Bot Resources says Unavailable for unread values and never shows them as z
   assert.ok([...h.nodes.get('#content').querySelectorAll('.br-chart-empty')].length >= 4, 'empty charts say so');
 });
 
+test('Bot Resources hides Bunny costs without config and renders partial provider history', async () => {
+  let snapshot = resourceSnapshot();
+  const h = ownerHarness(async () => response(snapshot));
+  h.app.navigate('resources');
+  await settle();
+  const section = () => h.nodes.get('#content').querySelector('[aria-labelledby="resources-bunny-costs"]');
+  const detail = () => section().querySelector('[aria-label="Magic Containers month-to-date estimate components"]');
+  assert.equal(section(), null);
+
+  const sampledAt = new Date(RESOURCE_NOW_MS - 5 * 24 * 3600e3).toISOString();
+  snapshot = resourceSnapshot({ provider: {
+    status: 'configured', month: '2026-11',
+    magic_containers: { status: 'available', month_to_date_usd: 2.25, projected_usd: 4.75, last_updated_secs: RESOURCE_NOW_MS / 1000 },
+    magic_breakdown: { cpu: 0.02, ram: 0.30, egress: 0.75, volume: null },
+    magic_cpu_hourly_averages: { sampled_at: sampledAt, min: 1.04 * 0.08, max: 1.23 * 0.08 },
+    database: { status: 'unavailable', configured_resources: 1 },
+    storage: { status: 'unavailable', month_to_date_usd: 0.005, projected_usd: 0.01, last_updated_secs: RESOURCE_NOW_MS / 1000, partial: true },
+    cdn: { status: 'unavailable' },
+    history: [{ month: '2026-10', magic_containers: { usd: 3.25, partial: false }, database: { usd: 0 }, storage: null }],
+  } });
+  await fire(h.nodes.get('#refresh-resources'), 'click');
+  const panel = section();
+  assert.ok(panel);
+  assert.match(textOf(panel), /2026-11 \(UTC\)/);
+  assert.match(textOf(panel), /Bunny’s monthly figure is the authoritative Magic Containers projection/);
+  assert.match(textOf(panel), /Partial estimates cover CPU, RAM, egress, and allocated volumes when available/);
+  assert.match(textOf(panel), /Projected month \(USD\)Month-to-date estimate \(USD\)/);
+  assert.match(textOf(panel), /Estimated costs/);
+  assert.match(textOf(detail()), /CPU cost\$0\.02Estimated hourly average CPU cores per pod0\.08–0\.1/);
+  assert.match(textOf(panel), /volume chart units are unverified/);
+  assert.match(textOf(detail()), /VolumesNot available/);
+  const sampleTime = detail().querySelector('dd time');
+  assert.equal(sampleTime?.dateTime, sampledAt);
+  assert.equal(sampleTime.textContent, new Date(sampledAt).toLocaleString(undefined, { timeZoneName: 'short' }));
+  assert.match(textOf(sampleTime.closest('dd')), /0\.08–0\.1 · Sampled /);
+  assert.equal(panel.querySelector('tbody strong').textContent, '$4.75');
+  assert.match(textOf(panel), /Magic Containers\$4.75\$2.25 \(partial\)/);
+  assert.match(textOf(panel), /Database \(1 database\)Not available/);
+  assert.match(textOf(panel), /Storage\$0.01<\$0.01 \(partial\).*last successful figures shown/);
+  assert.match(textOf(panel), /CDN.*Not available with scoped Bunny keys/);
+  assert.match(textOf(panel), /2026-10\$3.25 \(partial\)\$0.00Not available/);
+  assert.ok(h.nodes.get('#content').querySelector('[aria-labelledby="resources-memory-billing"]'));
+
+  snapshot.provider.magic_containers.month_to_date_usd = null;
+  snapshot.provider.magic_breakdown.egress = null;
+  snapshot.provider.magic_breakdown.egress_rate_unknown = true;
+  snapshot.provider.magic_breakdown.volume = 0;
+  snapshot.provider.magic_cpu_hourly_averages.max = snapshot.provider.magic_cpu_hourly_averages.min;
+  delete snapshot.provider.magic_cpu_hourly_averages.sampled_at;
+  snapshot.provider.history[0].magic_containers = { usd: null, egress_rate_unknown: true, partial: true };
+  await fire(h.nodes.get('#refresh-resources'), 'click');
+  assert.match(textOf(section()), /Magic Containers\$4.75Not available/);
+  assert.match(textOf(section()), /EgressUnknown regional rate/);
+  assert.match(textOf(detail()), /Volumes\$0\.00/);
+  assert.match(textOf(section()), /2026-10Unknown egress rate \(partial\)/);
+  assert.match(textOf(detail()), /0\.08 · Sample time unavailable/);
+  assert.equal(detail().querySelector('time'), null);
+
+  const volume = 0.60 * 0.5 / 720;
+  snapshot.provider.magic_containers.month_to_date_usd = volume;
+  snapshot.provider.magic_containers.partial = true;
+  snapshot.provider.magic_breakdown = { cpu: null, ram: null, egress: null, volume, egress_rate_unknown: false };
+  delete snapshot.provider.magic_cpu_hourly_averages;
+  await fire(h.nodes.get('#refresh-resources'), 'click');
+  assert.match(textOf(section()), /Magic Containers\$4\.75<\$0\.01 \(partial\)/);
+  for (const label of ['CPU cost', 'RAM', 'Egress']) {
+    assert.match(textOf(detail()), new RegExp(`${label}Not available`));
+  }
+  assert.match(textOf(detail()), /Volumes<\$0\.01/);
+
+  snapshot = resourceSnapshot();
+  await fire(h.nodes.get('#refresh-resources'), 'click');
+  assert.equal(section(), null);
+});
+
 test('Bot Resources rounds combined memory up from bytes, including zero and block boundaries', async () => {
   const mib = 2 ** 20;
   for (const [botBytes, apiBytes, blocks, capacity, headroom] of [

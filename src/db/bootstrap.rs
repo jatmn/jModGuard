@@ -205,7 +205,7 @@ pub(super) fn migrate_conn(conn: &mut Connection) -> Result<()> {
                 u64::try_from(events)?
                     .saturating_mul(128)
                     .saturating_add(EMPTY_TABLES_MIGRATION_GROWTH)
-            } else if matches!(target, 28 | 29) {
+            } else if matches!(target, 28 | 29 | 31) {
                 // Empty tables and indexes need schema and root pages only.
                 EMPTY_TABLES_MIGRATION_GROWTH
             } else {

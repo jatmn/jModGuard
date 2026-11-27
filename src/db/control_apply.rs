@@ -166,6 +166,11 @@ pub enum ControlOp {
     StoreRetryDeadlines {
         json: String,
     },
+    StoreBunnyCostSnapshot {
+        service: bunny_costs::BunnyService,
+        source_digest: bunny_costs::SourceDigest,
+        snapshot: bunny_costs::BunnyCostSnapshot,
+    },
     ClaimUpdateLease {
         component: String,
         owner: String,
@@ -448,6 +453,7 @@ pub fn control_actor_need(op: &ControlOp) -> ControlActorNeed {
         ControlOp::EnqueueBotAction { .. }
         | ControlOp::CancelBotAction { .. }
         | ControlOp::StoreRetryDeadlines { .. }
+        | ControlOp::StoreBunnyCostSnapshot { .. }
         | ControlOp::ClaimUpdateLease { .. }
         | ControlOp::RenewUpdateLease { .. }
         | ControlOp::ReleaseUpdateLease { .. }
@@ -1069,6 +1075,13 @@ async fn apply_control_inner(
             store_retry_deadlines(db, json).await?;
             saved_null()
         }
+        ControlOp::StoreBunnyCostSnapshot {
+            service,
+            source_digest,
+            snapshot,
+        } => saved_value(
+            bunny_costs::store_bunny_cost_snapshot(db, service, source_digest, snapshot).await?,
+        ),
         ControlOp::ClaimUpdateLease {
             component,
             owner,

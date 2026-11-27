@@ -1196,6 +1196,7 @@ dependencies = [
  "percent-encoding",
  "rand 0.10.4",
  "reqwest 0.13.5",
+ "ring",
  "serde",
  "serde_json",
  "tokio",
@@ -1203,6 +1204,7 @@ dependencies = [
  "tower-http 0.7.1",
  "tower-sessions",
  "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

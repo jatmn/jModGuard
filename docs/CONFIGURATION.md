@@ -66,6 +66,84 @@ current usage continues for 720 hours. Both cost estimates exclude host
 overhead and egress. They use local readings and make no calls to billing providers.
 See [Bot Resources](WEBUI.md#tabs).
 
+### Bunny provider cost estimates
+
+Set these optional variables in the **API process** environment. Use stats-only
+keys restricted to the listed resources. Example values are placeholders.
+
+| Variable | Placeholder | Purpose |
+|---|---|---|
+| `JMODGUARD_BUNNY_MC_STATS_KEY` | `<mc-stats-key>` | Key with `MagicContainers.Statistics` |
+| `JMODGUARD_BUNNY_MC_APP_ID` | `<mc-app-id>` | Magic Containers app ID, with its original case |
+| `JMODGUARD_BUNNY_DATA_STATS_KEY` | `<data-stats-key>` | Key with `Database.Statistics`, `StorageZone.Statistics`, or both |
+| `JMODGUARD_BUNNY_DB_CORE_ID` | `<CORE-DB-ID>` | Core database ID, as issued by Bunny |
+| `JMODGUARD_BUNNY_DB_GUILD_ID` | `<GUILD-DB-ID>` | Guild database ID, as issued by Bunny |
+| `JMODGUARD_BUNNY_STORAGE_ZONE_ID` | `<storage-zone-id>` | Storage zone ID |
+
+Set a matching key and ID for each service you want to see. Either database
+ID can be used by itself. Copy uppercase database IDs as issued. The API
+does not trim or change ID case. The Bunny panel appears only when the API can
+start a collector for at least one valid key-and-ID pair. Scoped keys cannot
+read CDN statistics.
+
+Costs use UTC calendar months and USD. Bunny's app-summary `monthlyCost` is
+the authoritative Magic Containers projection. The month-to-date subtotal
+and history estimate CPU, RAM, traffic and any available allocated volume cost.
+Chart keys mark bucket starts in UTC, and daily buckets follow the UTC calendar.
+The client filters by the requested range because Bunny can return buckets
+beyond `toDate`, including the current partial hour or day. Only closed
+buckets contribute to chart estimates and displayed averages.
+
+| Chart field | Observed or published scope | Treatment |
+| --- | --- | --- |
+| `cpuUsageSplitChart` | Mean percentage of the standard 8-CPU pod allocation, inferred from a cost comparison | Convert to estimated cores as `percent / 100 × 8` and price closed hours at $0.02 per core-hour. The latest closed hour also shows the estimated average cores per pod. |
+| `ramUsageSplitChart` | Sample-weighted mean bytes per pod, including daily buckets | Rounded up to whole 64 MiB blocks per pod and priced per hour. |
+| `trafficSplitChart` | Bytes summed per bucket, with daily values equal to the sum of hourly values | Priced as egress at the rate for the reporting pod's region |
+
+The reconstructed month-to-date total matched one standard app's
+`/summary.monthlyCost` projection. The public chart docs omit the CPU unit,
+and the conversion is unverified for
+[one-CPU trial pods](https://bunny.net/docs/magic-containers/limits#trial-accounts).
+
+Daily CPU and RAM values are sample-weighted means of the underlying readings.
+Current CPU cost uses closed hourly observations. Historical backfill reads
+daily RAM and traffic, and history can retain CPU costs saved during the
+current period. Daily RAM uses the mean for block rounding and applies the
+resulting blocks over 24 hours.
+
+Persistent volume cost uses the app summary's `totalVolumeSizeInGb` at
+$0.10/GB-month. The current allocated size is prorated over the elapsed UTC
+month. Volume chart units are unverified and those charts are excluded from
+estimates. A missing allocation leaves the volume cost unavailable.
+Historical backfill preserves any
+month-to-date volume estimate saved in that month and has no allocation
+history to fill in the remaining cost. A known volume estimate contributes
+to the partial subtotal even before any chart data is available.
+
+Missing values can leave gaps in these estimates. Bunny's billed RAM
+includes variable system overhead, and traffic billing covers egress
+outside the CDN. The chart schema leaves billing-specific traffic filters
+unspecified.
+See [Magic Containers pricing](https://bunny.net/docs/magic-containers/pricing)
+and [monitoring](https://bunny.net/docs/magic-containers/monitoring).
+
+Magic Containers traffic uses [Bunny’s published regional rates](https://bunny.net/docs/magic-containers/pricing#network-traffic-usage).
+Positive traffic in a region with an unknown rate leaves the chart-derived
+egress and total unavailable. Bunny’s summary projection remains available.
+Storage uses the single-region Standard rate and Database uses the
+public-preview rate. Estimates exclude the $1 monthly account minimum,
+taxes and credits. Storage projections extrapolate based on the fraction of the month
+elapsed. See [Storage pricing](https://bunny.net/docs/storage/pricing)
+and [Database pricing](https://bunny.net/database/#pricing).
+
+Successful figures refresh about every six hours. API failures keep the last
+successful same-month figures with their timestamp and trigger bounded retries.
+History groups daily estimates into monthly snapshots for each configured
+resource. It preserves collected days as missing days fill in. Backfill uses up
+to 365 days for Magic Containers and Storage and 180 days for Database.
+The authenticated bot writer link must be configured to save snapshots. The
+backup for the core database includes this history.
+
 ### Public legal details
 
 Operators must fill in `[legal]` in the API's configuration before publishing

@@ -2,7 +2,7 @@
 //! rolled-up history. The API's current values are read live from this
 //! process; the bot's come from the status row it saves each minute. History
 //! reads are cached briefly so refreshing the page cannot multiply database
-//! reads. No provider billing API is called.
+//! reads. The optional Bunny estimates come from the background collector.
 use super::state::ApiState;
 use super::usage::authorize;
 use axum::Json;
@@ -186,6 +186,7 @@ pub async fn overview(
         history_status,
         &api_status,
         &app.cfg.web.hosting_estimate,
+        app.bunny_costs.view(chrono::Utc::now()),
     ))
 }
 
@@ -301,6 +302,7 @@ fn build_response(
     history_status: &'static str,
     api_status: &ProcessStatus,
     estimate: &HostingEstimateConfig,
+    provider: Option<super::bunny_costs::Report>,
 ) -> Response {
     let ResourceWindow {
         span_secs,
@@ -344,9 +346,10 @@ fn build_response(
                 history: prepared.map(|history| history.bot.as_ref()),
             },
         },
-        // libsql does not report rows read to the client, and no provider
-        // billing API is called. Both stay unavailable rather than estimated.
-        provider: json!({"status": "not_configured", "reason": "no_scoped_read_only_key"}),
+        provider: provider.map_or_else(
+            || json!({"status": "not_configured", "reason": "no_scoped_read_only_key"}),
+            |report| json!(report),
+        ),
         range: range.label(),
         rows_read: json!({"status": "unavailable", "reason": "not_reported_by_database_client"}),
         span_secs,

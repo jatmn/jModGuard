@@ -74,6 +74,7 @@ mod updates;
 pub use updates::*;
 mod update_control;
 pub use update_control::*;
+pub mod bunny_costs;
 mod resources;
 pub mod usage;
 pub use resources::*;
@@ -105,6 +106,10 @@ const MIGRATIONS: &[(i64, &str)] = &[
         include_str!("../migrations/0029_cleanup_delete_journal.sql"),
     ),
     (30, include_str!("../migrations/0030_audit_log_date.sql")),
+    (
+        31,
+        include_str!("../migrations/0031_bunny_cost_snapshots.sql"),
+    ),
 ];
 
 /// Completed core schema required by service startup and release observations.
@@ -926,6 +931,34 @@ impl Db {
             default_prefix: GuildSettings::default().prefix,
             retention_days: GuildSettings::default().retention_days,
         })
+    }
+
+    /// Open a fresh local fixture at the released core baseline, before
+    /// any later migrations or bot bootstrap writes.
+    #[cfg(feature = "test-support")]
+    pub fn open_core_baseline_fixture(path: &Path) -> Result<Self> {
+        anyhow::ensure!(!path.exists(), "core baseline fixture must be fresh");
+        let opts = DbOpenOptions {
+            path: path.to_owned(),
+            url: String::new(),
+            token: String::new(),
+            pool_size: 2,
+            migrate: false,
+            read_only: false,
+            default_prefix: GuildSettings::default().prefix,
+            retention_days: GuildSettings::default().retention_days,
+        };
+        Self::open_with_bootstrap(
+            &opts,
+            |conn| {
+                let tx = conn.transaction_primary_write()?;
+                let (version, sql) = MIGRATIONS[0];
+                tx.execute_batch_bounded(sql, 16 * 1024 * 1024)?;
+                tx.pragma_update(None, "user_version", version)?;
+                tx.commit()
+            },
+            |_| Ok(()),
+        )
     }
 
     /// Current durable terminal defaults from `meta` (fresh read).

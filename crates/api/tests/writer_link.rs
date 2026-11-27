@@ -202,6 +202,55 @@ async fn api_paths_open_no_write_connection_and_save_through_the_bot() {
     assert_eq!(probe.immediate(), 0);
     cfg.bot.control_target = bound.to_string();
     let app = ApiState::new(cfg, db).unwrap();
+    // The API's cost collector can persist through the normal process-only
+    // writer operation while the API's own SQLite connection stays read-only.
+    use db::bunny_costs::{
+        BunnyCostSnapshot, BunnyDayCost, BunnyMonthData, BunnyService, bunny_cost_snapshots,
+    };
+    let month = chrono::NaiveDate::from_ymd_opt(2026, 10, 1).unwrap();
+    let observed = month.and_hms_opt(12, 0, 0).unwrap().and_utc().timestamp();
+    let first = [3; 32];
+    let second = [4; 32];
+    for (source_digest, fetched_at, cost) in [
+        (first, observed, 0.25),
+        (second, observed + 1, 0.75),
+        (first, observed - 1, 0.10),
+        (first, observed, 0.25),
+    ] {
+        let snapshot = BunnyCostSnapshot {
+            month,
+            fetched_at,
+            data: BunnyMonthData {
+                days: [(
+                    month,
+                    BunnyDayCost {
+                        storage: cost,
+                        ..BunnyDayCost::default()
+                    },
+                )]
+                .into(),
+                ..BunnyMonthData::default()
+            },
+        };
+        assert!(matches!(
+            app.commit(db::ControlOp::StoreBunnyCostSnapshot {
+                service: BunnyService::Storage,
+                source_digest,
+                snapshot,
+            })
+            .await
+            .unwrap(),
+            db::ControlReply::Saved { .. },
+        ));
+    }
+    for (digest, expected) in [(first, 0.25), (second, 0.75)] {
+        let costs = bunny_cost_snapshots(&app.db, BunnyService::Storage, digest, month, month)
+            .await
+            .unwrap();
+        assert_eq!(costs.len(), 1, "both source histories survive the switch");
+        assert_eq!(costs[0].data.month_to_date, Some(expected));
+    }
+
     let rejected = app
         .commit_actor(
             9,

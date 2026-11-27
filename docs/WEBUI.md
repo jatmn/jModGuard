@@ -463,6 +463,18 @@ declaration, which the panel labels when used. Optional hourly and 30-day USD
 estimates use the scope comparison for each metric and exclude host overhead and
 egress.
 See [hosting estimate configuration](CONFIGURATION.md#hosting-estimates).
+
+When configured, **Bunny cost estimates** shows accrued and projected USD by
+service for the UTC billing month, with up to 12 past months of stored
+estimates. The Magic Containers projection comes from Bunny's monthly summary.
+Its partial estimates cover CPU, RAM, egress, and allocated volumes when
+available. The CPU detail shows estimated average cores per pod for the latest
+closed hour, converted from the reported percentage of the standard allocation.
+The history marks incomplete months and keeps missing values
+separate from $0. Scoped Bunny keys leave CDN costs unavailable. The owner
+page reads snapshots and stays usable during a provider outage.
+See [Bunny provider configuration](CONFIGURATION.md#bunny-provider-cost-estimates).
+
 Below are bot activity (Gateway events per minute and by type, logical Discord REST requests,
 429s and rate-limit waits by bucket, shard latency, writer-lease generation and margin,
 guilds, capture queue), API activity (requests per minute, p50/p95 latency, 4xx/5xx,

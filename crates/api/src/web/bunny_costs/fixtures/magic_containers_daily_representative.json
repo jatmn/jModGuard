@@ -1,0 +1,76 @@
+{
+  "activeRegionsChart": {
+    "2026-10-31T00:00:00Z": 1,
+    "2026-11-01T00:00:00Z": 1,
+    "2026-11-02T00:00:00Z": 1
+  },
+  "instancesChart": {
+    "2026-10-31T00:00:00Z": 1,
+    "2026-11-01T00:00:00Z": 1,
+    "2026-11-02T00:00:00Z": 1
+  },
+  "instancesSplitChart": {},
+  "cpuUsageSplitChart": {
+    "pod-example": {
+      "region": "EU",
+      "chart": {
+        "2026-10-31T00:00:00Z": 2,
+        "2026-11-01T00:00:00Z": 0.984375,
+        "2026-11-02T00:00:00Z": 18.75
+      }
+    }
+  },
+  "ramUsageSplitChart": {
+    "pod-example": {
+      "region": "EU",
+      "chart": {
+        "2026-10-31T00:00:00Z": 419430400,
+        "2026-11-01T00:00:00Z": 262144000,
+        "2026-11-02T00:00:00Z": 429916160
+      }
+    }
+  },
+  "trafficSplitChart": {
+    "pod-example": {
+      "region": "EU",
+      "chart": {
+        "2026-10-31T00:00:00Z": 1100000,
+        "2026-11-01T00:00:00Z": 20000000,
+        "2026-11-02T00:00:00Z": 3200000
+      }
+    }
+  },
+  "ephemeralStorageSplitUsageChart": {},
+  "ephemeralStorageSplitLimitChart": {},
+  "volumesSplitUsageChart": {
+    "volume-example": {
+      "region": "EU",
+      "chart": {
+        "2026-11-01T00:00:00Z": 43500000
+      },
+      "pods": [
+        {
+          "podId": "pod-example",
+          "from": "2026-11-01T20:00:00Z",
+          "to": "2026-11-02T00:00:00Z"
+        }
+      ]
+    }
+  },
+  "volumesSplitCapacityChart": {
+    "volume-example": {
+      "region": "EU",
+      "chart": {
+        "2026-11-01T00:00:00Z": 1000000000
+      },
+      "pods": [
+        {
+          "podId": "pod-example",
+          "from": "2026-11-01T20:00:00Z",
+          "to": "2026-11-02T00:00:00Z"
+        }
+      ]
+    }
+  },
+  "releases": []
+}
