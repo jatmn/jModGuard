@@ -1858,7 +1858,7 @@ async fn live_ban_cleanup_records_blocked_and_cancelled_outcomes() {
             action: rule.actions[0].clone(),
             strikes: 1,
             evidence: serde_json::json!({"content":"sample"}),
-            badword_content: None,
+            match_content: None,
             mention_permission_unknown: false,
             matched_rule: Some(rule),
             dry_run: false,

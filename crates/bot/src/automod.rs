@@ -15,7 +15,7 @@ use serenity::model::guild::Member;
 use serenity::model::id::{ChannelId, GuildId, MessageId, UserId};
 use serenity::model::prelude::Timestamp;
 use std::cell::{LazyCell, OnceCell};
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::time::Instant as AutomodInstant;
@@ -217,6 +217,8 @@ pub struct MsgCtx<'a> {
     pub received: Option<AutomodInstant>,
 }
 
+type WordForms<'a> = (HashSet<&'a str>, HashSet<&'a str>);
+
 struct MessageText<'a> {
     raw: &'a str,
     normalized: OnceCell<String>,
@@ -251,6 +253,35 @@ impl<'a> MessageText<'a> {
     fn matches_badword(&self, patterns: &[Regex]) -> bool {
         patterns.iter().any(|pattern| self.matches_pattern(pattern))
     }
+
+    fn matches_known_spam(&self, cfg: &CachedGuildConfig) -> bool {
+        cfg.known_spam
+            .matches_lazy_forms(self.raw, || self.normalized(), || self.compact())
+    }
+
+    fn word_forms<'b>(&'b self, lowercase: &'b str) -> WordForms<'b> {
+        (word_tokens(lowercase), word_tokens(self.normalized()))
+    }
+
+    fn matches_custom_text<'b>(
+        &self,
+        cfg: &CachedGuildConfig,
+        rule_id: &str,
+        kind: &str,
+        words: impl FnOnce() -> &'b WordForms<'b>,
+    ) -> bool {
+        match kind {
+            "pattern" => cfg
+                .custom_patterns
+                .get(rule_id)
+                .is_some_and(|pattern| self.matches_pattern(pattern)),
+            "word" => cfg.custom_words.get(rule_id).is_some_and(|dictionary| {
+                let (literal, normalized) = words();
+                dictionary.matches(literal, normalized)
+            }),
+            _ => false,
+        }
+    }
 }
 
 /// A rule fired and an action decided (highest severity across rules wins).
@@ -260,8 +291,8 @@ pub struct PendingAction {
     pub action: ActionDef,
     pub strikes: u32,
     pub evidence: serde_json::Value,
-    /// Original badword input for live rechecks. The case excerpt can be truncated.
-    pub(crate) badword_content: Option<String>,
+    /// Original input for badword, pattern and word rechecks. The case excerpt can be truncated.
+    pub(crate) match_content: Option<String>,
     /// The winning action is an everyone-attempt whose channel permission
     /// could not be resolved. Kick and ban delete the message and stop.
     pub mention_permission_unknown: bool,
@@ -290,7 +321,7 @@ impl PendingAction {
             action: primary.clone(),
             strikes: 1,
             evidence,
-            badword_content: None,
+            match_content: None,
             mention_permission_unknown,
             matched_rule: Some(rule.clone()),
             dry_run: rule.dry_run,
@@ -305,6 +336,12 @@ impl PendingAction {
         } else {
             std::slice::from_ref(&self.action)
         }
+    }
+
+    fn known_spam_matches(&self, cfg: &CachedGuildConfig) -> bool {
+        self.evidence["content"]
+            .as_str()
+            .is_some_and(|raw| MessageText::new(raw).matches_known_spam(cfg))
     }
 }
 
@@ -402,8 +439,7 @@ impl AutomodEngine {
         let arrived = ctx.received.unwrap_or(now);
         let text = MessageText::new(ctx.content);
         let literal = LazyCell::new(|| ctx.content.to_lowercase());
-        let message_words =
-            LazyCell::new(|| (word_tokens(&literal), word_tokens(text.normalized())));
+        let message_words = LazyCell::new(|| text.word_forms(&literal));
         let has_url = URL_RE.is_match(ctx.content);
         let has_invite = INVITE_RE.is_match(ctx.content);
 
@@ -439,11 +475,7 @@ impl AutomodEngine {
                         && (has_url || has_invite)
                 }
                 "badword" => text.matches_badword(&cfg.regexes),
-                "known_spam" => cfg.known_spam.matches_lazy_forms(
-                    ctx.content,
-                    || text.normalized(),
-                    || text.compact(),
-                ),
+                "known_spam" => text.matches_known_spam(cfg),
                 "invite" => has_invite && !self.invite_allowed(rule, ctx.content),
                 // Velocity observes each eligible message under the strike bucket lock.
                 "velocity" => true,
@@ -467,7 +499,7 @@ impl AutomodEngine {
                     mention_permission_unknown: false,
                     evidence: serde_json::json!({ "content": ctx.content,
                         "channel_id": ctx.channel_id, "message_id": ctx.message_id }),
-                    badword_content: None,
+                    match_content: None,
                     matched_rule: Some(rule.clone()),
                     dry_run: rule.dry_run,
                 };
@@ -531,7 +563,7 @@ impl AutomodEngine {
                     "attachments": ctx.attachment_count,
                     "mentions": ctx.everyone_mentions + ctx.here_mentions + ctx.role_mentions,
                 }),
-                badword_content: (rule_id == "badword").then(|| ctx.content.to_owned()),
+                match_content: (rule_id == "badword").then(|| ctx.content.to_owned()),
                 matched_rule: Some(rule.clone()),
                 dry_run: rule.dry_run,
             };
@@ -565,14 +597,9 @@ impl AutomodEngine {
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
             let triggered = match kind {
-                "pattern" => cfg
-                    .custom_patterns
-                    .get(rule_id)
-                    .is_some_and(|pattern| text.matches_pattern(pattern)),
-                "word" => cfg.custom_words.get(rule_id).is_some_and(|dictionary| {
-                    let (literal, normalized) = LazyCell::force(&message_words);
-                    dictionary.matches(literal, normalized)
-                }),
+                "pattern" | "word" => {
+                    text.matches_custom_text(cfg, rule_id, kind, || &message_words)
+                }
                 "channel_content" => {
                     use jmodguard::custom_rules::{channel_link_blocked, content_toggle};
                     (content_toggle(rule, "attachments") && ctx.attachment_count > 0)
@@ -598,7 +625,7 @@ impl AutomodEngine {
             let Some(action) = jmodguard::custom_rules::primary_custom_action(rule) else {
                 continue;
             };
-            let pending = PendingAction::from_custom(
+            let mut pending = PendingAction::from_custom(
                 rule_id,
                 rule,
                 action,
@@ -611,6 +638,9 @@ impl AutomodEngine {
                 }),
                 kind == "everyone_attempt" && ctx.mention_permission_unknown,
             );
+            if matches!(kind, "pattern" | "word") {
+                pending.match_content = Some(ctx.content.to_owned());
+            }
             if is_more_severe(&pending, best.as_ref()) {
                 best = Some(pending);
             }
@@ -1090,8 +1120,7 @@ pub(crate) async fn execute_pending_with(
         let Some(current) = cfg.rules.get("known_spam") else {
             return false;
         };
-        let content = pending.evidence["content"].as_str().unwrap_or("");
-        if !current.enabled || !cfg.known_spam.matches(content) {
+        if !current.enabled || !pending.known_spam_matches(cfg) {
             return false;
         }
         if jmodguard::custom_rules::rule_scope_skips(
@@ -1449,6 +1478,7 @@ async fn recheck_message_rule(
     guild: u64,
     pending: &PendingAction,
     checked_rule: &RuleDef,
+    is_ban: bool,
     preset: Option<&ConfigDispatch>,
 ) -> bool {
     if let Some(preset) = preset {
@@ -1456,23 +1486,31 @@ async fn recheck_message_rule(
     }
     // The pending action came from the match. An edit before the first read
     // can otherwise make both config reads agree on a different action plan.
-    if pending
-        .matched_rule
-        .as_ref()
-        .is_none_or(|matched| matched.actions != checked_rule.actions)
-    {
+    let Some(matched) = pending.matched_rule.as_ref() else {
+        return false;
+    };
+    // A ban and its sweep also require the admitted trigger and scope.
+    if matched.actions != checked_rule.actions || (is_ban && matched != checked_rule) {
         return false;
     }
     recheck_live_rule(app, guild, &pending.rule_id, checked_rule, |cfg| {
         // These lists can change independently of the matched rule row.
         match pending.rule_id.as_str() {
             "badword" => pending
-                .badword_content
+                .match_content
                 .as_deref()
                 .is_some_and(|raw| MessageText::new(raw).matches_badword(&cfg.regexes)),
-            "known_spam" => cfg
-                .known_spam
-                .matches(pending.evidence["content"].as_str().unwrap_or("")),
+            "known_spam" => pending.known_spam_matches(cfg),
+            id if is_ban && jmodguard::custom_rules::is_custom_id(id) => {
+                let kind = checked_rule.params["kind"].as_str().unwrap_or("");
+                !matches!(kind, "pattern" | "word")
+                    || pending.match_content.as_deref().is_some_and(|raw| {
+                        let text = MessageText::new(raw);
+                        let lowercase = LazyCell::new(|| raw.to_lowercase());
+                        let words = LazyCell::new(|| text.word_forms(&lowercase));
+                        text.matches_custom_text(cfg, id, kind, || &words)
+                    })
+            }
             _ => true,
         }
     })
@@ -1705,11 +1743,15 @@ async fn execute_live<'a>(
     if preset_dispatch.is_some_and(|dispatch| !dispatch.is_current(app)) {
         return None;
     }
-    let message_rule_is_current = || async {
-        // A ban and its sweep can revalidate the original rule after a version
-        // change. The trigger and scope must still match the admitted rule.
-        (!is_ban || pending.matched_rule.as_ref() == Some(settings))
-            && recheck_message_rule(app, guild_id.get(), pending, settings, preset_dispatch).await
+    let message_rule_is_current = || {
+        recheck_message_rule(
+            app,
+            guild_id.get(),
+            pending,
+            settings,
+            is_ban,
+            preset_dispatch,
+        )
     };
 
     if let Some(warning) = warning
@@ -5214,6 +5256,140 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn custom_ban_purge_rechecks_effective_matchers_with_unchanged_rule_rows() {
+        use serenity::all::{GuildId, User, UserId};
+        use std::sync::{Arc, atomic::AtomicBool};
+        use std::time::Duration;
+
+        const ID: &str = "custom:0123456789abcdef";
+        const SWEEP: &str = "DELETE /api/v10/channels/71/messages/41";
+        for kind in ["pattern", "word"] {
+            for still_matches in [false, true] {
+                let path = std::env::temp_dir().join(format!(
+                    "custom_ban_purge_{:032x}.db",
+                    rand::random::<u128>()
+                ));
+                let app = BotState::new(Default::default(), crate::db::Db::open(&path, 2).unwrap())
+                    .unwrap();
+                let now_ms = jmodguard::control::now_ms();
+                assert!(
+                    crate::db::claim_active_bot(
+                        &app.db,
+                        app.activation.instance(),
+                        now_ms,
+                        Arc::new(AtomicBool::new(false)),
+                    )
+                    .await
+                    .unwrap()
+                );
+                app.activation.mark_lock_held(true);
+                let enrollment = crate::db::enroll_guild(&app.db, 10, 100)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                app.tenant.activate(enrollment).await.unwrap();
+
+                let mut rule = dry_run_word_ban();
+                if kind == "pattern" {
+                    rule.params = serde_json::json!({"kind": kind, "pattern": "scam$"});
+                }
+                rule.dry_run = false;
+                rule.actions[0].purge_last_hour = true;
+                crate::db::upsert_rule(&app.db, 10, ID, &rule)
+                    .await
+                    .unwrap();
+                let cfg = app.configs.get(&app.db, 10).await.unwrap();
+                let tail = if kind == "pattern" {
+                    "s c 4 m"
+                } else {
+                    "sp4mw0rd"
+                };
+                let content = format!("{} {tail}", "z".repeat(2000));
+                let mut message = word_message(&[]);
+                message.content = &content;
+                let pending = app.automod.evaluate(&cfg, &message).expect("custom match");
+                assert_eq!(pending.rule_id, ID);
+                assert!(!pending.evidence["content"].as_str().unwrap().contains(tail));
+                app.recent_messages
+                    .remember(10, 99, 71, 41, now_ms - 1_800_000);
+
+                // The compiler currently derives these from rule params. Change only
+                // the compiled input to exercise an otherwise identical rule row.
+                let mut edited = test_cfg(&cfg.rules, &cfg.custom_patterns);
+                if kind == "pattern" {
+                    let pattern = if still_matches { "cam$" } else { "innocent$" };
+                    edited
+                        .custom_patterns
+                        .insert(ID.into(), normalize::compile_user_regex(pattern).unwrap());
+                } else {
+                    let words = if still_matches {
+                        ["spamword", "extra"]
+                    } else {
+                        ["safe", "extra"]
+                    };
+                    let mut edited_rule = cfg.rules[ID].clone();
+                    edited_rule.params["words"] = serde_json::json!(words);
+                    edited.custom_words.insert(
+                        ID.into(),
+                        jmodguard::custom_rules::WordDictionary::from_rule(&edited_rule).unwrap(),
+                    );
+                }
+                assert_eq!(
+                    app.automod.evaluate(&edited, &message).is_some(),
+                    still_matches
+                );
+
+                let (release, release_rx) = tokio::sync::oneshot::channel();
+                let requests = Arc::new(ReplyRequests {
+                    gate: Some(DiscordRequestGate {
+                        method: "PUT",
+                        path: "/api/v10/guilds/10/bans/99",
+                        entered: tokio::sync::Notify::new(),
+                        release: std::sync::Mutex::new(Some(release_rx)),
+                    }),
+                    ..Default::default()
+                });
+                let stub = DiscordStub::bind(Some(Arc::clone(&requests)));
+                let mut user = User::default();
+                user.id = UserId::new(99);
+                user.name = "member".into();
+                let execute = execute_pending_with(
+                    &app,
+                    &stub.http,
+                    &stub.cache,
+                    GuildId::new(10),
+                    &user,
+                    None,
+                    "member",
+                    Some(42),
+                    Some(70),
+                    &pending,
+                );
+                let edit = async {
+                    let gate = requests.gate.as_ref().unwrap();
+                    tokio::time::timeout(Duration::from_secs(5), gate.entered.notified())
+                        .await
+                        .unwrap();
+                    app.configs.replace_cached_matchers_for_test(10, edited);
+                    release.send(()).unwrap();
+                };
+                tokio::join!(execute, edit);
+                let seen = stub.finish();
+                assert_eq!(seen[0], "GET /api/v10/guilds/10/bans/99");
+                crate::spam_actions::tests::assert_ban_request(&seen[1], 10, 99, 3600);
+                assert_eq!(
+                    &seen[2..],
+                    if still_matches { &[SWEEP][..] } else { &[] },
+                    "{kind}, still_matches={still_matches}: {seen:?}",
+                );
+                drop(app);
+                let _ = std::fs::remove_file(&path);
+                crate::tenant::remove_sidecars(&path);
+            }
+        }
+    }
+
     #[test]
     fn known_spam_first_hit_and_exemptions_preserve_other_rules() {
         let rule = crate::defaults::default_rules()
@@ -5316,7 +5492,7 @@ mod tests {
                 (
                     "sample",
                     "Full Stack AI developer pitch",
-                    "fullst@ckaid3v3lop3rpitch",
+                    " F U L L\u{200b} S T @ C K A I D 3 V 3 L O P 3 R P I T C H ",
                 ),
                 ("url", "tinyurl.com/*", "join https://TINYURL.COM/abc"),
             ] {
@@ -5374,6 +5550,8 @@ mod tests {
                 let cfg = app.configs.get(&app.db, 10).await.unwrap();
                 let mut message = word_message(&[]);
                 message.content = content;
+                // The legacy direct matcher currently builds the same forms.
+                assert!(cfg.known_spam.matches(content), "{kind}: {content:?}");
                 let pending = AutomodEngine::new().evaluate(&cfg, &message).unwrap();
                 let mut user = serenity::model::user::User::default();
                 user.id = UserId::new(99);
@@ -7510,7 +7688,7 @@ mod tests {
                     "channel_id": 70,
                     "message_id": 42,
                 }),
-                badword_content: Some("spamword".into()),
+                match_content: Some("spamword".into()),
                 mention_permission_unknown: false,
                 matched_rule: Some(matched),
                 dry_run: false,
