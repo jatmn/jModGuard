@@ -503,24 +503,6 @@ fn update(
     Ok(())
 }
 
-fn capture_busy(error: &anyhow::Error) -> bool {
-    if crate::db_compat::is_database_commit_indeterminate(error) {
-        return false;
-    }
-    error.chain().any(|cause| {
-        match cause.downcast_ref::<libsql::Error>() {
-            Some(
-                libsql::Error::SqliteFailure(code, _)
-                | libsql::Error::RemoteSqliteFailure(code, _, _),
-            ) => code & 0xff == 5,
-            // Hrana exposes the remote SQLite code in its structured error's
-            // display. Do not classify timeouts/connection loss as contention.
-            Some(libsql::Error::Hrana(_)) => cause.to_string().contains("SQLITE_BUSY"),
-            _ => false,
-        }
-    })
-}
-
 fn capture_transaction(conn: &Connection, immediate: bool) -> Result<Transaction> {
     if immediate {
         conn.transaction_primary_write()
@@ -538,7 +520,7 @@ impl GuildDataStore {
         let operation = std::sync::Arc::new(operation);
         let first = operation.clone();
         match self.db.with_conn(move |conn| first(conn, false)).await {
-            Err(error) if capture_busy(&error) => {
+            Err(error) if crate::db_compat::is_database_busy(&error) => {
                 // The failed transaction was rolled back before with_conn
                 // returned. Re-read everything under the existing writer path
                 // once, instead of repeatedly trying to promote stale reads.

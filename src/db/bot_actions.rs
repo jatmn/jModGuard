@@ -1,6 +1,7 @@
 //! Durable action storage with current and captured membership checks.
 use super::*;
 use crate::bot_actions::{Action, Limits};
+use crate::db_compat::Transaction;
 use serde::Deserialize;
 
 // Stored and wire strings remain adapters; unknown values remain readable.
@@ -437,24 +438,51 @@ pub async fn claim_bot_action(db: &Db, now: i64) -> Result<Option<BotAction>> {
         if !due {
             return Ok(None);
         }
-        claim_bot_action_conn(conn, now)
+        claim_bot_action_tx(conn.transaction_immediate()?, now)
     })
     .await
 }
 
 /// Revalidate a positive scheduler advisory on the primary.
 pub async fn claim_advised_bot_action(db: &Db, now: i64) -> Result<Option<BotAction>> {
-    db.with_conn(move |conn| {
-        // Confirm the hint without reserving the writer or preparing a receipt.
-        let tx = conn.transaction_primary_snapshot()?;
-        let due: bool = tx.query_row(&poll_due_sql(), params![now], |r| Ok(r.get(0)?))?;
-        tx.finish_read()?;
-        if !due {
-            return Ok(None);
+    if db.is_remote() && !db.is_read_only() {
+        let result = db
+            .with_conn(move |conn| claim_advised_bot_action_conn(conn, now, true))
+            .await;
+        match result {
+            // A concurrent commit can invalidate a deferred transaction's
+            // promotion. Recheck due work on a fresh primary snapshot.
+            Err(ref error) if crate::db_compat::is_database_busy(error) => {}
+            result => return result,
         }
-        claim_bot_action_conn(conn, now)
-    })
-    .await
+    }
+    db.with_conn(move |conn| claim_advised_bot_action_conn(conn, now, false))
+        .await
+}
+
+fn claim_advised_bot_action_conn(
+    conn: &Connection,
+    now: i64,
+    promote: bool,
+) -> Result<Option<BotAction>> {
+    let mut tx = if promote {
+        conn.transaction_capture()?
+    } else {
+        conn.transaction_primary_snapshot()?
+    };
+    let due: bool = tx.query_row(&poll_due_sql(), params![now], |r| Ok(r.get(0)?))?;
+    if !due {
+        tx.finish_read()?;
+        return Ok(None);
+    }
+    if promote {
+        // The positive check and the write share one primary transaction.
+        tx.ensure_mutation_receipt()?;
+    } else {
+        tx.finish_read()?;
+        tx = conn.transaction_immediate()?;
+    }
+    claim_bot_action_tx(tx, now)
 }
 
 const EXPIRE_UNSTARTED_SQL: &str =
@@ -466,8 +494,7 @@ const MARK_EXPIRED_RUNNING_UNCERTAIN_SQL: &str =
          WHERE id IN (SELECT id FROM bot_actions
          WHERE state='running' AND expires_at<=?1 LIMIT 64)";
 
-fn claim_bot_action_conn(conn: &mut Connection, now: i64) -> Result<Option<BotAction>> {
-    let tx = conn.transaction_immediate()?;
+fn claim_bot_action_tx(tx: Transaction, now: i64) -> Result<Option<BotAction>> {
     tx.execute_matching(EXPIRE_UNSTARTED_SQL, params![now])?;
     tx.execute_matching(MARK_EXPIRED_RUNNING_UNCERTAIN_SQL, params![now])?;
     let job = tx

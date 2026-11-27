@@ -155,6 +155,25 @@ pub(crate) fn is_database_commit_indeterminate(error: &anyhow::Error) -> bool {
     })
 }
 
+/// A proven SQLite lock conflict permits retrying a deferred promotion after rollback.
+pub(crate) fn is_database_busy(error: &anyhow::Error) -> bool {
+    if is_database_commit_indeterminate(error) {
+        return false;
+    }
+    error.chain().any(|cause| {
+        match cause.downcast_ref::<libsql::Error>() {
+            Some(
+                libsql::Error::SqliteFailure(code, _)
+                | libsql::Error::RemoteSqliteFailure(code, _, _),
+            ) => code & 0xff == 5,
+            // Hrana exposes the remote SQLite code in its structured error's
+            // display. Timeouts and connection loss do not identify contention.
+            Some(libsql::Error::Hrana(_)) => cause.to_string().contains("SQLITE_BUSY"),
+            _ => false,
+        }
+    })
+}
+
 /// After our own deadline, one attempt to drop a remote writer lock.
 ///
 /// Short enough that a hung ROLLBACK cannot hold the API call, and shorter
