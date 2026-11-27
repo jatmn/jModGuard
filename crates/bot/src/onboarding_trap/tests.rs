@@ -16,6 +16,8 @@ const NEW_TRAP_ROLE: u64 = 23;
 const MEMBER: u64 = 30;
 const REMOVAL_ROLES: [u64; 4] = [25, 24, 26, 27];
 const BOT_ROLE: u64 = 40;
+const BOT_KICK_ROLE: u64 = 41;
+const FIXTURE_NOW_MS: i64 = 1_767_225_600_000;
 const REASON: &str = "[Automod] Kicked for suspected bot (onboarding)";
 
 fn member(id: u64, roles: &[u64], joined_at: Timestamp) -> Member {
@@ -57,6 +59,7 @@ fn guild(everyone: Permissions) -> Guild {
             BOT_ROLE,
             Permissions::MANAGE_ROLES | Permissions::KICK_MEMBERS,
         ),
+        (BOT_KICK_ROLE, Permissions::KICK_MEMBERS),
     ] {
         let mut role = Role::default();
         role.id = RoleId::new(id);
@@ -353,6 +356,8 @@ async fn gateway_case(
     let rejections = event_kind == "cleanup rejected destination";
     let remove_roles = event_kind.starts_with("role removal");
     let removal_paused = event_kind == "role removal promotion";
+    let revoke_bot_kick = event_kind == "role removal bot lost kick";
+    let removal_cancelled = removal_paused || revoke_bot_kick;
     let removal_rejected = event_kind == "role removal partial";
     let mut config = jmodguard::config::BotProcessConfig::default();
     if ungrouped {
@@ -397,7 +402,7 @@ async fn gateway_case(
         if event_kind != "cleanup off" {
             rule.params["cleanup_window_minutes"] = serde_json::json!(5);
         }
-        let now_ms = Timestamp::now().timestamp_millis();
+        let now_ms = now().timestamp_millis();
         let joined_at_ms = member.joined_at.unwrap().timestamp_millis();
         for (guild, author, id, at_ms) in [
             (GUILD, MEMBER, 101, now_ms - 1_000),
@@ -475,8 +480,13 @@ async fn gateway_case(
     .await;
     let bot_id = ctx.cache.current_user().id;
     let bot_path = format!("/members/{bot_id}");
-    let bot_json =
-        serde_json::to_string(&self::member(bot_id.get(), &[BOT_ROLE], Timestamp::now())).unwrap();
+    let mut bot = self::member(bot_id.get(), &[BOT_ROLE], now());
+    let bot_without_kick_json = revoke_bot_kick.then(|| {
+        let json = serde_json::to_string(&bot).unwrap();
+        bot.roles.push(RoleId::new(BOT_KICK_ROLE));
+        json
+    });
+    let bot_json = serde_json::to_string(&bot).unwrap();
     let guild_json = serde_json::to_string(&guild).unwrap();
     let member_json = serde_json::to_string(&discord_member).unwrap();
     let mut member_with_new_role = discord_member.clone();
@@ -503,6 +513,7 @@ async fn gateway_case(
         let captured = Arc::clone(&captured);
         let (guild_json, member_json) = (guild_json.clone(), member_json.clone());
         let (bot_path, bot_json) = (bot_path.clone(), bot_json.clone());
+        let bot_without_kick_json = bot_without_kick_json.clone();
         let staff_json = staff_json.clone();
         let staff_veto = server_staff_veto.clone();
         let new_role_granted = Arc::clone(&server_new_role_granted);
@@ -514,6 +525,7 @@ async fn gateway_case(
                 let captured = Arc::clone(&captured);
                 let (guild_json, member_json) = (guild_json.clone(), member_json.clone());
                 let (bot_path, bot_json) = (bot_path.clone(), bot_json.clone());
+                let bot_without_kick_json = bot_without_kick_json.clone();
                 let staff_json = staff_json.clone();
                 let staff_veto = staff_veto.clone();
                 let new_role_granted = Arc::clone(&new_role_granted);
@@ -547,7 +559,16 @@ async fn gateway_case(
                         }
                     }
                     let (status, body) = match call.method {
-                        Method::GET if call.path.ends_with(&bot_path) => (200, bot_json),
+                        Method::GET if call.path.ends_with(&bot_path) => {
+                            let body = match bot_without_kick_json {
+                                Some(json) if captured.lock().iter().any(|previous| {
+                                    previous.method == Method::DELETE
+                                        && previous.path.ends_with("/members/30/roles/25")
+                                }) => json,
+                                _ => bot_json,
+                            };
+                            (200, body)
+                        }
                         Method::GET if call.path.contains("/members/") => {
                             let body = if staff_veto.load(Ordering::Relaxed) {
                                 staff_json
@@ -884,7 +905,7 @@ async fn gateway_case(
             )
             .await;
     }
-    if expected_kick || dry || removal_paused {
+    if expected_kick || dry || removal_cancelled {
         // Both events can replay an uncached old state. The server deliberately
         // still reports the same member so we exercise the process replay guard.
         let replay = if new_role_granted.load(Ordering::Relaxed) {
@@ -1058,13 +1079,14 @@ async fn gateway_case(
                 assert!(effects[0].2.contains("would clean tracked messages"));
             }
             if remove_roles {
-                assert!(
-                    effects[0]
-                        .2
-                        .contains("would remove selected roles, then would kick")
-                );
+                let action = if event_kind == "role removal dry-run" {
+                    "[DRY RUN] would attempt to remove selected roles, then would kick"
+                } else {
+                    "[DRY RUN] would kick"
+                };
+                assert!(effects[0].2.contains(action), "{effects:?}");
             }
-        } else if removal_paused {
+        } else if removal_cancelled {
             assert_eq!(effects.len(), 2, "{effects:?}");
             assert_eq!(effects[0].0, Method::DELETE);
             assert!(effects[0].1.ends_with("/members/30/roles/25"));
@@ -1375,17 +1397,51 @@ async fn disabled_unchanged_outside_window_and_stale_stay_do_not_act() {
 
 #[tokio::test]
 async fn selected_role_removals_run_before_the_kick_and_cleanup() {
-    let member = member(MEMBER, &[TRAP_ROLE, 24, 25, 26, 29], Timestamp::now());
-    gateway_case(
-        member.clone(),
-        member,
-        guild(Permissions::empty()),
-        "role removal ordered",
-        30,
-        false,
-        true,
-    )
-    .await;
+    let member = member(
+        MEMBER,
+        &[TRAP_ROLE, 24, 25, 26, 29],
+        Timestamp::from_millis(FIXTURE_NOW_MS - 60_000).unwrap(),
+    );
+    FIXTURE_NOW
+        .scope(
+            Timestamp::from_millis(FIXTURE_NOW_MS).unwrap(),
+            gateway_case(
+                member.clone(),
+                member,
+                guild(Permissions::empty()),
+                "role removal ordered",
+                30,
+                false,
+                true,
+            ),
+        )
+        .await;
+}
+
+#[tokio::test]
+async fn losing_the_bots_kick_role_after_a_removal_stops_the_sequence() {
+    let now = Timestamp::from_millis(FIXTURE_NOW_MS).unwrap();
+    let member = member(MEMBER, &[TRAP_ROLE, 24, 25], now);
+    let mut guild = guild(Permissions::empty());
+    guild
+        .roles
+        .get_mut(&RoleId::new(BOT_ROLE))
+        .unwrap()
+        .permissions = Permissions::MANAGE_ROLES;
+    FIXTURE_NOW
+        .scope(
+            now,
+            gateway_case(
+                member.clone(),
+                member,
+                guild,
+                "role removal bot lost kick",
+                30,
+                false,
+                false,
+            ),
+        )
+        .await;
 }
 
 #[tokio::test]
@@ -1419,17 +1475,33 @@ async fn partial_role_removal_or_missing_manage_roles_does_not_prevent_the_kick(
 
 #[tokio::test]
 async fn dry_run_role_removal_logs_without_mutation_and_ignores_replays() {
-    let member = member(MEMBER, &[TRAP_ROLE, 24], Timestamp::now());
-    gateway_case(
-        member.clone(),
-        member,
-        guild(Permissions::empty()),
-        "role removal dry-run",
-        30,
-        true,
-        false,
-    )
-    .await;
+    let now = Timestamp::from_millis(FIXTURE_NOW_MS).unwrap();
+    let both = Permissions::MANAGE_ROLES | Permissions::KICK_MEMBERS;
+    for (roles, permissions, position, expected_preview) in [
+        (&[TRAP_ROLE, 24][..], both, 40, true),
+        (&[TRAP_ROLE], both, 40, false),
+        (&[TRAP_ROLE, 26], both, 40, false),
+        (&[TRAP_ROLE, 24], Permissions::KICK_MEMBERS, 40, false),
+        (&[TRAP_ROLE, 24], Permissions::MANAGE_ROLES, 40, false),
+        (&[TRAP_ROLE, 24], both, 23, false),
+    ] {
+        let member = member(MEMBER, roles, now);
+        let mut guild = guild(Permissions::empty());
+        let bot_role = guild.roles.get_mut(&RoleId::new(BOT_ROLE)).unwrap();
+        bot_role.permissions = permissions;
+        bot_role.position = position;
+        let scenario = if expected_preview {
+            "role removal dry-run"
+        } else {
+            "role removal dry-run skipped"
+        };
+        FIXTURE_NOW
+            .scope(
+                now,
+                gateway_case(member.clone(), member, guild, scenario, 30, true, false),
+            )
+            .await;
+    }
 }
 
 #[tokio::test]
