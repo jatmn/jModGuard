@@ -17,6 +17,7 @@ use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::Duration;
+use tokio::time::Instant;
 
 pub use libsql::{Row, Value, params, params_from_iter};
 
@@ -44,6 +45,12 @@ pub struct DatabaseOperationTimedOut {
     operation: &'static str,
     timeout: Duration,
     replica_routable: bool,
+}
+
+#[derive(Clone, Copy)]
+enum DatabaseWait {
+    Timeout(Duration),
+    Deadline(Instant),
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -578,6 +585,50 @@ impl DbRuntime {
         T: Send,
         E: Into<anyhow::Error> + Send,
     {
+        self.block_on_database_with_wait(
+            operation,
+            timeout.map(DatabaseWait::Timeout),
+            future,
+            honor_caller,
+        )
+    }
+
+    fn block_on_transaction_statement<F, T, E>(
+        &self,
+        operation: &'static str,
+        read_deadline: Option<Instant>,
+        write_deadline: Option<Instant>,
+        future: F,
+    ) -> Result<T>
+    where
+        F: Future<Output = std::result::Result<T, E>> + Send,
+        T: Send,
+        E: Into<anyhow::Error> + Send,
+    {
+        let wait = match write_deadline {
+            Some(write) => Some(DatabaseWait::Deadline(
+                read_deadline.map_or(write, |read| read.min(write)),
+            )),
+            None => read_deadline
+                .map(|read| self.remaining_read_budget(read))
+                .or(self.operation_timeout)
+                .map(DatabaseWait::Timeout),
+        };
+        self.block_on_database_with_wait(operation, wait, future, true)
+    }
+
+    fn block_on_database_with_wait<F, T, E>(
+        &self,
+        operation: &'static str,
+        wait: Option<DatabaseWait>,
+        future: F,
+        honor_caller: bool,
+    ) -> Result<T>
+    where
+        F: Future<Output = std::result::Result<T, E>> + Send,
+        T: Send,
+        E: Into<anyhow::Error> + Send,
+    {
         if let Some(probe) = &self.startup_probe {
             probe.record_query();
         }
@@ -587,39 +638,15 @@ impl DbRuntime {
         } else {
             None
         };
-        #[cfg(test)]
-        let clock = self.manual_clock.lock().expect("manual clock lock").clone();
         self.block_on(async move {
+            let (timeout, deadline) = self.operation_timer(operation, wait)?;
             let abandoned = async {
                 match watch {
                     Some(watch) => watch.wait().await,
                     None => std::future::pending::<()>().await,
                 }
             };
-            #[cfg(test)]
-            let manual_deadline =
-                timeout.and_then(|timeout| clock.as_ref().map(|clock| clock.wait(timeout)));
-            #[cfg(test)]
-            let deadline = async {
-                match timeout {
-                    Some(timeout) => {
-                        if let Some(deadline) = manual_deadline {
-                            deadline.await;
-                        } else {
-                            tokio::time::sleep(timeout).await;
-                        }
-                    }
-                    None => std::future::pending::<()>().await,
-                }
-            };
-            #[cfg(not(test))]
-            let deadline = async {
-                match timeout {
-                    Some(timeout) => tokio::time::sleep(timeout).await,
-                    None => std::future::pending::<()>().await,
-                }
-            };
-            let remote = timeout.is_some();
+            let remote = wait.is_some();
             tokio::select! {
                 biased;
                 result = future => {
@@ -633,11 +660,43 @@ impl DbRuntime {
                 _ = abandoned => Err(database_caller_abandoned(operation)),
                 _ = deadline, if remote => Err(DatabaseOperationTimedOut {
                     operation,
-                    timeout: timeout.unwrap_or(Duration::ZERO),
+                    timeout,
                     replica_routable: self.replica_routable,
                 }.into()),
             }
         })
+    }
+
+    fn operation_timer(
+        &self,
+        operation: &'static str,
+        wait: Option<DatabaseWait>,
+    ) -> Result<(Duration, impl Future<Output = ()> + use<>)> {
+        #[cfg(test)]
+        let clock = self.manual_clock.lock().expect("manual clock lock").clone();
+        #[cfg(test)]
+        if let Some(clock) = &clock {
+            clock.enter_operation(operation);
+        }
+        let (timeout, deadline) = match wait {
+            Some(DatabaseWait::Timeout(timeout)) => (timeout, Some(self.snapshot_now() + timeout)),
+            Some(DatabaseWait::Deadline(deadline)) => {
+                (self.remaining_until(operation, deadline)?, Some(deadline))
+            }
+            None => (Duration::ZERO, None),
+        };
+        Ok((timeout, async move {
+            if let Some(deadline) = deadline {
+                #[cfg(test)]
+                if let Some(clock) = clock {
+                    clock.wait_until(deadline).await;
+                    return;
+                }
+                tokio::time::sleep_until(deadline).await;
+            } else {
+                std::future::pending::<()>().await;
+            }
+        }))
     }
 
     /// Drive a remote `BEGIN` on this runtime.
@@ -657,21 +716,25 @@ impl DbRuntime {
     where
         F: Future<Output = std::result::Result<libsql::Transaction, libsql::Error>> + Send,
     {
-        self.complete_or_release_open_within(operation, self.operation_timeout, future)
+        self.complete_or_release_open_within(
+            operation,
+            self.operation_timeout.map(DatabaseWait::Timeout),
+            future,
+        )
     }
 
     fn complete_or_release_open_within<F>(
         &self,
         operation: &'static str,
-        operation_timeout: Option<Duration>,
+        wait: Option<DatabaseWait>,
         future: F,
     ) -> Result<libsql::Transaction>
     where
         F: Future<Output = std::result::Result<libsql::Transaction, libsql::Error>> + Send,
     {
-        let Some(operation_timeout) = operation_timeout else {
+        if wait.is_none() {
             return self.block_on(future).map_err(Into::into);
-        };
+        }
         let watch = active_caller_abandon();
         #[cfg(test)]
         let clock = self.manual_clock.lock().expect("manual clock lock").clone();
@@ -689,18 +752,7 @@ impl DbRuntime {
                     None => std::future::pending::<()>().await,
                 }
             };
-            #[cfg(test)]
-            let manual_deadline = clock.as_ref().map(|clock| clock.wait(operation_timeout));
-            #[cfg(test)]
-            let deadline = async {
-                if let Some(deadline) = manual_deadline {
-                    deadline.await;
-                } else {
-                    tokio::time::sleep(operation_timeout).await;
-                }
-            };
-            #[cfg(not(test))]
-            let deadline = async { tokio::time::sleep(operation_timeout).await };
+            let (timeout, deadline) = self.operation_timer(operation, wait)?;
             let stop = tokio::select! {
                 biased;
                 result = future.as_mut() => {
@@ -775,7 +827,7 @@ impl DbRuntime {
                 Stop::Abandoned => Err(database_caller_abandoned(operation)),
                 Stop::Deadline => Err(DatabaseOperationTimedOut {
                     operation,
-                    timeout: operation_timeout,
+                    timeout,
                     replica_routable: self.replica_routable,
                 }.into()),
             }
@@ -788,6 +840,30 @@ impl DbRuntime {
 
     pub(crate) fn operation_limit(&self) -> Option<Duration> {
         self.operation_timeout
+    }
+
+    pub(crate) fn capture_write_deadline(&self) -> Option<Instant> {
+        self.operation_limit()
+            .map(|limit| self.snapshot_now() + limit)
+    }
+
+    fn remaining_read_budget(&self, deadline: Instant) -> Duration {
+        let remaining = deadline.saturating_duration_since(self.snapshot_now());
+        self.operation_limit()
+            .map_or(remaining, |limit| remaining.min(limit))
+    }
+
+    fn remaining_until(&self, operation: &'static str, deadline: Instant) -> Result<Duration> {
+        let remaining = deadline.saturating_duration_since(self.snapshot_now());
+        if remaining.is_zero() {
+            return Err(DatabaseOperationTimedOut {
+                operation,
+                timeout: remaining,
+                replica_routable: self.replica_routable,
+            }
+            .into());
+        }
+        Ok(remaining)
     }
 
     fn snapshot_now(&self) -> tokio::time::Instant {
@@ -859,6 +935,7 @@ pub(crate) struct ManualClock {
     origin: tokio::time::Instant,
     now_ms: AtomicU64,
     notify: tokio::sync::Notify,
+    advance_at_operation: Mutex<Option<(&'static str, Duration)>>,
 }
 
 #[cfg(test)]
@@ -868,6 +945,7 @@ impl ManualClock {
             origin: tokio::time::Instant::now(),
             now_ms: AtomicU64::new(0),
             notify: tokio::sync::Notify::new(),
+            advance_at_operation: Mutex::new(None),
         })
     }
 
@@ -877,18 +955,33 @@ impl ManualClock {
         self.notify.notify_waiters();
     }
 
+    pub(crate) fn advance_at_operation(&self, operation: &'static str, by: Duration) {
+        *self.advance_at_operation.lock().unwrap() = Some((operation, by));
+    }
+
+    fn enter_operation(&self, operation: &'static str) {
+        let mut scheduled = self.advance_at_operation.lock().unwrap();
+        if let Some((name, by)) = *scheduled
+            && name == operation
+        {
+            *scheduled = None;
+            self.advance(by);
+        }
+    }
+
     // Capture the deadline before polling the operation: its HTTP request can
     // wake the test and advance this clock before the timer is first polled.
     fn wait(&self, timeout: Duration) -> impl Future<Output = ()> + '_ {
-        let timeout_ms = u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX);
-        let deadline = self
-            .now_ms
-            .load(Ordering::SeqCst)
-            .saturating_add(timeout_ms);
+        let now = self.origin + Duration::from_millis(self.now_ms.load(Ordering::SeqCst));
+        self.wait_until(now + timeout)
+    }
+
+    fn wait_until(&self, deadline: Instant) -> impl Future<Output = ()> + '_ {
+        let deadline = deadline.saturating_duration_since(self.origin);
         async move {
             loop {
                 let notified = self.notify.notified();
-                if self.now_ms.load(Ordering::SeqCst) >= deadline {
+                if Duration::from_millis(self.now_ms.load(Ordering::SeqCst)) >= deadline {
                     return;
                 }
                 notified.await;
@@ -1640,6 +1733,7 @@ impl Connection {
         operation: &'static str,
         behavior: libsql::TransactionBehavior,
         read_budget: Option<Duration>,
+        write_deadline: Option<Instant>,
     ) -> Result<(
         libsql::Transaction,
         Option<tokio::time::Instant>,
@@ -1654,12 +1748,17 @@ impl Connection {
             self.runtime.for_replica_read()
         };
         let started = tokio::time::Instant::now();
-        let read_deadline = read_budget.map(|budget| runtime.snapshot_now() + budget);
+        let read_deadline = read_budget.map(|budget| {
+            let deadline = runtime.snapshot_now() + budget;
+            write_deadline.map_or(deadline, |write| write.min(deadline))
+        });
         let open = self.inner.transaction_with_behavior(behavior);
-        let opened = match read_budget {
-            Some(budget) => runtime.complete_or_release_open_within(operation, Some(budget), open),
-            None => runtime.complete_or_release_open(operation, open),
+        let wait = match write_deadline {
+            Some(write) => Some(DatabaseWait::Deadline(read_deadline.unwrap_or(write))),
+            None => read_budget.map(DatabaseWait::Timeout),
         };
+        let wait = wait.or(runtime.operation_timeout.map(DatabaseWait::Timeout));
+        let opened = runtime.complete_or_release_open_within(operation, wait, open);
         if primary && !self.guild_store {
             match &opened {
                 Ok(_) => jmodguard_runtime::resources::count_labelled(
@@ -1695,6 +1794,7 @@ impl Connection {
             "begin immediate transaction",
             libsql::TransactionBehavior::Immediate,
             None,
+            None,
         )?;
         let mut transaction = self.wrap_transaction(inner, WriteState::Unprepared, None, tally);
         transaction.ensure_mutation_receipt()?;
@@ -1716,6 +1816,7 @@ impl Connection {
             "begin primary snapshot",
             libsql::TransactionBehavior::Deferred,
             self.interactive_read_budget(),
+            None,
         )?;
         Ok(self.wrap_transaction(inner, WriteState::Snapshot, deadline, tally))
     }
@@ -1725,13 +1826,34 @@ impl Connection {
     /// entire operation on a proven busy error, never reuse the read results.
     #[track_caller]
     pub(crate) fn transaction_capture(&self) -> Result<Transaction> {
+        self.transaction_capture_before(None, false)
+    }
+
+    #[track_caller]
+    pub(crate) fn transaction_capture_before(
+        &self,
+        write_deadline: Option<Instant>,
+        immediate: bool,
+    ) -> Result<Transaction> {
         self.refuse_writer_lock()?;
-        let (inner, deadline, tally) = self.open_remote_transaction(
-            "begin capture transaction",
-            libsql::TransactionBehavior::Deferred,
-            self.interactive_read_budget(),
-        )?;
-        Ok(self.wrap_transaction(inner, WriteState::Unprepared, deadline, tally))
+        let (operation, behavior, read_budget) = if immediate {
+            (
+                "begin primary write transaction",
+                libsql::TransactionBehavior::Immediate,
+                None,
+            )
+        } else {
+            (
+                "begin capture transaction",
+                libsql::TransactionBehavior::Deferred,
+                self.interactive_read_budget(),
+            )
+        };
+        let (inner, read_deadline, tally) =
+            self.open_remote_transaction(operation, behavior, read_budget, write_deadline)?;
+        let mut tx = self.wrap_transaction(inner, WriteState::Unprepared, read_deadline, tally);
+        tx.write_deadline = write_deadline;
+        Ok(tx)
     }
 
     /// Replica-scalable read. `BEGIN READONLY` does not take the writer lock.
@@ -1742,6 +1864,7 @@ impl Connection {
             "begin consistent read",
             libsql::TransactionBehavior::ReadOnly,
             self.interactive_read_budget(),
+            None,
         )?;
         Ok(self.wrap_transaction(inner, WriteState::Snapshot, deadline, tally))
     }
@@ -1768,6 +1891,7 @@ impl Connection {
             "begin primary write transaction",
             libsql::TransactionBehavior::Immediate,
             None,
+            None,
         )?;
         Ok(self.wrap_transaction(inner, WriteState::Unprepared, None, tally))
     }
@@ -1793,6 +1917,7 @@ impl Connection {
             pending_config_version: std::sync::atomic::AtomicU64::new(0),
             write_state,
             read_deadline,
+            write_deadline: None,
             mutation_receipt: None,
             capacity_tracking: CapacityTracking::default(),
             stream: Arc::new(TransactionStream::new()),
@@ -2023,6 +2148,7 @@ impl SqlExecutor for Connection {
             inner: RuntimeOwned::new(inner, &runtime),
             runtime,
             read_deadline: None,
+            write_deadline: None,
             stream: Arc::new(TransactionStream::new()),
         })
     }
@@ -2039,11 +2165,8 @@ impl SqlExecutor for Connection {
 pub struct Statement {
     inner: RuntimeOwned<libsql::Statement>,
     runtime: DbRuntime,
-    /// Absolute budget copied from a remote read or snapshot. Autocommit
-    /// prepares and statements after a capture write leave this empty.
-    /// `query_map` is the only execution method. A new one has to honor
-    /// [`Self::query_wait`] instead of the pool deadline.
-    read_deadline: Option<tokio::time::Instant>,
+    read_deadline: Option<Instant>,
+    write_deadline: Option<Instant>,
     stream: Arc<TransactionStream>,
 }
 
@@ -2064,7 +2187,6 @@ impl Statement {
         P: IntoParams + Send,
         F: FnMut(&Row) -> Result<T> + Send,
     {
-        let timeout = self.query_wait();
         let runtime = self.runtime.clone();
         let stream = Arc::clone(&self.stream);
         let query = async {
@@ -2075,24 +2197,16 @@ impl Statement {
             }
             Ok::<_, anyhow::Error>(rows)
         };
-        let mapped = if let Some(timeout) = timeout {
-            runtime.block_on_database_within("query", Some(timeout), query, true)
-        } else {
-            runtime.block_on_database("query", query)
-        };
+        let mapped = runtime.block_on_transaction_statement(
+            "query",
+            self.read_deadline,
+            self.write_deadline,
+            query,
+        );
         if let Err(error) = &mapped {
             stream.note_error(error);
         }
         Ok(MappedRows(mapped?.into_iter()))
-    }
-
-    fn query_wait(&self) -> Option<Duration> {
-        let deadline = self.read_deadline?;
-        let remaining = deadline.saturating_duration_since(self.runtime.snapshot_now());
-        Some(match self.runtime.operation_limit() {
-            Some(limit) => remaining.min(limit),
-            None => remaining,
-        })
     }
 }
 
@@ -2205,9 +2319,10 @@ pub struct Transaction {
     connection_config_version: Arc<std::sync::atomic::AtomicU64>,
     pending_config_version: std::sync::atomic::AtomicU64,
     write_state: WriteState,
-    /// Remote reads and snapshots. Cleared in effect once a capture prepares
-    /// a write; member write transactions never set it.
-    read_deadline: Option<tokio::time::Instant>,
+    /// Interactive read phase. Promotion clears this deadline.
+    read_deadline: Option<Instant>,
+    /// Ordinary write deadline fixed before a guild snapshot capture starts.
+    write_deadline: Option<Instant>,
     mutation_receipt: Option<String>,
     capacity_tracking: CapacityTracking,
     stream: Arc<TransactionStream>,
@@ -2458,7 +2573,8 @@ impl Transaction {
     /// all succeeded. An already-expired budget still gets one short release
     /// instead of the pool deadline. Writes keep the normal cleanup path.
     fn budgeted_read_rollback(&self, operation: &'static str) -> Option<Result<()>> {
-        let wait = self.statement_wait()?;
+        let deadline = self.active_read_deadline()?;
+        let wait = self.runtime.remaining_read_budget(deadline);
         let timeout = if wait.is_zero() {
             REMOTE_LOCK_RELEASE_TIMEOUT
         } else {
@@ -2476,18 +2592,9 @@ impl Transaction {
         )
     }
 
-    /// Time left in a remote read or snapshot. `None` keeps the runtime deadline
-    /// (writes, and a capture after it has prepared a mutation).
-    fn statement_wait(&self) -> Option<Duration> {
-        let deadline = self.read_deadline?;
-        if self.write_state == WriteState::Prepared {
-            return None;
-        }
-        let remaining = deadline.saturating_duration_since(self.runtime.snapshot_now());
-        Some(match self.runtime.operation_limit() {
-            Some(limit) => remaining.min(limit),
-            None => remaining,
-        })
+    fn active_read_deadline(&self) -> Option<Instant> {
+        self.read_deadline
+            .filter(|_| self.write_state != WriteState::Prepared)
     }
 
     fn drive<T, E>(
@@ -2502,12 +2609,12 @@ impl Transaction {
         if let Some(primary) = &self.primary {
             primary.count(1);
         }
-        if let Some(timeout) = self.statement_wait() {
-            self.runtime
-                .block_on_database_within(operation, Some(timeout), future, true)
-        } else {
-            self.runtime.block_on_database(operation, future)
-        }
+        self.runtime.block_on_transaction_statement(
+            operation,
+            self.active_read_deadline(),
+            self.write_deadline,
+            future,
+        )
     }
 
     fn map_stream<T>(&self, result: Result<T>) -> Result<T> {
@@ -2572,16 +2679,29 @@ impl Transaction {
         self.ensure_mutation_receipt_limit(self.capacity_limits.growth)
     }
 
-    /// End the capture's read deadline before preparing a write. Capacity
-    /// sampling and receipt insertion use the ordinary write operation deadline.
-    pub(crate) fn prepare_capture_write(mut self) -> Result<Self> {
+    /// Promote in place before receipt setup, using the normal growth limit.
+    pub(crate) fn prepare_capture_write(&mut self) -> Result<()> {
+        self.end_capture_read()?;
+        self.ensure_mutation_receipt()
+    }
+
+    /// A take uses the reclaim limit for both receipt setup and deletion.
+    pub(crate) fn prepare_capture_reclaim(&mut self) -> Result<()> {
+        self.end_capture_read()?;
+        self.prepare_reclaim()
+    }
+
+    fn end_capture_read(&mut self) -> Result<()> {
         anyhow::ensure!(
-            self.write_state == WriteState::Unprepared,
-            "capture write requires an unprepared writable transaction"
+            self.write_state.allows_write(),
+            "read snapshot cannot take the write lock"
         );
+        if let Some(write) = self.write_deadline {
+            self.runtime
+                .remaining_until("promote capture transaction", write)?;
+        }
         self.read_deadline = None;
-        self.ensure_mutation_receipt()?;
-        Ok(self)
+        Ok(())
     }
 
     fn ensure_mutation_receipt_limit(&mut self, limit_bytes: u64) -> Result<()> {
@@ -2838,9 +2958,17 @@ impl Transaction {
                 );
             }
         }
-        let result = self
-            .runtime
-            .block_on_database("commit transaction", self.inner().execute_batch("COMMIT"));
+        let mut commit_started = false;
+        let inner = self.inner();
+        let result = self.runtime.block_on_transaction_statement(
+            "commit transaction",
+            None,
+            self.write_deadline,
+            async {
+                commit_started = true;
+                inner.execute_batch("COMMIT").await
+            },
+        );
         #[cfg(debug_assertions)]
         let result = if result.is_ok() && TEST_DROP_COMMIT_RESPONSE.swap(false, Ordering::SeqCst) {
             Err(database_operation_timed_out(
@@ -2862,15 +2990,18 @@ impl Transaction {
                 Ok(())
             }
             Err(commit_error) if self.runtime.is_remote() => {
+                self.note_remote_stream_loss(&commit_error);
+                if !commit_started {
+                    // The deadline expired before the first poll of COMMIT.
+                    // Drop releases the live transaction on the short rollback budget.
+                    return Err(commit_error);
+                }
                 // Cleanup only: a successful ROLLBACK response cannot prove a
                 // preceding COMMIT was not accepted when its response was
-                // lost. Callers must reconcile every remote commit error as
-                // an indeterminate outcome. An interactive timeout already
-                // closed the stream; ROLLBACK on it waits out the client
-                // deadline and is not cleanup. Our own deadline is different:
-                // the baton may still be live, and the writer lock stays until
-                // the provider steals it unless we roll back promptly.
-                self.note_remote_stream_loss(&commit_error);
+                // lost. Once COMMIT might have been sent, reconcile against
+                // the primary. A provider timeout already closed the stream.
+                // A client deadline can leave the baton live, so roll back
+                // promptly to release the writer lock.
                 if self.stream.provider_closed() {
                     self.connection_health.taint();
                 } else if self.remote_write_needs_prompt_release() {
@@ -3289,15 +3420,11 @@ impl SqlExecutor for Transaction {
         require_read_sql(sql)?;
         let inner =
             self.map_stream(self.drive("transaction prepare", self.inner().prepare(sql)))?;
-        let read_deadline = if self.write_state == WriteState::Prepared {
-            None
-        } else {
-            self.read_deadline
-        };
         Ok(Statement {
             inner: RuntimeOwned::new(inner, &self.runtime),
             runtime: self.runtime.clone(),
-            read_deadline,
+            read_deadline: self.active_read_deadline(),
+            write_deadline: self.write_deadline,
             stream: Arc::clone(&self.stream),
         })
     }

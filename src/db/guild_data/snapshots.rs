@@ -503,28 +503,29 @@ fn update(
     Ok(())
 }
 
-fn capture_transaction(conn: &Connection, immediate: bool) -> Result<Transaction> {
-    if immediate {
-        conn.transaction_primary_write()
-    } else {
-        conn.transaction_capture()
-    }
-}
-
 impl GuildDataStore {
     async fn capture<T, F>(&self, operation: F) -> Result<T>
     where
         T: Send + 'static,
-        F: Fn(&mut Connection, bool) -> Result<T> + Send + Sync + 'static,
+        F: Fn(Transaction) -> Result<T> + Send + Sync + 'static,
     {
+        let deadline = self.db.connections.runtime.capture_write_deadline();
         let operation = std::sync::Arc::new(operation);
         let first = operation.clone();
-        match self.db.with_conn(move |conn| first(conn, false)).await {
+        match self
+            .db
+            .with_conn(move |conn| first(conn.transaction_capture_before(deadline, false)?))
+            .await
+        {
             Err(error) if crate::db_compat::is_database_busy(&error) => {
                 // The failed transaction was rolled back before with_conn
                 // returned. Re-read everything under the existing writer path
                 // once, instead of repeatedly trying to promote stale reads.
-                self.db.with_conn(move |conn| operation(conn, true)).await
+                self.db
+                    .with_conn(move |conn| {
+                        operation(conn.transaction_capture_before(deadline, true)?)
+                    })
+                    .await
             }
             result => result,
         }
@@ -622,9 +623,8 @@ impl GuildDataStore {
         self.refuse_fenced_guild_write(scope.guild_id()).await?;
         let expected = self.expected.clone();
         let batch_scope = scope.clone();
-        self.capture(move |conn, immediate| {
+        self.capture(move |mut tx| {
             let scope = &batch_scope;
-            let mut tx = capture_transaction(conn, immediate)?;
             verify_scope(&tx, &expected, scope, true)?;
             let mut outcomes = vec![SnapshotOutcome::Stored; batch.len()];
             let mut seen = HashSet::new();
@@ -689,7 +689,7 @@ impl GuildDataStore {
                 for outcome in &mut outcomes { if *outcome == SnapshotOutcome::Stored { *outcome = SnapshotOutcome::CapacityRefused; } }
                 return Ok(Some(outcomes));
             }
-            tx.ensure_mutation_receipt()?;
+            tx.prepare_capture_write()?;
             tx.execute_bounded(&format!("{INSERT_SNAPSHOT} VALUES {}", placeholders.join(",")), params_from_iter(values), reserve * count)?;
             tx.commit()?;
             Ok(Some(outcomes))
@@ -751,9 +751,8 @@ impl GuildDataStore {
         let edit = observation.edit_at_ms.ok_or(SnapshotError::Invalid)?;
         let incoming_bytes = bound_fields(&mut observation.fields)?;
         let expected = self.expected.clone();
-        self.capture(move |conn, immediate| {
+        self.capture(move |mut tx| {
             let observation = observation.clone();
-            let mut tx = capture_transaction(conn, immediate)?;
             verify_scope(&tx, &expected, &scope, true)?;
             if observation.observed_at_ms >= expires || write_time_ms()? >= expires { tx.finish_read()?; return Ok(SnapshotTransition { outcome: SnapshotOutcome::Expired, before: None, after: None, same_revision_before: None }); }
             let old = load(&tx, &scope, observation.channel_id, observation.message_id)?;
@@ -787,7 +786,7 @@ impl GuildDataStore {
                 if admission.wrote_health { tx.commit()?; } else { tx.finish_read()?; }
                 return Ok(SnapshotTransition { outcome: SnapshotOutcome::CapacityRefused, before: None, after: old, same_revision_before: None });
             }
-            tx.ensure_mutation_receipt()?;
+            tx.prepare_capture_write()?;
             let row = MessageSnapshot { guild_id: scope.guild_id(), channel_id: observation.channel_id, message_id: observation.message_id, fields: bounded, created_at_ms: old.as_ref().map_or(observation.created_at_ms, |r| r.created_at_ms), first_observed_at_ms: old.as_ref().map_or(observation.observed_at_ms, |r| r.first_observed_at_ms), last_observed_at_ms: observation.observed_at_ms, edit_at_ms: Some(edit), expires_at_ms: old.as_ref().map_or(expires, |r| r.expires_at_ms), generation: old.as_ref().map_or(1, |r| r.generation.saturating_add(1)), coverage_epoch: observation.coverage_epoch, continuous: old.as_ref().is_some_and(|r| r.continuity_at(observation.coverage_epoch) == SnapshotContinuity::Continuous), content_supplied: content_supplied.is_supplied(), attachments_supplied: attachments_supplied.is_supplied() };
             if old.is_some() { update(&tx, &scope, &row, bytes)?; } else { insert(&tx, &scope, &row, incoming_bytes)?; }
             tx.commit()?;
@@ -857,9 +856,8 @@ impl GuildDataStore {
             SnapshotError::BatchLimit
         );
         let expected = self.expected.clone();
-        self.capture(move |conn, immediate| {
+        self.capture(move |mut tx| {
             let ids = ids.clone();
-            let mut tx = capture_transaction(conn, immediate)?;
             verify_scope(&tx, &expected, &scope, true)?;
             if ids.is_empty() { tx.finish_read()?; return Ok(Vec::new()); }
             let mut unique = ids.clone();
@@ -890,7 +888,7 @@ impl GuildDataStore {
             let expired_count = found.values().filter(|row| row.expires_at_ms <= effective_now).count();
             if found.is_empty() { tx.finish_read()?; }
             else {
-                tx.prepare_reclaim()?;
+                tx.prepare_capture_reclaim()?;
                 tx.execute_reclaim(&format!("DELETE FROM guild_message_snapshots WHERE {where_sql}"), params_from_iter(args))?;
                 if expired_count > 0 {
                     tx.execute_reclaim_metadata_bounded(
@@ -1044,7 +1042,7 @@ fn admit_snapshot(
     // reached, capture waits until a fresh primary sample drops below 700 MB.
     if allocated >= crate::capacity::SNAPSHOT_PAUSE_BYTES {
         if !paused {
-            tx.ensure_mutation_receipt()?;
+            tx.prepare_capture_write()?;
             tx.execute_bounded(
                 "UPDATE guild_snapshot_health SET capacity_paused=1 WHERE singleton=1",
                 (),
@@ -1064,7 +1062,7 @@ fn admit_snapshot(
                 wrote_health,
             });
         }
-        tx.ensure_mutation_receipt()?;
+        tx.prepare_capture_write()?;
         tx.execute_bounded(
             "UPDATE guild_snapshot_health SET capacity_paused=0 WHERE singleton=1",
             (),
@@ -1083,7 +1081,7 @@ fn admit_snapshot(
             .and_then(|n| u64::try_from(n).ok())
             .unwrap_or(allocated);
         let health_reserve = growth_reserve(tx)?;
-        tx.ensure_mutation_receipt()?;
+        tx.prepare_capture_write()?;
         tx.execute_bounded("UPDATE guild_snapshot_health SET physical_sample_bytes=?1,physical_sample_at_ms=?2,physical_debt_bytes=?3 WHERE singleton=1",
             params![measured as i64,now_ms,health_reserve as i64], health_reserve)?;
         wrote_health = true;
@@ -1103,7 +1101,7 @@ fn admit_snapshot(
         allocated
     };
     if fresh_allocated >= crate::capacity::SNAPSHOT_PAUSE_BYTES {
-        tx.ensure_mutation_receipt()?;
+        tx.prepare_capture_write()?;
         tx.execute_bounded(
             "UPDATE guild_snapshot_health SET capacity_paused=1 WHERE singleton=1",
             (),
@@ -1152,10 +1150,8 @@ mod capture_tests {
         let calls = attempts.clone();
         let writer_path = path.clone();
         let result = store
-            .capture(move |conn, immediate| {
+            .capture(move |mut tx| {
                 let attempt = calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                assert_eq!(immediate, attempt == 1);
-                let mut tx = capture_transaction(conn, immediate)?;
                 let lost: i64 = tx.query_row(
                     "SELECT lost_count FROM guild_snapshot_health WHERE singleton=1",
                     (),
@@ -1171,7 +1167,7 @@ mod capture_tests {
                         1_000_000,
                     )?;
                 }
-                tx.ensure_mutation_receipt()?;
+                tx.prepare_capture_write()?;
                 tx.execute_bounded(
                     "UPDATE guild_snapshot_health SET lost_count=?1 WHERE singleton=1",
                     params![lost + 10],
