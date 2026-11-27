@@ -28,6 +28,7 @@ webpki-roots = "1"
 
 [dev-dependencies]
 hyper = { version = "0.14", features = ["server", "http1", "tcp"] }
+rcgen = { version = "0.13", default-features = false, features = ["ring"] }
 tokio-tungstenite = { version = "0.30", default-features = false, features = ["handshake"] }
 jmodguard = { path = "../..", features = ["test-support"] }
 libsql = { version = "0.10.0", default-features = false, features = ["core"] }

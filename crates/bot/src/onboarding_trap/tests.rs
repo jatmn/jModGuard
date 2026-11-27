@@ -1750,6 +1750,106 @@ async fn rate_limit_waits_gate_dispatch_and_retries_without_hiding_confirmations
 }
 
 #[tokio::test(start_paused = true)]
+async fn a_vetoed_delete_preserves_the_last_route_slot() {
+    use serenity::http::{LightMethod, Request};
+    use std::sync::atomic::AtomicUsize;
+
+    let path = std::env::temp_dir().join(format!(
+        "onboarding_route_slot_{:032x}.db",
+        rand::random::<u128>()
+    ));
+    let app = BotState::new(
+        jmodguard::config::BotProcessConfig::default(),
+        crate::db::Db::open(&path, 2).unwrap(),
+    )
+    .unwrap();
+    app.activation.mark_lock_held(true);
+    let server = Server::bind(&([127, 0, 0, 1], 0).into());
+    let http = HttpBuilder::new("fixture")
+        .proxy(format!("http://{}", server.local_addr()))
+        .build();
+    let sent = Arc::new(AtomicUsize::new(0));
+    let server_sent = Arc::clone(&sent);
+    let server = tokio::spawn(server.serve(make_service_fn(move |_| {
+        let sent = Arc::clone(&server_sent);
+        async move {
+            Ok::<_, Infallible>(service_fn(move |request| {
+                assert_eq!(request.method(), Method::DELETE);
+                sent.fetch_add(1, Ordering::SeqCst);
+                std::future::ready(Ok::<_, Infallible>(
+                    Response::builder().status(204).body(Body::empty()).unwrap(),
+                ))
+            }))
+        }
+    })));
+    let route = Route::GuildMember {
+        guild_id: GUILD.into(),
+        user_id: MEMBER.into(),
+    };
+    let request = Request::new(route, LightMethod::Delete);
+    let routes = http.ratelimiter.as_ref().unwrap().routes();
+    let bucket = Arc::clone(
+        routes
+            .write()
+            .await
+            .entry(route.ratelimiting_bucket())
+            .or_default(),
+    );
+    let response = reqwest::Response::from(
+        hyper1::Response::builder()
+            .status(204)
+            .header("x-ratelimit-limit", "1")
+            .header("x-ratelimit-remaining", "1")
+            .header("x-ratelimit-reset-after", "60")
+            .body("")
+            .unwrap(),
+    );
+    bucket
+        .lock()
+        .await
+        .post_hook(&response, &request, &|_| {}, false)
+        .await
+        .unwrap();
+    let dispatch = |allowed| {
+        let bucket = &bucket;
+        delete_before_dispatch_deadline(
+            &app,
+            &http,
+            route,
+            REASON,
+            tokio::time::Instant::now() + DISPATCH_EVIDENCE_WINDOW,
+            || true,
+            move || {
+                assert!(
+                    bucket.try_lock().is_err(),
+                    "hold the route lock through handoff"
+                );
+                std::future::ready(allowed)
+            },
+        )
+    };
+    tokio::time::resume();
+    assert!(matches!(dispatch(false).await, DeleteDispatch::Unsent));
+    assert_eq!(sent.load(Ordering::SeqCst), 0);
+    assert_eq!(bucket.lock().await.remaining(), 1, "a veto must not debit");
+    let valid = tokio::time::timeout(Duration::from_secs(3), dispatch(true))
+        .await
+        .expect("the valid DELETE must not wait for the reset");
+    assert!(matches!(valid, DeleteDispatch::Finished(Ok(()))));
+    assert_eq!(sent.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        bucket.lock().await.remaining(),
+        0,
+        "the sent DELETE uses the last slot"
+    );
+    server.abort();
+    let _ = server.await;
+    drop(app);
+    crate::tenant::remove_sidecars(&path);
+    std::fs::remove_file(path).unwrap();
+}
+
+#[tokio::test(start_paused = true)]
 async fn guarded_delete_never_sends_when_tls_setup_outlasts_evidence() {
     use tokio::io::AsyncReadExt;
 

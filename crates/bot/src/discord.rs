@@ -90,6 +90,34 @@ pub(crate) enum DeleteDispatch {
     Uncertain,
 }
 
+struct RouteQuota<'a> {
+    bucket: Option<&'a tokio::sync::Mutex<serenity::http::Ratelimit>>,
+    request: &'a serenity::http::Request<'static>,
+    on_wait: &'a (dyn Fn(serenity::http::RatelimitInfo) + Send + Sync),
+}
+
+impl<'a> RouteQuota<'a> {
+    async fn acquire(&self) -> Option<tokio::sync::MutexGuard<'a, serenity::http::Ratelimit>> {
+        let mut held = self.bucket?.lock().await;
+        // With a recorded reset and no slots left, Serenity can wait but
+        // cannot debit a slot. Keep the lock until the request is sent.
+        if held.remaining() == 0 && held.reset().is_some() {
+            held.pre_hook(self.request, self.on_wait).await;
+        }
+        Some(held)
+    }
+
+    async fn charge(&self, held: Option<tokio::sync::MutexGuard<'a, serenity::http::Ratelimit>>) {
+        // This branch of pre_hook runs synchronously. Exhausted buckets
+        // have already waited in acquire and have no slot left to debit.
+        if let Some(mut held) = held
+            && (held.remaining() != 0 || held.reset().is_none())
+        {
+            held.pre_hook(self.request, self.on_wait).await;
+        }
+    }
+}
+
 /// Use Serenity's route buckets and validate admission at the first socket
 /// write. Only an explicit rate-limit rejection may authorize another attempt.
 pub(crate) async fn delete_before_dispatch_deadline<F: Future<Output = bool> + Send>(
@@ -165,10 +193,10 @@ pub(crate) async fn delete_before_dispatch_deadline<F: Future<Output = bool> + S
         let Ok(outbound) = outbound else {
             return DeleteDispatch::Unsent;
         };
-        let quota = async {
-            let mut held = bucket.as_ref()?.lock().await;
-            held.pre_hook(&rate_request, &on_wait).await;
-            Some(held)
+        let quota = RouteQuota {
+            bucket: bucket.as_deref(),
+            request: &rate_request,
+            on_wait: &on_wait,
         };
         let receipt =
             match guarded_delete::send(&uri, outbound, deadline, &admit, &refresh, quota).await {
