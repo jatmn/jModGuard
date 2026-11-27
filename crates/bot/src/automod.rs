@@ -1480,6 +1480,12 @@ fn custom_text_kind(rule: &RuleDef) -> Option<&str> {
     }
 }
 
+struct MessageRuleScope<'a> {
+    user: u64,
+    channel: Option<u64>,
+    member: Option<&'a Member>,
+}
+
 async fn recheck_message_rule(
     app: &BotState,
     guild: u64,
@@ -1487,6 +1493,7 @@ async fn recheck_message_rule(
     checked_rule: &RuleDef,
     is_ban: bool,
     preset: Option<&ConfigDispatch>,
+    scope: &MessageRuleScope<'_>,
 ) -> bool {
     if let Some(preset) = preset {
         return preset.is_current(app);
@@ -1512,6 +1519,25 @@ async fn recheck_message_rule(
                 let Some(kind) = custom_text_kind(checked_rule) else {
                     return custom_text_kind(matched).is_none();
                 };
+                let Some(channel) = scope.channel else {
+                    return false;
+                };
+                let roles: Vec<_> = scope
+                    .member
+                    .map(|member| member.roles.iter().map(|role| role.get()).collect())
+                    .unwrap_or_default();
+                // The rule fence also covers the settings used by the earlier
+                // member and moderator exemption lookup.
+                if jmodguard::custom_rules::rule_scope_skips(
+                    checked_rule,
+                    scope.user,
+                    channel,
+                    &roles,
+                    false,
+                    true,
+                ) {
+                    return false;
+                }
                 pending.match_content.as_deref().is_some_and(|raw| {
                     let text = MessageText::new(raw);
                     let lowercase = LazyCell::new(|| raw.to_lowercase());
@@ -1751,6 +1777,11 @@ async fn execute_live<'a>(
     if preset_dispatch.is_some_and(|dispatch| !dispatch.is_current(app)) {
         return None;
     }
+    let scope = MessageRuleScope {
+        user: target.id.get(),
+        channel: msg_channel,
+        member: provided_member,
+    };
     let message_rule_is_current = || {
         recheck_message_rule(
             app,
@@ -1759,6 +1790,7 @@ async fn execute_live<'a>(
             settings,
             is_ban,
             preset_dispatch,
+            &scope,
         )
     };
 
@@ -5738,7 +5770,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn custom_actions_recheck_matchers_before_dispatch() {
+    async fn custom_actions_recheck_matchers_and_scope_before_dispatch() {
         use serenity::all::{GuildId, Member, UserId};
         use std::sync::{Arc, atomic::AtomicBool};
 
@@ -5760,14 +5792,21 @@ mod tests {
             .unwrap()
         );
         app.activation.mark_lock_held(true);
+        crate::db::enroll_guild(&app.db, 10, 100)
+            .await
+            .unwrap()
+            .unwrap();
         let guild = GuildId::new(10);
         let mut member = Member::default();
         member.guild_id = guild;
         member.user.id = UserId::new(99);
+        member.roles = vec![7.into()];
+        let mut expected_warns = 0;
         for (action, request) in [
-            ("delete", "DELETE /api/v10/channels/70/messages/42"),
-            ("kick", "DELETE /api/v10/guilds/10/members/99"),
-            ("timeout", "PATCH /api/v10/guilds/10/members/99"),
+            ("delete", Some("DELETE /api/v10/channels/70/messages/42")),
+            ("kick", Some("DELETE /api/v10/guilds/10/members/99")),
+            ("timeout", Some("PATCH /api/v10/guilds/10/members/99")),
+            ("warn", None),
         ] {
             for kind in ["pattern", "word"] {
                 let mut rule = dry_run_word_ban();
@@ -5786,7 +5825,7 @@ mod tests {
                     .unwrap();
                 let cfg = app.configs.get(&app.db, 10).await.unwrap();
                 let pending = AutomodEngine::new()
-                    .evaluate(&cfg, &word_message(&[]))
+                    .evaluate(&cfg, &word_message(&[7]))
                     .unwrap_or_else(|| panic!("{action} with {kind} must match before the edit"));
                 assert_eq!(pending.rule_id, RULE);
                 let stub = DiscordStub::start();
@@ -5805,6 +5844,56 @@ mod tests {
                     )
                 };
                 execute().await;
+                expected_warns += usize::from(action == "warn");
+                assert_eq!(
+                    crate::db::list_warns(&app.db, 10, 99).await.unwrap().len(),
+                    expected_warns
+                );
+                for (scope, edited) in [
+                    (
+                        "channel allowlist",
+                        RuleDef {
+                            include_channels: vec![71],
+                            ..rule.clone()
+                        },
+                    ),
+                    (
+                        "channel exemption",
+                        RuleDef {
+                            whitelist_channels: vec![70],
+                            ..rule.clone()
+                        },
+                    ),
+                    (
+                        "user exemption",
+                        RuleDef {
+                            whitelist_users: vec![99],
+                            ..rule.clone()
+                        },
+                    ),
+                    (
+                        "role exemption",
+                        RuleDef {
+                            whitelist_roles: vec![7],
+                            ..rule.clone()
+                        },
+                    ),
+                ] {
+                    crate::db::upsert_rule(&app.db, 10, RULE, &edited)
+                        .await
+                        .unwrap();
+                    execute().await;
+                    assert_eq!(
+                        stub.lines.lock().unwrap().as_slice(),
+                        request.as_slice(),
+                        "{action} with {kind} after {scope}"
+                    );
+                    assert_eq!(
+                        crate::db::list_warns(&app.db, 10, 99).await.unwrap().len(),
+                        expected_warns,
+                        "{action} with {kind} after {scope}"
+                    );
+                }
                 if kind == "pattern" {
                     rule.params["pattern"] = "^safe$".into();
                 } else {
@@ -5814,7 +5903,12 @@ mod tests {
                     .await
                     .unwrap();
                 execute().await;
-                assert_eq!(stub.finish(), [request], "{action} with {kind}");
+                assert_eq!(stub.finish(), request.as_slice(), "{action} with {kind}");
+                assert_eq!(
+                    crate::db::list_warns(&app.db, 10, 99).await.unwrap().len(),
+                    expected_warns,
+                    "{action} with {kind} after matcher edit"
+                );
             }
         }
         drop(app);
@@ -6144,7 +6238,7 @@ mod tests {
                     .expect("reply uses the updated expiry");
             }
             let seen = stub.finish();
-            if edit == TriggerBeforeDispatch {
+            if changes_match {
                 assert!(seen.is_empty(), "{edit:?}: {seen:?}");
             } else {
                 assert_eq!(seen.first(), Some(&format!("DELETE {DELETE}")), "{edit:?}");
