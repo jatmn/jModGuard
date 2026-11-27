@@ -927,10 +927,7 @@ async fn punish_proven_match(
                             )
                             .await
                             {
-                                if outcome == CaseOutcome::Succeeded
-                                    && purge_seconds > 0
-                                    && dispatch.is_current(app)
-                                {
+                                if outcome == CaseOutcome::Succeeded && purge_seconds > 0 {
                                     let sweep_at_ms = chrono::Utc::now().timestamp_millis();
                                     deleted_count += crate::recent_messages::sweep_after_ban(
                                         app,
@@ -940,7 +937,7 @@ async fn punish_proven_match(
                                         purge_seconds,
                                         sweep_at_ms,
                                         cleanup.as_ref(),
-                                        || std::future::ready(dispatch.is_current(app)),
+                                        rule_is_current,
                                     )
                                     .await;
                                 }
@@ -1776,16 +1773,28 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn ban_purge_repeated_text_uses_saved_selection_and_keeps_matched_deletes() {
         use std::sync::atomic::{AtomicBool, Ordering};
+        #[derive(Clone, Copy, Debug)]
+        enum ConfigEdit {
+            Disable,
+            Unrelated,
+            PurgeWindow,
+        }
+        use ConfigEdit::{Disable, PurgeWindow, Unrelated};
+
         let ban = ("PUT", "/api/v10/guilds/10/bans/99");
         let member = ("GET", "/api/v10/guilds/10/members/99");
         let first_sweep = ("DELETE", "/api/v10/channels/16/messages/46");
         let second_sweep = ("DELETE", "/api/v10/channels/15/messages/45");
-        for (purge, dry, mut disable_on, expected, swept, matched) in [
+        for (purge, dry, mut edit_on, expected, swept, matched) in [
             (false, false, None, 0, 0, 3),
             (true, false, None, 3600, 2, 3),
-            (true, false, Some(ban), 3600, 0, 3),
-            (true, false, Some(first_sweep), 3600, 1, 3),
-            (true, false, Some(member), 3600, 0, 0),
+            (true, false, Some((ban, Disable)), 3600, 0, 3),
+            (true, false, Some((first_sweep, Disable)), 3600, 1, 3),
+            (true, false, Some((member, Disable)), 3600, 0, 0),
+            (true, false, Some((member, Unrelated)), 3600, 2, 3),
+            (true, false, Some((ban, Unrelated)), 3600, 2, 3),
+            (true, false, Some((first_sweep, Unrelated)), 3600, 2, 3),
+            (true, false, Some((ban, PurgeWindow)), 3600, 0, 3),
             (true, false, None, 3600, 0, 1),
             (true, true, None, 3600, 0, 0),
         ] {
@@ -1852,7 +1861,7 @@ pub(crate) mod tests {
                 messages[0].0, messages[0].1
             );
             if matched == 1 {
-                disable_on = Some(("DELETE", first_match.as_str()));
+                edit_on = Some((("DELETE", first_match.as_str()), Disable));
             }
             let found = Match {
                 kind: Kind::Text,
@@ -1875,17 +1884,33 @@ pub(crate) mod tests {
             let server_stop = Arc::clone(&stop);
             let writer = Arc::clone(&app);
             let runtime = tokio::runtime::Handle::current();
-            rule.enabled = false;
-            let disable_route = disable_on.map(|(method, path)| (method, path.to_owned()));
+            let edit_route = edit_on.map(|((method, path), edit)| {
+                let rule_id = match edit {
+                    Disable => {
+                        rule.enabled = false;
+                        "repeat_text"
+                    }
+                    Unrelated => {
+                        rule = cfg.rules["velocity"].clone();
+                        rule.log_automod = !rule.log_automod;
+                        "velocity"
+                    }
+                    PurgeWindow => {
+                        rule.actions[1].purge_last_hour = false;
+                        "repeat_text"
+                    }
+                };
+                (method, path.to_owned(), rule_id, rule)
+            });
             let server = std::thread::spawn(move || {
                 serve_discord_stub(
                     listener,
                     server_lines,
                     server_stop,
                     move |method, path, _| {
-                        if disable_route
-                            .as_ref()
-                            .is_some_and(|(m, p)| *m == method && p == path)
+                        if let Some((m, p, rule_id, rule)) = &edit_route
+                            && *m == method
+                            && p == path
                         {
                             let saved = runtime
                                 .block_on(crate::db::apply_control(
@@ -1894,7 +1919,7 @@ pub(crate) mod tests {
                                     crate::db::ControlOp::UpsertRule {
                                         request: scope.clone(),
                                         target: scope.clone(),
-                                        id: "repeat_text".into(),
+                                        id: (*rule_id).into(),
                                         rule: rule.clone(),
                                         clear_guild_override: false,
                                         replace_velocity_limit: false,
@@ -1968,7 +1993,7 @@ pub(crate) mod tests {
                 assert_eq!(
                     deletes.len(),
                     3 + swept,
-                    "disable on {disable_on:?}: {seen:?}"
+                    "config edit on {edit_on:?}: {seen:?}"
                 );
                 for (channel, message) in [(11, 42), (12, 43), (13, 44)] {
                     assert!(
@@ -1984,7 +2009,7 @@ pub(crate) mod tests {
                     assert_eq!(
                         deletes.contains(&&format!("{method} {path}")),
                         should_sweep,
-                        "disable on {disable_on:?}: {seen:?}"
+                        "config edit on {edit_on:?}: {seen:?}"
                     );
                 }
             }

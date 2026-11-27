@@ -227,10 +227,11 @@ pub struct PendingAction {
     /// The winning action is an everyone-attempt whose channel permission
     /// could not be resolved. Kick and ban delete the message and stop.
     pub mention_permission_unknown: bool,
-    /// The rule as it was when the message matched. For a built-in rule, if its
-    /// configuration cannot be re-read before acting, these settings still
-    /// decide dry-run and exemptions. Custom rules snapshot the ordered actions
-    /// here, but still require current configuration before acting.
+    /// The rule as it was when the message matched. Built-in rules can fall
+    /// back to these dry-run and exemption settings if configuration is
+    /// unavailable. Message deletes and replies require current settings,
+    /// and unavailable configuration withholds kicks and bans. Custom rules
+    /// snapshot the ordered action plan here and require live configuration.
     pub matched_rule: Option<RuleDef>,
     /// Whether the rule was in dry-run when this action was selected. Its
     /// strike ladder belongs to that mode, so execution never runs it live.
@@ -1407,7 +1408,7 @@ async fn recheck_preset(
     dispatch.is_current(app).then_some(dispatch)
 }
 
-async fn delete_rule_is_current(
+async fn recheck_message_rule(
     app: &BotState,
     guild: u64,
     pending: &PendingAction,
@@ -1433,6 +1434,30 @@ async fn delete_rule_is_current(
                 .matches(pending.evidence["content"].as_str().unwrap_or(""))
     })
     .await
+}
+
+fn reply_match_is_current(pending: &PendingAction, checked_rule: &RuleDef) -> bool {
+    let Some(matched) = pending.matched_rule.as_ref() else {
+        return false;
+    };
+    let (Some(matched_params), Some(checked_params)) =
+        (matched.params.as_object(), checked_rule.params.as_object())
+    else {
+        return false;
+    };
+
+    // The pending match can justify updated reply settings only while the
+    // trigger and scope that selected it still agree with the live rule.
+    matched.include_channels == checked_rule.include_channels
+        && matched.whitelist_channels == checked_rule.whitelist_channels
+        && matched.whitelist_users == checked_rule.whitelist_users
+        && matched.whitelist_roles == checked_rule.whitelist_roles
+        && matched.skip_moderators == checked_rule.skip_moderators
+        && matched_params
+            .keys()
+            .chain(checked_params.keys())
+            .filter(|key| key.as_str() != "channel_reply")
+            .all(|key| matched_params.get(key) == checked_params.get(key))
 }
 
 pub(crate) async fn recheck_live_rule(
@@ -1636,8 +1661,8 @@ async fn execute_live<'a>(
     if !dispatch_is_current() {
         return None;
     }
-    let delete_is_current =
-        || delete_rule_is_current(app, guild_id.get(), pending, settings, preset_dispatch);
+    let message_rule_is_current =
+        || recheck_message_rule(app, guild_id.get(), pending, settings, preset_dispatch);
 
     if let Some(warning) = warning
         && matches!(rule.action.as_str(), "kick" | "ban")
@@ -1649,7 +1674,7 @@ async fn execute_live<'a>(
             "{warning}"
         );
         let outcome = if let (Some(ch), Some(id)) = (msg_channel, msg_id) {
-            if config_unknown || !delete_is_current().await || !app.activation.may_record() {
+            if config_unknown || !message_rule_is_current().await || !app.activation.may_record() {
                 return None;
             }
             automod_try_delete_message(
@@ -1727,7 +1752,7 @@ async fn execute_live<'a>(
         "log" => None,
         "delete" => {
             if let (Some(ch), Some(id)) = (msg_channel, msg_id) {
-                if !delete_is_current().await || !app.activation.may_record() {
+                if !message_rule_is_current().await || !app.activation.may_record() {
                     return None;
                 }
                 automod_try_delete_message(
@@ -1749,9 +1774,11 @@ async fn execute_live<'a>(
         }
         "channel_reply" => {
             let outcome = if let Some(channel) = msg_channel
-                && let Ok((template, delete_after)) = jmodguard::custom_rules::channel_reply(
-                    pending.matched_rule.as_ref().unwrap_or(settings),
-                ) {
+                && let Ok((template, delete_after)) =
+                    jmodguard::custom_rules::channel_reply(settings)
+                && reply_match_is_current(pending, settings)
+                && message_rule_is_current().await
+            {
                 app.automod
                     .replies
                     .send(
@@ -2097,7 +2124,7 @@ async fn execute_live<'a>(
                             } else {
                                 None
                             };
-                            let raced = if (purge_seconds > 0 && !delete_is_current().await)
+                            let raced = if (purge_seconds > 0 && !message_rule_is_current().await)
                                 || !dispatch_is_current()
                                 || automod_member_blocked(
                                     app,
@@ -2240,7 +2267,7 @@ async fn execute_live<'a>(
                                                 purge_seconds,
                                                 chrono::Utc::now().timestamp_millis(),
                                                 cleanup.as_ref(),
-                                                delete_is_current,
+                                                message_rule_is_current,
                                             )
                                             .await;
                                             vars.insert(
@@ -5476,6 +5503,175 @@ mod tests {
         sent_at: std::sync::OnceLock<Instant>,
         deleted_at: std::sync::OnceLock<Instant>,
         deleted: tokio::sync::Notify,
+    }
+
+    #[tokio::test]
+    async fn channel_reply_uses_the_rule_admitted_for_delete() {
+        use serenity::all::{GuildId, User, UserId};
+        use std::sync::{Arc, atomic::AtomicBool};
+        use std::time::Duration;
+
+        #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+        enum Edit {
+            BeforeDispatch,
+            TriggerBeforeDispatch,
+            ScopeBeforeDispatch,
+            UnrelatedDuringDelete,
+            TemplateDuringDelete,
+            DisableDuringDelete,
+        }
+        use Edit::{
+            BeforeDispatch, DisableDuringDelete, ScopeBeforeDispatch, TemplateDuringDelete,
+            TriggerBeforeDispatch, UnrelatedDuringDelete,
+        };
+
+        const RULE: &str = "custom:0123456789abcdef";
+        const DELETE: &str = "/api/v10/channels/70/messages/42";
+        for edit in [
+            BeforeDispatch,
+            TriggerBeforeDispatch,
+            ScopeBeforeDispatch,
+            UnrelatedDuringDelete,
+            TemplateDuringDelete,
+            DisableDuringDelete,
+        ] {
+            let path = std::env::temp_dir()
+                .join(format!("reply_dispatch_{:032x}.db", rand::random::<u128>()));
+            let app =
+                BotState::new(Default::default(), crate::db::Db::open(&path, 2).unwrap()).unwrap();
+            assert!(
+                crate::db::claim_active_bot(
+                    &app.db,
+                    app.activation.instance(),
+                    jmodguard::control::now_ms(),
+                    Arc::new(AtomicBool::new(false)),
+                )
+                .await
+                .unwrap()
+            );
+            app.activation.mark_lock_held(true);
+            let mut rule = dry_run_word_ban();
+            rule.dry_run = false;
+            rule.log_automod = false;
+            rule.open_case = false;
+            rule.actions[0].action = "delete".into();
+            let mut reply = rule.actions[0].clone();
+            reply.action = "channel_reply".into();
+            rule.actions.push(reply);
+            rule.params["channel_reply"] =
+                serde_json::json!({ "template": "Original", "delete_after_seconds": 0 });
+            crate::db::upsert_rule(&app.db, 10, RULE, &rule)
+                .await
+                .unwrap();
+            let cfg = app.configs.get(&app.db, 10).await.unwrap();
+            let pending = app.automod.evaluate(&cfg, &word_message(&[])).unwrap();
+            assert_eq!(pending.rule_id, RULE);
+
+            let changes_match = matches!(edit, TriggerBeforeDispatch | ScopeBeforeDispatch);
+            let (release, release_rx) = tokio::sync::oneshot::channel();
+            let requests = Arc::new(ReplyRequests {
+                gate: (edit != BeforeDispatch && !changes_match).then(|| DiscordRequestGate {
+                    method: "DELETE",
+                    path: DELETE,
+                    entered: tokio::sync::Notify::new(),
+                    release: std::sync::Mutex::new(Some(release_rx)),
+                }),
+                ..Default::default()
+            });
+            let stub = DiscordStub::bind(Some(Arc::clone(&requests)));
+            let mut user = User::default();
+            user.id = UserId::new(99);
+            user.name = "member".into();
+            let execution = execute_pending_with(
+                &app,
+                &stub.http,
+                &stub.cache,
+                GuildId::new(10),
+                &user,
+                None,
+                "member",
+                Some(42),
+                Some(70),
+                &pending,
+            );
+            let save = async {
+                if let Some(gate) = &requests.gate {
+                    tokio::time::timeout(Duration::from_secs(5), gate.entered.notified())
+                        .await
+                        .unwrap();
+                }
+                match edit {
+                    UnrelatedDuringDelete => {
+                        let mut velocity = cfg.rules["velocity"].clone();
+                        velocity.log_automod = !velocity.log_automod;
+                        crate::db::upsert_rule(&app.db, 10, "velocity", &velocity)
+                            .await
+                            .unwrap();
+                    }
+                    _ => {
+                        rule.enabled = edit != DisableDuringDelete;
+                        rule.params["channel_reply"] = serde_json::json!({
+                            "template": "Updated", "delete_after_seconds": 1
+                        });
+                        if edit == TriggerBeforeDispatch {
+                            rule.params["words"] = serde_json::json!(["differentword"]);
+                        } else if edit == ScopeBeforeDispatch {
+                            rule.whitelist_channels.push(70);
+                        }
+                        crate::db::upsert_rule(&app.db, 10, RULE, &rule)
+                            .await
+                            .unwrap();
+                    }
+                }
+                if requests.gate.is_some() {
+                    release.send(()).unwrap();
+                }
+            };
+            if requests.gate.is_some() {
+                assert!(tokio::join!(execution, save).0);
+            } else {
+                save.await;
+                if changes_match {
+                    let current = app.configs.get(&app.db, 10).await.unwrap();
+                    assert_eq!(current.rules[RULE].actions, cfg.rules[RULE].actions);
+                    assert!(
+                        AutomodEngine::new()
+                            .evaluate(&current, &word_message(&[]))
+                            .is_none_or(|matched| matched.rule_id != RULE),
+                        "{edit:?}: the current rule must reject the old match"
+                    );
+                }
+                assert!(execution.await);
+            }
+            let observed = requests.posts.lock().unwrap().clone();
+            if edit == BeforeDispatch
+                && observed
+                    .first()
+                    .is_some_and(|post| post["content"] == "Updated")
+            {
+                tokio::time::timeout(Duration::from_secs(5), requests.deleted.notified())
+                    .await
+                    .expect("reply uses the updated expiry");
+            }
+            let seen = stub.finish();
+            assert_eq!(seen.first(), Some(&format!("DELETE {DELETE}")), "{edit:?}");
+            let content: Vec<_> = observed
+                .iter()
+                .map(|post| post["content"].as_str())
+                .collect();
+            let expected: &[_] = match edit {
+                BeforeDispatch => &[Some("Updated")],
+                UnrelatedDuringDelete => &[Some("Original")],
+                TriggerBeforeDispatch
+                | ScopeBeforeDispatch
+                | TemplateDuringDelete
+                | DisableDuringDelete => &[],
+            };
+            assert_eq!(content, expected, "{edit:?}");
+            drop(app);
+            let _ = std::fs::remove_file(&path);
+            crate::tenant::remove_sidecars(&path);
+        }
     }
 
     enum PresetEdit {
