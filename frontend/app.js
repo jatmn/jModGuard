@@ -1536,7 +1536,7 @@ function MemoryBillingPanel({ snapshot, nowMs }) {
   const blockText = blocks && `${formatExact(blocks.count)} block${blocks.count === 1 ? "" : "s"} (${formatExact(blocks.capacity)} MiB) · ${blocks.headroom} headroom to the next block in this estimate`;
   const peakBytes = snapshot.combined_memory_peak?.peak_bytes;
   const pairedPeriods = snapshot.combined_memory_peak?.periods;
-  const totalPeriods = (snapshot.to_secs - snapshot.from_secs) / snapshot.span_secs;
+  const totalPeriods = snapshot.combined_memory_peak?.total_periods;
   const peakPeriod = snapshot.span_secs === 3600 ? "hour" : "minute";
   const coverage = Number.isSafeInteger(pairedPeriods) && pairedPeriods >= 0
     && Number.isSafeInteger(totalPeriods) && totalPeriods > 0 && pairedPeriods <= totalPeriods

@@ -445,7 +445,8 @@ one-block minimum. The paired-period peak estimate uses only minutes (hours for
 7-day and 30-day ranges) with memory readings from both processes. It takes the
 highest sum of the two processes' separate maxima in any paired period. Those
 maxima can occur at different times, so their sum bounds the sampled combined
-memory within that period. The panel shows paired coverage across the range and
+memory within that period. The panel counts paired readings against completed
+minutes or hours with at least one completed minute in the chart window. It
 reports when there are no paired readings. Gaps can hide higher peaks.
 
 The estimates exclude the variable system overhead that Bunny bills. Bunny's

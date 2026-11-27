@@ -67,22 +67,42 @@ impl ResourceRange {
         }
     }
 
-    /// (stored span, window, chart bucket) in seconds. Every range draws at
-    /// most 180 points per process.
-    fn shape(self) -> (i64, i64, i64) {
-        match self {
+    /// Every range draws at most 180 points per process.
+    fn window(self, now_secs: i64) -> ResourceWindow {
+        let (span_secs, duration, bucket_secs) = match self {
             Self::Hour => (MINUTE_SECS, 3_600, 60),
             Self::Day => (MINUTE_SECS, 86_400, 600),
             Self::Week => (HOUR_SECS, 7 * 86_400, HOUR_SECS),
             Self::Month => (HOUR_SECS, 30 * 86_400, 4 * HOUR_SECS),
+        };
+        let to_secs = now_secs - now_secs.rem_euclid(bucket_secs) + bucket_secs;
+        // A rollup is eligible once it can contain a completed minute. An
+        // open hour becomes eligible when its first minute completes.
+        let last_minute = now_secs - now_secs.rem_euclid(MINUTE_SECS) - MINUTE_SECS;
+        let eligible_to_secs = last_minute - last_minute.rem_euclid(span_secs) + span_secs;
+        ResourceWindow {
+            span_secs,
+            bucket_secs,
+            from_secs: to_secs - duration,
+            to_secs,
+            eligible_to_secs,
         }
     }
+}
+
+#[derive(PartialEq, Eq)]
+struct ResourceWindow {
+    span_secs: i64,
+    bucket_secs: i64,
+    from_secs: i64,
+    to_secs: i64,
+    eligible_to_secs: i64,
 }
 
 struct CachedHistory {
     /// Completion time of the last read attempt, including failures.
     checked_at: Instant,
-    to_secs: i64,
+    window: ResourceWindow,
     prepared: Option<Arc<PreparedHistory>>,
     stale: bool,
 }
@@ -102,25 +122,27 @@ impl CachedHistory {
 struct PreparedHistory {
     bot: Box<RawValue>,
     api: Box<RawValue>,
-    combined_memory_peak: Value,
+    combined_memory_peak: PairedMemoryPeak,
     bot_status: Option<ProcessStatus>,
 }
 
 impl PreparedHistory {
-    fn new(
-        records: ResourceRecords,
-        from_secs: i64,
-        to_secs: i64,
-        bucket: i64,
-    ) -> serde_json::Result<Self> {
+    fn new(records: ResourceRecords, window: &ResourceWindow) -> serde_json::Result<Self> {
+        let ResourceWindow {
+            from_secs,
+            to_secs,
+            bucket_secs,
+            eligible_to_secs,
+            ..
+        } = *window;
         Ok(Self {
-            bot: to_raw_value(&history_json(&records.bot, from_secs, to_secs, bucket))?,
-            api: to_raw_value(&history_json(&records.api, from_secs, to_secs, bucket))?,
+            bot: to_raw_value(&history_json(&records.bot, from_secs, to_secs, bucket_secs))?,
+            api: to_raw_value(&history_json(&records.api, from_secs, to_secs, bucket_secs))?,
             combined_memory_peak: combined_memory_peak(
                 &records.bot,
                 &records.api,
                 from_secs,
-                to_secs,
+                eligible_to_secs,
             ),
             bot_status: records
                 .statuses
@@ -192,13 +214,12 @@ async fn history(
     range: ResourceRange,
     now_secs: i64,
 ) -> (Option<Arc<PreparedHistory>>, &'static str) {
-    let (span, window, bucket) = range.shape();
-    let to_secs = now_secs - now_secs.rem_euclid(bucket) + bucket;
+    let window = range.window(now_secs);
     {
         let cache = app.resource_cache.entries.lock().await;
         if let Some(entry) = cache.get(&range)
             && entry.checked_at.elapsed() < HISTORY_TTL
-            && entry.to_secs == to_secs
+            && entry.window == window
         {
             return entry.result();
         }
@@ -209,37 +230,35 @@ async fn history(
         let cache = app.resource_cache.entries.lock().await;
         if let Some(entry) = cache.get(&range)
             && entry.checked_at.elapsed() < HISTORY_TTL
-            && entry.to_secs == to_secs
+            && entry.window == window
         {
             return entry.result();
         }
     }
-    let from_secs = to_secs - window;
     let read = tokio::time::timeout(
         HISTORY_DEADLINE,
-        db::resource_records(&app.db, span, from_secs, to_secs),
+        db::resource_records(&app.db, window.span_secs, window.from_secs, window.to_secs),
     )
     .await;
     let checked_at = Instant::now();
     let prepared = match read {
-        Ok(Ok(records)) => PreparedHistory::new(records, from_secs, to_secs, bucket)
-            .ok()
-            .map(Arc::new),
+        Ok(Ok(records)) => PreparedHistory::new(records, &window).ok().map(Arc::new),
         _ => None,
     };
     let mut cache = app.resource_cache.entries.lock().await;
     let (prepared, stale) = match prepared {
         Some(prepared) => (Some(prepared), false),
         None => {
-            let last = cache
-                .remove(&range)
-                .filter(|entry| entry.to_secs == to_secs);
+            let last = cache.remove(&range).filter(|entry| {
+                entry.window.to_secs == window.to_secs
+                    && entry.window.eligible_to_secs <= window.eligible_to_secs
+            });
             (last.and_then(|entry| entry.prepared), true)
         }
     };
     let entry = cache.entry(range).insert_entry(CachedHistory {
         checked_at,
-        to_secs,
+        window,
         prepared,
         stale,
     });
@@ -250,7 +269,7 @@ async fn history(
 struct ResourcesOverview<'a> {
     bucket_secs: i64,
     cgroup_relation: Value,
-    combined_memory_peak: Option<&'a Value>,
+    combined_memory_peak: Option<Value>,
     from_secs: i64,
     generated_at_ms: i64,
     history_status: &'static str,
@@ -283,10 +302,13 @@ fn build_response(
     api_status: &ProcessStatus,
     estimate: &HostingEstimateConfig,
 ) -> Response {
-    let (span, window, bucket) = range.shape();
-    let now_secs = now_ms / 1000;
-    let to_secs = now_secs - now_secs.rem_euclid(bucket) + bucket;
-    let from_secs = to_secs - window;
+    let ResourceWindow {
+        span_secs,
+        bucket_secs,
+        from_secs,
+        to_secs,
+        eligible_to_secs,
+    } = range.window(now_ms / 1000);
     let bot_status = prepared.and_then(|history| history.bot_status.as_ref());
     let (memory_relation, cpu_relation) =
         bot_status.map_or((CgroupRelation::Unknown, CgroupRelation::Unknown), |bot| {
@@ -302,12 +324,19 @@ fn build_response(
         _ => json!(relation),
     };
     Json(ResourcesOverview {
-        bucket_secs: bucket,
+        bucket_secs,
         cgroup_relation: json!({
             "memory": estimate_relation(memory_relation),
             "cpu": estimate_relation(cpu_relation),
         }),
-        combined_memory_peak: prepared.map(|history| &history.combined_memory_peak),
+        combined_memory_peak: prepared.map(|history| {
+            let peak = &history.combined_memory_peak;
+            json!({
+                "peak_bytes": peak.peak_bytes,
+                "periods": peak.periods,
+                "total_periods": (eligible_to_secs - from_secs) / span_secs,
+            })
+        }),
         from_secs,
         generated_at_ms: now_ms,
         history_status,
@@ -327,7 +356,7 @@ fn build_response(
         provider: json!({"status": "not_configured", "reason": "no_scoped_read_only_key"}),
         range: range.label(),
         rows_read: json!({"status": "unavailable", "reason": "not_reported_by_database_client"}),
-        span_secs: span,
+        span_secs,
         to_secs,
     })
     .into_response()
@@ -359,10 +388,20 @@ fn current(status: Option<&ProcessStatus>, now_ms: i64) -> Value {
     })
 }
 
-/// The largest bot plus API memory peak over stored periods that both
+struct PairedMemoryPeak {
+    peak_bytes: Option<u64>,
+    periods: u64,
+}
+
+/// The largest bot plus API memory peak over eligible periods that both
 /// processes recorded. Each process's peak can come at a different moment of
 /// the period, so the sum is an upper bound within those paired periods.
-fn combined_memory_peak(bot: &[Rollup], api: &[Rollup], from_secs: i64, to_secs: i64) -> Value {
+fn combined_memory_peak(
+    bot: &[Rollup],
+    api: &[Rollup],
+    from_secs: i64,
+    to_secs: i64,
+) -> PairedMemoryPeak {
     let in_range = |row: &&Rollup| row.start_secs >= from_secs && row.start_secs < to_secs;
     let api: HashMap<i64, u64> = api
         .iter()
@@ -379,7 +418,10 @@ fn combined_memory_peak(bot: &[Rollup], api: &[Rollup], from_secs: i64, to_secs:
         periods += 1;
         peak = peak.max(Some(bot_bytes.saturating_add(*api_bytes)));
     }
-    json!({"peak_bytes": peak, "periods": periods})
+    PairedMemoryPeak {
+        peak_bytes: peak,
+        periods,
+    }
 }
 
 /// Downsamples stored rollups onto a fixed grid of `bucket`-second points.
