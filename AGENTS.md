@@ -213,6 +213,18 @@ and `npm run build --prefix tools/webui`. Rebuild after frontend/build-input cha
 Generated assets and third-party source must not be committed. Local preflight
 and publication build these assets automatically.
 
+For launcher review commands with a 120-second cap, run these as two separate
+commands from the repository root. Give the build its own budget and let it
+finish before running another Cargo command against the same target directory.
+
+```bash
+bash crates/updater/review-launcher-tests.sh build > launcher-harness.path
+bash crates/updater/review-launcher-tests.sh run "$(cat launcher-harness.path)" launcher-review.log
+```
+
+The timed step runs the compiled harness on four threads and streams panics,
+including test names, to the console and the log as they happen.
+
 For ordinary PRs, run the regression and checks relevant to the changed behavior
 locally: `bash scripts/ci-preflight.sh --affected` runs the groups CI selects for
 this checkout's changes, including uncommitted and untracked files; see
