@@ -15,9 +15,12 @@ case "${1:-}" in
     ;;
   run)
     [[ $# -eq 3 && -x "$2" ]] || { echo 'Usage: review-launcher-tests.sh run HARNESS LOG' >&2; exit 2; }
-    # Leave time for termination and log output before the review tool's 120s cap.
+    # Kill the whole pipeline before the 120s cap, even if a fixture keeps the pipe open.
     # Libtest otherwise buffers failure diagnostics until the suite ends.
-    timeout --kill-after=2s 110s "$2" --test-threads=4 --no-capture 2>&1 | tee "$3"
+    # shellcheck disable=SC2016  # Expand the positional parameters in the child shell.
+    exec timeout --signal=KILL 110s bash -o pipefail -c '
+      "$1" --test-threads=4 --no-capture 2>&1 | tee -- "$2"
+    ' bash "$2" "$3"
     ;;
   *)
     echo 'Usage: review-launcher-tests.sh build | run HARNESS LOG' >&2
