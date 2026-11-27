@@ -4379,7 +4379,7 @@ function EditorSection({ title, hint, className = "", children }) {
 
 // Enabled and Dry-run sit in the header as toggles; their labels stay the
 // exact control names.
-function RuleEditorHeader({ title, enabled, dryRun, dryRunDisabled, disabled, requireChannels, hasChannels, onEnabled, onDryRun, dryRunRef }) {
+function RuleEditorHeader({ title, enabled, dryRun, dryRunDisabled, enabledDisabled, disabled, requireChannels, hasChannels, onEnabled, onDryRun, dryRunRef }) {
   return h(
     "div",
     { className: "editor-heading rule-editor-header" },
@@ -4393,7 +4393,7 @@ function RuleEditorHeader({ title, enabled, dryRun, dryRunDisabled, disabled, re
         h(Input, {
           type: "checkbox",
           className: "toggle toggle-sm",
-          ...(requireChannels ? { checked: enabled, disabled: !hasChannels } : { defaultChecked: enabled, disabled }),
+          ...(requireChannels ? { checked: enabled, disabled: !hasChannels } : { defaultChecked: enabled, disabled: disabled || enabledDisabled }),
           onChange: (e) => onEnabled(e.target.checked),
         }),
         "Enabled",
@@ -5188,6 +5188,10 @@ function OnboardingTrapEditor({ record }) {
   const refresh = () => setRevision((value) => value + 1);
   const pending = useRef(new Set()).current;
   const hasRole = roleIds.length > 0 && roleIds[0] !== state.guildId;
+  const canManageRemoval = canManageServer();
+  const managedRemoval = !canManageRemoval && Array.isArray(rule.params?.remove_role_ids)
+    && rule.params.remove_role_ids.length > 0;
+  const liveRemoval = managedRemoval && rule.enabled && !rule.dry_run;
   return h(
     DialogPanel,
     { className: "modal-box rule-editor", onInput: trackDraft },
@@ -5197,13 +5201,15 @@ function OnboardingTrapEditor({ record }) {
       enabled: rule.enabled && hasRole,
       dryRun: rule.dry_run,
       disabled: !hasRole,
+      enabledDisabled: managedRemoval && !rule.enabled && !rule.dry_run,
+      dryRunDisabled: managedRemoval && rule.enabled && rule.dry_run,
       onEnabled: (on) => { rule.enabled = on; refresh(); },
       onDryRun: (on) => { rule.dry_run = on; refresh(); },
     }),
     h(
       EditorSection,
       { title: "Trigger" },
-      h(IdPicker, {
+      liveRemoval ? h("p", {}, `Trap role: ${roleShown(roleIds[0], names)}`) : h(IdPicker, {
         kind: "role",
         label: "Trap role",
         hint: "Pick the role granted by the optional Discord Onboarding answer.",
@@ -5221,6 +5227,7 @@ function OnboardingTrapEditor({ record }) {
         h(Label, {}, "Join window (minutes)"),
         h(Input, {
           type: "number", className: "input", min: 0, max: 1440, step: 1, required: true,
+          disabled: liveRemoval,
           value: windowMinutes, onChange: (event) => setWindowMinutes(event.target.value),
         }),
       ),
@@ -5230,14 +5237,14 @@ function OnboardingTrapEditor({ record }) {
       EditorSection,
       { title: "Actions" },
       h("p", {}, "The trap opens a private kick case and posts to the Member kick and Automod logs."),
-      h(IdPicker, {
+      canManageRemoval ? h(IdPicker, {
         kind: "role",
         label: "Roles to remove before kicking",
         hint: "Optional. Pick up to five roles below jModGuard’s highest role. Requires Manage Roles. A failed removal can still be followed by a kick.",
         ids: removalRoleIds,
         names: { ...names, roles: names.roles.filter((role) => !role.managed && role.id !== roleIds[0]) },
         pending,
-      }),
+      }) : h("p", { className: "field-help" }, "You need Manage Server to change or activate role removal."),
       h(Field, {},
         h(Label, {}, "Kick reason"),
         h(Input, { className: "input", value: rule.actions[0].reason, onChange: (event) => {
@@ -5264,7 +5271,7 @@ function OnboardingTrapEditor({ record }) {
           if (!flushPendingIds(pending)) return;
           const roleId = roleIds[0] || null;
           if (roleId === state.guildId) throw new Error("Choose a role other than @everyone");
-          if (removalRoleIds.length > 5 || removalRoleIds.some((id) => id === state.guildId || id === roleId)) {
+          if (canManageRemoval && (removalRoleIds.length > 5 || removalRoleIds.some((id) => id === state.guildId || id === roleId))) {
             throw new Error("Choose up to five roles other than @everyone and the trap role to remove");
           }
           if (!/^\d+$/.test(windowMinutes) || Number(windowMinutes) > 1440) throw new Error("Enter a join window from 0 to 1440 minutes");
@@ -5277,7 +5284,7 @@ function OnboardingTrapEditor({ record }) {
               role_id: roleId,
               join_window_minutes: Number(windowMinutes),
               cleanup_window_minutes: Number(cleanupMinutes),
-              remove_role_ids: [...removalRoleIds],
+              ...(canManageRemoval ? { remove_role_ids: [...removalRoleIds] } : {}),
             },
           };
           await reloadAfter(() => api(`/api/guilds/${state.guildId}/rules/${record.rule_id}`, "PUT", { scope: "guild", data, expected }), () => {

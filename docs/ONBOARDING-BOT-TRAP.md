@@ -44,6 +44,7 @@ for the Community server setup and preview requirements.
    default join window is 30 minutes. Set it to 0 to check role grants at any
    time. Keeping a window helps protect members from accidental later grants.
 
+   Configuring or activating role removal requires **Manage Server**.
    Leave **Roles to remove before kicking** empty to skip role removal. You
    can select up to five additional roles. The trap removes selected roles the
    member holds, in selection order. jModGuard needs **Manage Roles** and must

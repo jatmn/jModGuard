@@ -8067,6 +8067,43 @@ test('built-in onboarding trap starts off, warns on unsafe setup, and saves a gu
   assert.deepEqual(calls[1].expected, calls[0].data);
 });
 
+test('delegated settings can edit cleanup while onboarding role removal stays locked', async () => {
+  const id = 'onboarding_bot_trap';
+  for (const [enabled, dryRun] of [[false, false], [true, true], [true, false]]) {
+    const effective = {
+      enabled, dry_run: dryRun, skip_moderators: true, log_automod: true, open_case: true,
+      params: { role_id: '22', join_window_minutes: 30, remove_role_ids: ['23'] },
+      actions: [{ at: 1, action: 'kick', reason: 'Fixture kick' }],
+    };
+    const writes = [];
+    const h = harness(async (url, options) => {
+      if (url.endsWith('/server-names')) return response({ roles: [{ id: '22', name: 'Anti-bot' }], channels: [] });
+      assert.equal(options.method, 'PUT');
+      assert.ok(url.endsWith(`/rules/${id}`));
+      const body = JSON.parse(options.body);
+      writes.push(body);
+      return response({ config_patch: { kind: 'rule', id, scope: 'guild', value: body.data } });
+    });
+    h.app.state.guilds[0].access = 'settings';
+    h.app.state.config = { enrollment_id: 'membership', rules: [{ rule_id: id, name: 'Onboarding bot trap', effective }] };
+    h.app.navigate('rules');
+    const card = h.nodes.get('#content');
+    await fire(findNode(card, n => n.localName === 'button' && n.getAttribute('aria-label') === 'Edit'), 'click');
+    await settle();
+    const modal = h.document.querySelector('.modal-overlay');
+    assert.match(textOf(modal), /Manage Server to change or activate role removal/);
+    assert.ok(![...modal.querySelectorAll('label')].some(label => textOf(label) === 'Roles to remove before kicking'));
+    assert.equal(pickerLabelled(modal, 'Enabled').disabled, !enabled && !dryRun);
+    assert.equal(pickerLabelled(modal, 'Dry-run (log only)').disabled, enabled && dryRun);
+    assert.equal(pickerLabelled(modal, 'Join window (minutes)').disabled, enabled && !dryRun);
+    await typeValue(pickerLabelled(modal, 'Recent-message cleanup (minutes)'), '12');
+    await fire(findNode(modal, n => n.localName === 'button' && textOf(n) === 'Save'), 'click');
+    assert.equal(writes.length, 1);
+    assert.deepEqual(writes[0].expected, effective);
+    assert.deepEqual(writes[0].data, { ...effective, params: { ...effective.params, cleanup_window_minutes: 12 } });
+  }
+});
+
 test('custom pattern draft save uses dry_run and custom id', () => {
   const h = harness();
   const draft = h.app.buildCustomRuleSaveBody(

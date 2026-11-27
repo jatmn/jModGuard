@@ -1077,6 +1077,60 @@ mod tests {
         };
         let reply = submit(bound, seal(&grant, 7));
         assert_eq!(failure_message(&reply), "actor is not allowed");
+
+        let id = jmodguard::onboarding_trap::RULE_ID;
+        let mut staged = db::get_rule(&bot.db, 0, id).await.unwrap().unwrap();
+        staged.params["role_id"] = serde_json::json!("20");
+        staged.params["remove_role_ids"] = serde_json::json!(["22"]);
+        staged.enabled = true;
+        db::upsert_rule(&bot.db, 10, id, &staged).await.unwrap();
+        let version = db::get_config_version(&bot.db).await.unwrap();
+        let mut live = staged.clone();
+        live.dry_run = false;
+        let mut different_roles = staged.clone();
+        different_roles.params["remove_role_ids"] = serde_json::json!(["23"]);
+        for rule in [live.clone(), different_roles] {
+            let op = db::ControlOp::SaveOnboardingTrap {
+                scope: scope(&enrollment),
+                expected: staged.clone(),
+                rule,
+            };
+            let reply = submit(bound, seal(&op, 7));
+            assert_eq!(failure_message(&reply), "actor is not allowed");
+        }
+        let forged = db::ControlOp::SaveOnboardingTrap {
+            scope: scope(&enrollment),
+            expected: live.clone(),
+            rule: live,
+        };
+        let reply = submit(bound, seal(&forged, 7));
+        assert!(
+            failure_message(&reply).contains("Reload the rule"),
+            "{reply:?}"
+        );
+        let reset = db::ControlOp::DeleteRule {
+            request: scope(&enrollment),
+            target: scope(&enrollment),
+            id: id.to_owned(),
+        };
+        let reply = submit(bound, seal(&reset, 7));
+        assert_eq!(failure_message(&reply), "actor is not allowed");
+        assert_eq!(db::get_config_version(&bot.db).await.unwrap(), version);
+        assert_eq!(
+            db::get_rule(&bot.db, 10, id).await.unwrap(),
+            Some(staged.clone())
+        );
+
+        let mut safe = staged.clone();
+        safe.params["cleanup_window_minutes"] = serde_json::json!(10);
+        let op = db::ControlOp::SaveOnboardingTrap {
+            scope: scope(&enrollment),
+            expected: staged,
+            rule: safe.clone(),
+        };
+        let reply = submit(bound, seal(&op, 7));
+        assert!(matches!(reply, ControlReply::Saved { .. }), "{reply:?}");
+        assert_eq!(db::get_rule(&bot.db, 10, id).await.unwrap(), Some(safe));
         drop(bot);
         cleanup(&path);
     }

@@ -59,6 +59,31 @@ pub fn removal_role_ids(guild_id: u64, rule: &RuleDef) -> Option<Vec<u64>> {
     Some(ids)
 }
 
+/// Manage Server controls the saved removal list and who it can affect in live mode.
+/// An unchanged policy can be retained during ordinary edits or switched off.
+pub fn role_removal_requires_manage(guild_id: u64, current: &RuleDef, next: &RuleDef) -> bool {
+    let roles = removal_role_ids(guild_id, next);
+    removal_role_ids(guild_id, current) != roles
+        || (next.enabled
+            && !next.dry_run
+            && roles.is_some_and(|ids| !ids.is_empty())
+            && (!current.enabled
+                || current.dry_run
+                || role_id(current) != role_id(next)
+                || join_window_minutes(current) != join_window_minutes(next)
+                || current.whitelist_roles != next.whitelist_roles
+                || current.whitelist_users != next.whitelist_users
+                || current.whitelist_channels.contains(&0) != next.whitelist_channels.contains(&0)
+                || !current.skip_moderators
+                || !current.log_automod
+                || !current.open_case
+                || !has_kick_action(current)))
+}
+
+fn has_kick_action(rule: &RuleDef) -> bool {
+    matches!(rule.actions.as_slice(), [action] if action.action == "kick" && action.at == 1)
+}
+
 pub(crate) fn validate(guild_id: i64, rule: &RuleDef) -> Result<()> {
     let role = role_id(rule);
     if let Some(value) = rule.params.get("role_id")
@@ -95,7 +120,7 @@ pub(crate) fn validate(guild_id: i64, rule: &RuleDef) -> Result<()> {
         "The onboarding trap must log matches and open cases"
     );
     ensure!(
-        matches!(rule.actions.as_slice(), [action] if action.action == "kick" && action.at == 1),
+        has_kick_action(rule),
         "The onboarding trap requires one kick action"
     );
     Ok(())

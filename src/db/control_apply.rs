@@ -548,8 +548,28 @@ pub fn control_actor_needs(op: &ControlOp) -> Vec<ControlActorNeed> {
 /// or a second guild.
 pub fn settings_role_scope(op: &ControlOp) -> Option<&ScopeWire> {
     let (request, target) = match op {
+        ControlOp::SaveOnboardingTrap {
+            scope,
+            expected,
+            rule,
+        } if !crate::onboarding_trap::role_removal_requires_manage(
+            u64::try_from(scope.guild_id).ok()?,
+            expected,
+            rule,
+        ) =>
+        {
+            // The writer compares expected with the primary rule in the
+            // same transaction as the save, so it cannot grant a stale edit.
+            (scope, scope)
+        }
+        // Resetting this override can change the removal policy without a
+        // comparison. Generic upserts must use the dedicated save instead.
+        ControlOp::UpsertRule { id, .. } | ControlOp::DeleteRule { id, .. }
+            if id == crate::onboarding_trap::RULE_ID =>
+        {
+            return None;
+        }
         ControlOp::PatchSettings { scope, .. }
-        | ControlOp::SaveOnboardingTrap { scope, .. }
         | ControlOp::AddKnownBadImage { scope, .. }
         | ControlOp::RemoveKnownBadImage { scope, .. } => (scope, scope),
         ControlOp::UpsertRule {
