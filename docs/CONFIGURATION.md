@@ -96,20 +96,23 @@ hours or full days. Today's daily bucket is dropped.
 
 | Chart field | Observed or published scope | Treatment |
 | --- | --- | --- |
-| `cpuUsageSplitChart` | Mean cores per pod | Priced at $0.02 per core-hour. The latest closed hour also shows the per-pod average cores. |
+| `cpuUsageSplitChart` | Mean cores per pod | Closed hourly points are priced at $0.02 per core-hour. The latest closed hour also shows the per-pod average cores. |
 | `ramUsageSplitChart` | Mean bytes per pod | Rounded up to whole 64 MiB blocks per pod and priced per hour. |
 | `trafficSplitChart` | Bytes summed per bucket, with daily values equal to the sum of hourly values | Priced as egress at the rate for the reporting pod's region |
 
 Daily CPU and RAM values are sample-weighted means of the underlying readings.
-Daily estimates apply those means over 24 hours. RAM uses the daily mean for
-rounding when hourly data is outside the lookback window.
+CPU cost uses closed hourly observations or saved hourly costs. A daily CPU
+mean alone gives no usage duration, so CPU cost is unavailable when neither
+hourly source is available. Daily RAM still uses the mean for block rounding
+and applies the resulting blocks over 24 hours.
 
 Persistent volume cost uses the app summary's `totalVolumeSizeInGb` at
 $0.10/GB-month. The current allocated size is prorated over the elapsed UTC
 month. Volume charts do not contribute to estimates. A missing allocation
 leaves the volume cost unavailable. Historical backfill preserves any
 month-to-date volume estimate saved in that month and has no allocation
-history to fill in the remaining cost.
+history to fill in the remaining cost. A known volume estimate contributes
+to the partial subtotal even before any chart data is available.
 
 Missing values can leave gaps in these estimates. Bunny's billed RAM
 includes variable system overhead, and traffic billing covers egress

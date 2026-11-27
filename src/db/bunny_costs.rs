@@ -33,9 +33,10 @@ impl BunnyService {
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Serialize)]
 pub struct BunnyDayCost {
-    // The legacy `cpu` field used unverified chart units.
+    // Older `cpu` and `cpu_core_cost` fields may include unverified charges
+    // or daily rollups without usage duration. Only read hourly prices.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub cpu_core_cost: Option<f64>,
+    pub hourly_cpu_cost: Option<f64>,
     pub ram: f64,
     pub egress: f64,
     // Retain a zero on the writer wire for older peers and discard legacy
@@ -60,7 +61,7 @@ pub struct BunnyCpuAverages {
 pub struct BunnyMonthData {
     pub days: CostDays,
     #[serde(default)]
-    pub magic_cpu_priced: bool,
+    pub magic_cpu_from_hourly: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cpu_hourly_averages: Option<BunnyCpuAverages>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -84,10 +85,13 @@ impl BunnyMonthData {
     }
 
     fn magic_subtotal(&self) -> Option<f64> {
-        (!self.days.is_empty() && !self.egress_rate_unknown()).then(|| {
+        if self.days.is_empty() {
+            return self.allocated_volume_cost;
+        }
+        (!self.egress_rate_unknown()).then(|| {
             self.days
                 .values()
-                .map(|day| day.cpu_core_cost.unwrap_or_default() + day.ram + day.egress)
+                .map(|day| day.hourly_cpu_cost.unwrap_or_default() + day.ram + day.egress)
                 .sum::<f64>()
                 + self.allocated_volume_cost.unwrap_or_default()
         })
@@ -103,15 +107,19 @@ impl BunnyMonthData {
                     if saved.complete {
                         // Fill in verified CPU pricing when a legacy snapshot
                         // already has a full day of RAM and traffic.
-                        let cpu_core_cost = if day.complete {
-                            saved.cpu_core_cost.or(day.cpu_core_cost)
+                        let hourly_cpu_cost = if day.complete {
+                            saved.hourly_cpu_cost.or(day.hourly_cpu_cost)
                         } else {
-                            saved.cpu_core_cost
+                            saved.hourly_cpu_cost
                         };
                         *day = BunnyDayCost {
-                            cpu_core_cost,
+                            hourly_cpu_cost,
                             ..saved
                         };
+                    } else {
+                        // Keep any saved closed-hour prices when a later
+                        // daily rollup has no hourly coverage.
+                        day.hourly_cpu_cost = day.hourly_cpu_cost.or(saved.hourly_cpu_cost);
                     }
                 })
                 .or_insert(saved);
@@ -122,7 +130,10 @@ impl BunnyMonthData {
     pub fn summarize(&mut self, service: BunnyService, month: NaiveDate, observed: DateTime<Utc>) {
         let next = month + Months::new(1);
         let completed_to = observed.date_naive().min(next);
-        self.partial = !self.covers(month, completed_to);
+        let volume_only = service == BunnyService::MagicContainers
+            && self.days.is_empty()
+            && self.allocated_volume_cost.is_some();
+        self.partial = volume_only || !self.covers(month, completed_to);
         self.closed = !self.partial && completed_to == next;
         self.month_to_date = match service {
             BunnyService::MagicContainers => self.magic_subtotal(),
@@ -224,7 +235,7 @@ pub(super) async fn store_bunny_cost_snapshot(
                     && date.month() == row.month.month()
                     && *date <= observed.date_naive()
                     && (!cost.complete || *date < observed.date_naive())
-                    && cost.cpu_core_cost.is_none_or(valid_amount)
+                    && cost.hourly_cpu_cost.is_none_or(valid_amount)
                     && [cost.ram, cost.egress, cost.storage]
                         .into_iter()
                         .all(valid_amount)
@@ -286,4 +297,34 @@ pub(super) async fn store_bunny_cost_snapshot(
         Ok(row)
     })
     .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn magic_subtotal_includes_known_volume_with_empty_charts() {
+        let month = NaiveDate::from_ymd_opt(2026, 11, 1).unwrap();
+        let observed = DateTime::from_timestamp(midnight_secs(month) + 30 * 60, 0).unwrap();
+        for cost in [None, Some(0.0), Some(0.125)] {
+            let mut data = BunnyMonthData {
+                allocated_volume_cost: cost,
+                ..BunnyMonthData::default()
+            };
+            data.summarize(BunnyService::MagicContainers, month, observed);
+            assert_eq!(data.month_to_date, cost);
+            assert_eq!(data.partial, cost.is_some());
+
+            data.days.insert(
+                month,
+                BunnyDayCost {
+                    egress_rate_unknown: true,
+                    ..BunnyDayCost::default()
+                },
+            );
+            data.summarize(BunnyService::MagicContainers, month, observed);
+            assert_eq!(data.month_to_date, None);
+        }
+    }
 }

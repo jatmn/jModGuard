@@ -14428,6 +14428,18 @@ test('Bot Resources hides Bunny costs without config and renders partial provide
   assert.match(textOf(detail()), /1\.125–1\.625 · Sample time unavailable/);
   assert.equal(detail().querySelector('time'), null);
 
+  const volume = 0.60 * 0.5 / 720;
+  snapshot.provider.magic_containers.month_to_date_usd = volume;
+  snapshot.provider.magic_containers.partial = true;
+  snapshot.provider.magic_breakdown = { cpu: null, ram: null, egress: null, volume, egress_rate_unknown: false };
+  delete snapshot.provider.magic_cpu_hourly_averages;
+  await fire(h.nodes.get('#refresh-resources'), 'click');
+  assert.match(textOf(section()), /Magic Containers\$4\.75<\$0\.01 \(partial\)/);
+  for (const label of ['CPU cost', 'RAM', 'Egress']) {
+    assert.match(textOf(detail()), new RegExp(`${label}Not available`));
+  }
+  assert.match(textOf(detail()), /Volumes<\$0\.01/);
+
   snapshot = resourceSnapshot();
   await fire(h.nodes.get('#refresh-resources'), 'click');
   assert.equal(section(), null);

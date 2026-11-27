@@ -17,6 +17,13 @@ const CPU_CORE_HOUR: f64 = 0.02;
 const VOLUME_GB_MONTH: f64 = 0.10;
 const STORAGE_GB_MONTH: f64 = 0.01;
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum McChart {
+    Daily,
+    Hourly,
+    HourlyCpu,
+}
+
 pub(super) struct Client {
     http: reqwest::Client,
     base: reqwest::Url,
@@ -98,9 +105,10 @@ impl Client {
         &self,
         source: &Source,
         window: Window,
-        hourly: bool,
+        chart: McChart,
         data: &mut MonthData,
     ) -> Result<(), Failure> {
+        let hourly = chart != McChart::Daily;
         let hours = if hourly { 1 } else { 24 };
         let seconds = 3600 * hours;
         // Bunny can return buckets past toDate, including the open bucket.
@@ -126,32 +134,40 @@ impl Client {
             .await?;
         let range = window.from..to;
         let hours = hours as f64;
-        // CPU and RAM daily points already average all their raw samples.
-        // Traffic points are byte totals for their bucket at either granularity.
-        for series in charts.cpu.into_values() {
-            let mut samples = series.chart.range(range.clone());
-            for (&time, &value) in samples.clone() {
-                let day = data.days.entry(time.date_naive()).or_default();
-                *day.cpu_core_cost.get_or_insert(0.0) +=
-                    nonnegative(value)? * hours * CPU_CORE_HOUR;
-            }
-            if hourly && let Some((&sampled_at, &value)) = samples.next_back() {
-                match &mut data.cpu_hourly_averages {
-                    Some(cpu) if sampled_at < cpu.sampled_at => {}
-                    Some(cpu) if sampled_at == cpu.sampled_at => {
-                        cpu.min = cpu.min.min(value);
-                        cpu.max = cpu.max.max(value);
-                    }
-                    _ => {
-                        data.cpu_hourly_averages = Some(BunnyCpuAverages {
-                            sampled_at,
-                            min: value,
-                            max: value,
-                        });
+        // A daily CPU mean has no duration. Only closed hourly CPU points
+        // contribute to the per-day sum of core-hours.
+        if hourly {
+            for series in charts.cpu.into_values() {
+                let mut samples = series.chart.range(range.clone());
+                for (&time, &value) in samples.clone() {
+                    let day = data.days.entry(time.date_naive()).or_default();
+                    *day.hourly_cpu_cost.get_or_insert(0.0) += nonnegative(value)? * CPU_CORE_HOUR;
+                }
+                if chart == McChart::Hourly
+                    && let Some((&sampled_at, &value)) = samples.next_back()
+                {
+                    match &mut data.cpu_hourly_averages {
+                        Some(cpu) if sampled_at < cpu.sampled_at => {}
+                        Some(cpu) if sampled_at == cpu.sampled_at => {
+                            cpu.min = cpu.min.min(value);
+                            cpu.max = cpu.max.max(value);
+                        }
+                        _ => {
+                            data.cpu_hourly_averages = Some(BunnyCpuAverages {
+                                sampled_at,
+                                min: value,
+                                max: value,
+                            });
+                        }
                     }
                 }
             }
         }
+        if chart == McChart::HourlyCpu {
+            return Ok(());
+        }
+        // Daily RAM points average their raw samples. Traffic points are
+        // byte totals for their bucket at either granularity.
         let days = &mut data.days;
         for series in charts.ram.into_values() {
             for (&time, &value) in series.chart.range(range.clone()) {
