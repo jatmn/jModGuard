@@ -21,6 +21,8 @@ use tokio::time::Instant;
 
 pub use libsql::{Row, Value, params, params_from_iter};
 
+pub(crate) const BEGIN_PRIMARY_SNAPSHOT: &str = "begin primary snapshot";
+
 static RECEIPT_PRUNE_COUNTER: AtomicU64 = AtomicU64::new(0);
 // 64 possible 64-KiB pages cover row, both receipt B-trees and split paths.
 // This is independently admitted before creating/refreshing our own receipt.
@@ -145,6 +147,14 @@ pub(crate) fn is_database_operation_timeout(error: &anyhow::Error) -> bool {
         cause.downcast_ref::<DatabaseOperationTimedOut>().is_some()
             || cause.downcast_ref::<DatabaseCallerAbandoned>().is_some()
     })
+}
+
+pub(crate) fn local_database_timeout_operation(error: &anyhow::Error) -> Option<&'static str> {
+    error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<DatabaseOperationTimedOut>())
+        .filter(|timeout| timeout.remote_failure.is_none())
+        .map(|timeout| timeout.operation)
 }
 
 pub(crate) fn database_caller_abandoned(operation: &'static str) -> anyhow::Error {
@@ -1859,7 +1869,7 @@ impl Connection {
         write_deadline: Option<Instant>,
     ) -> Result<Transaction> {
         let (inner, deadline, tally) = self.open_remote_transaction(
-            "begin primary snapshot",
+            BEGIN_PRIMARY_SNAPSHOT,
             libsql::TransactionBehavior::Deferred,
             self.interactive_read_budget(),
             write_deadline,

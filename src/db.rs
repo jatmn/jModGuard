@@ -16,8 +16,8 @@ use std::time::{Duration, Instant};
 #[cfg(debug_assertions)]
 pub use crate::db_compat::test_drop_next_commit_response;
 use crate::db_compat::{
-    Connection, DbRuntime, OptionalExtension, Row, Value, database_operation_timed_out,
-    params_from_iter,
+    BEGIN_PRIMARY_SNAPSHOT, Connection, DbRuntime, OptionalExtension, Row, Value,
+    database_operation_timed_out, local_database_timeout_operation, params_from_iter,
 };
 #[doc(hidden)]
 pub use crate::db_compat::{
@@ -1393,7 +1393,23 @@ impl Db {
                         write_deadline,
                     )
                     .await;
-                probe.finish(result)?
+                match result {
+                    Err(error)
+                        if write_deadline.is_some()
+                            && matches!(
+                                local_database_timeout_operation(&error),
+                                Some(
+                                    WAIT_FOR_CONNECTION
+                                        | CHECKOUT_CONNECTION
+                                        | BEGIN_PRIMARY_SNAPSHOT
+                                )
+                            ) =>
+                    {
+                        probe.release_without_attempt();
+                        return Err(error);
+                    }
+                    result => probe.finish(result)?,
+                }
             }
         };
         let started = Instant::now();
