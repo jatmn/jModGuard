@@ -32,6 +32,15 @@ impl Handler {
         &self.app
     }
 
+    fn observe_spam_message_delete(&self, guild: GuildId, channel: ChannelId, message: MessageId) {
+        self.app
+            .image_spam
+            .deleted(guild.get(), channel.get(), message.get());
+        self.app
+            .text_spam
+            .deleted(guild.get(), channel.get(), message.get());
+    }
+
     // Serenity spawns this hook and does not await it before sleeping. The sleep
     // covers both a real provider throttle and a pre-emptive empty bucket. This
     // function awaits one pacing write attempt before it returns; the log sender
@@ -1579,9 +1588,7 @@ impl EventHandler for Handler {
                 .snapshots
                 .unhooked_delete(guild_id, channel_id, &[deleted_message_id]);
         }
-        self.app
-            .image_spam
-            .deleted(guild_id.get(), channel_id.get(), deleted_message_id.get());
+        self.observe_spam_message_delete(guild_id, channel_id, deleted_message_id);
         let observation = logging::claim_cleanup_gateway(
             &self.app,
             guild_id,
@@ -1593,9 +1600,6 @@ impl EventHandler for Handler {
         self.app
             .recent_messages
             .forget(guild_id.get(), channel_id.get(), deleted_message_id.get());
-        self.app
-            .text_spam
-            .invalidate(guild_id.get(), channel_id.get(), deleted_message_id.get());
         if let Some(observation) = observation {
             logging::persist_cleanup_observations(&self.app, &[observation]).await;
         }
@@ -1635,6 +1639,7 @@ impl EventHandler for Handler {
         }
         let mut observations = Vec::new();
         for id in &multiple_deleted_messages_ids {
+            self.observe_spam_message_delete(guild_id, channel_id, *id);
             observations.extend(logging::claim_cleanup_gateway(
                 &self.app,
                 guild_id,
@@ -1646,12 +1651,6 @@ impl EventHandler for Handler {
             self.app
                 .recent_messages
                 .forget(guild_id.get(), channel_id.get(), id.get());
-            self.app
-                .image_spam
-                .invalidate(guild_id.get(), channel_id.get(), id.get());
-            self.app
-                .text_spam
-                .invalidate(guild_id.get(), channel_id.get(), id.get());
         }
         logging::persist_cleanup_observations(&self.app, &observations).await;
         if !hooked {

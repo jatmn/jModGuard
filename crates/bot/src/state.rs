@@ -2926,6 +2926,19 @@ impl ConfigCache {
             .map(|entry| Arc::clone(&entry.config))
     }
 
+    #[cfg(test)]
+    pub(crate) fn replace_cached_matchers_for_test(
+        &self,
+        guild_id: u64,
+        mut config: CachedGuildConfig,
+    ) {
+        let mut entry = self.map.get_mut(&(guild_id as i64)).unwrap();
+        assert_eq!(config.rules, entry.config.rules);
+        config.version = entry.config.version;
+        config.durable_version = entry.config.durable_version;
+        entry.config = Arc::new(config);
+    }
+
     pub async fn get(&self, db: &Db, guild_id: u64) -> Result<Arc<CachedGuildConfig>> {
         let guild_id = guild_id as i64;
         let mut route = ConfigReadRoute::Replica;

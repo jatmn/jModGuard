@@ -10,7 +10,10 @@ use serenity::{
 };
 use std::{
     collections::{BTreeSet, HashMap},
-    sync::Arc,
+    sync::{
+        Arc, Weak,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{Duration, Instant},
 };
 
@@ -48,12 +51,30 @@ struct Post {
     text: String,
     cost: usize,
     revision: u64,
+    own_delete: Weak<AtomicBool>,
 }
+
+/// A deleted post can still prove this dispatch if REST succeeded and Gateway
+/// echoed the deletion. The observation itself is retired normally.
+pub(crate) struct OwnDelete {
+    post: Post,
+    proof_lifetime: Weak<()>,
+    echoed: Arc<AtomicBool>,
+    succeeded: bool,
+}
+
+impl OwnDelete {
+    pub(crate) fn finish(&mut self, succeeded: bool) {
+        self.succeeded = succeeded;
+    }
+}
+
 struct Bucket {
     retired_before: u64,
     window: Duration,
     last_seen: Instant,
     token: (u64, u64),
+    proof_lifetime: Arc<()>,
     posts: Vec<Post>,
     report: ReportCooldown,
 }
@@ -90,6 +111,8 @@ struct Guild {
 struct Watermark {
     retired_before: u64,
     last_seen: Instant,
+    // The final own delete can retire the bucket before the ban check.
+    proof: Option<((u64, u64), Arc<()>)>,
 }
 struct State {
     revision: u64,
@@ -151,19 +174,38 @@ impl Detector {
         });
     }
     pub fn invalidate(&self, guild: u64, channel: u64, message: u64) {
+        self.invalidate_message(guild, channel, message, false);
+    }
+
+    pub(crate) fn deleted(&self, guild: u64, channel: u64, message: u64) {
+        self.invalidate_message(guild, channel, message, true);
+    }
+
+    fn invalidate_message(&self, guild: u64, channel: u64, message: u64, delete_echo: bool) {
         let mut state = self.state.lock();
         state.revision = state.revision.wrapping_add(1);
         let Some(author) = state.index.get(&(guild, channel, message)).copied() else {
             return;
         };
         drop_author_posts(&mut state, guild, author, |p| {
-            p.id == message && p.channel == channel
+            if p.id != message || p.channel != channel {
+                return false;
+            }
+            if delete_echo && let Some(echoed) = p.own_delete.upgrade() {
+                echoed.store(true, Ordering::Release);
+            }
+            true
         });
     }
     pub fn invalidate_author(&self, guild: u64, author: u64) {
         let mut state = self.state.lock();
         state.revision = state.revision.wrapping_add(1);
         drop_author_posts(&mut state, guild, author, |_| true);
+        if let Some(g) = state.guilds.get_mut(&guild)
+            && let Some(watermark) = g.watermarks.get_mut(&author)
+        {
+            watermark.proof = None;
+        }
     }
     pub fn invalidate_guild(&self, guild: u64) {
         let mut state = self.state.lock();
@@ -175,6 +217,11 @@ impl Detector {
             .unwrap_or_default();
         for author in authors {
             drop_author_posts(&mut state, guild, author, |_| true);
+        }
+        if let Some(g) = state.guilds.get_mut(&guild) {
+            for watermark in g.watermarks.values_mut() {
+                watermark.proof = None;
+            }
         }
     }
     pub fn author_of(&self, guild: u64, channel: u64, message: u64) -> Option<u64> {
@@ -253,38 +300,54 @@ impl Detector {
         }
     }
 
-    /// True when every matched message is still indexed under this author with the
-    /// same config token and still forms a live cross-channel exact-text match.
+    /// True when live observations and confirmed own deletes still form the
+    /// cross-channel exact-text match under the admitted config token.
     pub(crate) fn match_still_proving(
         &self,
-        guild: u64,
-        author: u64,
+        (guild, author): (u64, u64),
         token: (u64, u64),
         messages: &[(u64, u64)],
         policy: &Policy,
         now: Instant,
+        own_deletes: &[OwnDelete],
     ) -> bool {
         let state = self.state.lock();
-        let Some(b) = state
-            .guilds
-            .get(&guild)
-            .and_then(|g| g.authors.get(&author))
+        let Some(g) = state.guilds.get(&guild) else {
+            return false;
+        };
+        let bucket = g.authors.get(&author);
+        let Some((current_token, proof_lifetime)) =
+            bucket.map(|b| (b.token, &b.proof_lifetime)).or_else(|| {
+                let (token, lifetime) = g.watermarks.get(&author)?.proof.as_ref()?;
+                Some((*token, lifetime))
+            })
         else {
             return false;
         };
-        if b.token != token {
+        if current_token != token || messages.is_empty() {
             return false;
         }
+        let proof_lifetime = Arc::downgrade(proof_lifetime);
         let window = Duration::from_secs(policy.window_secs);
         let posts: Vec<_> = messages
             .iter()
             .filter_map(|(channel, message)| {
-                if state.index.get(&(guild, *channel, *message)) != Some(&author) {
-                    return None;
+                if state.index.get(&(guild, *channel, *message)) == Some(&author) {
+                    return bucket?
+                        .posts
+                        .iter()
+                        .find(|p| p.channel == *channel && p.id == *message);
                 }
-                b.posts
+                own_deletes
                     .iter()
-                    .find(|p| p.channel == *channel && p.id == *message)
+                    .find(|deleted| {
+                        deleted.post.channel == *channel
+                            && deleted.post.id == *message
+                            && deleted.proof_lifetime.ptr_eq(&proof_lifetime)
+                            && deleted.succeeded
+                            && deleted.echoed.load(Ordering::Acquire)
+                    })
+                    .map(|deleted| &deleted.post)
             })
             .collect();
         if posts.len() != messages.len() {
@@ -303,6 +366,33 @@ impl Detector {
             .collect::<BTreeSet<_>>()
             .len()
             >= policy.min_channels
+    }
+
+    pub(crate) fn begin_delete(
+        &self,
+        guild: u64,
+        author: u64,
+        token: (u64, u64),
+        channel: u64,
+        message: u64,
+    ) -> Option<OwnDelete> {
+        let mut state = self.state.lock();
+        let bucket = state.guilds.get_mut(&guild)?.authors.get_mut(&author)?;
+        if bucket.token != token {
+            return None;
+        }
+        let post = bucket
+            .posts
+            .iter_mut()
+            .find(|p| p.channel == channel && p.id == message)?;
+        let echoed = Arc::new(AtomicBool::new(false));
+        post.own_delete = Arc::downgrade(&echoed);
+        Some(OwnDelete {
+            post: post.clone(),
+            proof_lifetime: Arc::downgrade(&bucket.proof_lifetime),
+            echoed,
+            succeeded: false,
+        })
     }
 
     #[allow(clippy::too_many_arguments)] // Private bounded admission tuple, no external API.
@@ -424,10 +514,15 @@ impl Detector {
         });
         let watermark = g.watermarks.remove(&author);
         let b = g.authors.entry(author).or_insert_with(|| Bucket {
-            retired_before: watermark.map(|w| w.retired_before).unwrap_or(0),
+            retired_before: watermark.as_ref().map_or(0, |w| w.retired_before),
             window: Duration::from_secs(policy.window_secs),
             last_seen: now,
             token,
+            proof_lifetime: watermark
+                .and_then(|w| w.proof)
+                .filter(|(proof_token, _)| *proof_token == token)
+                .map(|(_, lifetime)| lifetime)
+                .unwrap_or_default(),
             posts: vec![],
             report: ReportCooldown::ReadyAt(now),
         });
@@ -476,6 +571,7 @@ impl Detector {
                     text: (*text).into(),
                     cost: text.len(),
                     revision: self.revision(),
+                    own_delete: Weak::new(),
                 },
                 token,
                 policy,
@@ -587,6 +683,7 @@ fn park_author(g: &mut Guild, authors: &mut usize, author: u64, now: Instant) {
         Watermark {
             retired_before: b.retired_before,
             last_seen: now,
+            proof: Some((b.token, b.proof_lifetime)),
         },
     );
     while g.watermarks.len() > MAX_AUTHORS_PER_GUILD {
@@ -835,6 +932,7 @@ fn consider(
             cost: 64 + text.len(),
             text: text.clone(),
             revision,
+            own_delete: Weak::new(),
         },
         token,
         &policy,
@@ -1207,6 +1305,7 @@ mod tests {
             text: text.into(),
             cost: 8,
             revision: 0,
+            own_delete: Weak::new(),
         }
     }
     fn matched(outcome: AdmitOutcome) -> Option<Vec<(u64, u64)>> {
@@ -1515,9 +1614,9 @@ mod tests {
         let mut third = post(12, 3, now, "spam");
         third.revision = d.revision();
         let matched_messages = matched(d.admit(1, 2, third, token, &p, now, false)).unwrap();
-        assert!(d.match_still_proving(1, 2, token, &matched_messages, &p, now));
+        assert!(d.match_still_proving((1, 2), token, &matched_messages, &p, now, &[]));
         d.invalidate(1, 2, 11);
-        assert!(!d.match_still_proving(1, 2, token, &matched_messages, &p, now));
+        assert!(!d.match_still_proving((1, 2), token, &matched_messages, &p, now, &[]));
 
         let fresh = Detector::default();
         for (id, channel) in [(10, 1), (11, 2)] {
@@ -1538,7 +1637,71 @@ mod tests {
             fresh.admit(1, 2, changed, token, &p, now, true),
             AdmitOutcome::Admitted
         );
-        assert!(!fresh.match_still_proving(1, 2, token, &matched_messages, &p, now));
+        assert!(!fresh.match_still_proving((1, 2), token, &matched_messages, &p, now, &[]));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn echoed_text_deletes_keep_proof_only_for_live_same_token_author() {
+        let now = tokio::time::Instant::now().into_std();
+        let policy = policy();
+        let token = (1, 2);
+        for (restored_token, revoke_before_restore) in
+            [(token, false), ((1, 3), false), (token, true)]
+        {
+            let detector = Detector::default();
+            let messages = detector
+                .seed_exact_text(
+                    1,
+                    2,
+                    token,
+                    &policy,
+                    now,
+                    &[(10, 1, "spam"), (11, 2, "spam"), (12, 3, "spam")],
+                )
+                .unwrap();
+            let confirmed: Vec<_> = messages
+                .iter()
+                .map(|(channel, message)| {
+                    let mut delete = detector
+                        .begin_delete(1, 2, token, *channel, *message)
+                        .unwrap();
+                    detector.deleted(1, *channel, *message);
+                    delete.finish(true);
+                    delete
+                })
+                .collect();
+            let proves_at = |proof_token, at| {
+                detector.match_still_proving(
+                    (1, 2),
+                    proof_token,
+                    &messages,
+                    &policy,
+                    at,
+                    &confirmed,
+                )
+            };
+            assert!(proves_at(token, now));
+            if revoke_before_restore {
+                detector.invalidate_author(1, 2);
+                assert!(!proves_at(token, now));
+            }
+            assert!(
+                detector
+                    .seed_exact_text(1, 2, restored_token, &policy, now, &[(13, 4, "other")])
+                    .is_none()
+            );
+            assert_eq!(detector.author_of(1, 4, 13), Some(2));
+            assert_eq!(
+                proves_at(restored_token, now),
+                restored_token == token && !revoke_before_restore
+            );
+            assert!(!proves_at(
+                token,
+                now + Duration::from_secs(policy.window_secs)
+            ));
+            detector.invalidate_author(1, 2);
+            assert!(!proves_at(token, now));
+        }
     }
 
     #[tokio::test(start_paused = true)]
@@ -1551,6 +1714,7 @@ mod tests {
             window: Duration::from_secs(policy.window_secs),
             last_seen: now,
             token: (0, 0),
+            proof_lifetime: Arc::default(),
             posts: vec![
                 post(1, 10, expired, "bravo"),
                 post(2, 20, expired, "alpha"),

@@ -477,6 +477,10 @@ impl Detector {
     }
 
     pub fn new(limits: Limits) -> anyhow::Result<Self> {
+        Self::new_at(limits, Instant::now())
+    }
+
+    fn new_at(limits: Limits, now: Instant) -> anyhow::Result<Self> {
         limits.validate()?;
         Ok(Self {
             slots: Arc::new(tokio::sync::Semaphore::new(limits.concurrency)),
@@ -489,7 +493,7 @@ impl Detector {
                 authors: 0,
                 serial: 0,
                 bytes: 0,
-                budget: Budget::new(Instant::now()),
+                budget: Budget::new(now),
             }),
             hasher: Hasher::default(),
             dropped: std::sync::atomic::AtomicU64::new(0),
@@ -2656,6 +2660,18 @@ fn report_vars(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::OnceLock;
+
+    fn fixture_epoch() -> Instant {
+        // Instant is opaque. Every fixture timestamp is an explicit offset from this origin.
+        static EPOCH: OnceLock<Instant> = OnceLock::new();
+        *EPOCH.get_or_init(Instant::now)
+    }
+
+    fn fixture_detector(limits: Limits) -> Detector {
+        Detector::new_at(limits, fixture_epoch()).unwrap()
+    }
+
     #[test]
     fn images_without_media_type_are_admitted_by_dimensions_and_filename() {
         assert!(is_image_attachment(true, true, None, "image.jpg"));
@@ -2838,8 +2854,8 @@ mod tests {
     }
     #[test]
     fn invalidation_during_config_load_prevents_late_admission() {
-        let now = Instant::now();
-        let d = Detector::new(Limits::default()).unwrap();
+        let now = fixture_epoch();
+        let d = fixture_detector(Limits::default());
         let mut p = post(1, 1, now, &[1, 2]);
         p.revision = d.revision();
         d.invalidate(1, 1, 1); // The create callback has not reached admission yet.
@@ -2852,8 +2868,8 @@ mod tests {
 
     #[test]
     fn unchanged_files_do_not_refresh_and_changed_files_replace() {
-        let now = Instant::now();
-        let d = Detector::new(Limits::default()).unwrap();
+        let now = fixture_epoch();
+        let d = fixture_detector(Limits::default());
         let mut first = post(1, 10, now, &[1, 2]);
         first.revision = d.revision();
         first.edited_ms = 1;
@@ -2917,8 +2933,8 @@ mod tests {
 
     #[test]
     fn apply_admit_outcome_preserves_unchanged_and_rejects_stale() {
-        let d = Detector::new(Limits::default()).unwrap();
-        let now = Instant::now();
+        let d = fixture_detector(Limits::default());
+        let now = fixture_epoch();
         let mut first = post(1, 10, now, &[1, 2]);
         first.revision = d.revision();
         assert!(matches!(
@@ -2945,9 +2961,9 @@ mod tests {
 
     #[test]
     fn only_retryable_verified_reports_release_the_exact_image_window() {
-        let now = Instant::now();
+        let now = fixture_epoch();
 
-        let consumed = Detector::new(Limits::default()).unwrap();
+        let consumed = fixture_detector(Limits::default());
         let consumed_window = complete_verified_window(&consumed, now);
         finish_verified_report_window(
             &consumed,
@@ -2962,7 +2978,7 @@ mod tests {
             consumed_window.until
         );
 
-        let retryable = Detector::new(Limits::default()).unwrap();
+        let retryable = fixture_detector(Limits::default());
         let retryable_window = complete_verified_window(&retryable, now);
         finish_verified_report_window(
             &retryable,
@@ -2977,7 +2993,7 @@ mod tests {
             now + Duration::from_secs(1)
         );
 
-        let stale = Detector::new(Limits::default()).unwrap();
+        let stale = fixture_detector(Limits::default());
         let stale_window = complete_verified_window(&stale, now);
         let newer_until = now + Duration::from_secs(120);
         stale
@@ -3006,8 +3022,8 @@ mod tests {
 
     #[test]
     fn match_still_proving_rejects_invalidated_messages() {
-        let d = Detector::new(Limits::default()).unwrap();
-        let now = Instant::now();
+        let d = fixture_detector(Limits::default());
+        let now = fixture_epoch();
         let p = policy();
         let token = (0, 0);
         let job = job(&d, now);
@@ -3045,8 +3061,8 @@ mod tests {
 
     #[test]
     fn match_still_proving_rejects_replaced_attachments() {
-        let d = Detector::new(Limits::default()).unwrap();
-        let now = Instant::now();
+        let d = fixture_detector(Limits::default());
+        let now = fixture_epoch();
         let p = policy();
         let token = (0, 0);
         let job = job(&d, now);
@@ -3117,8 +3133,8 @@ mod tests {
 
     #[test]
     fn attachment_replacement_cancels_an_inflight_hash_job() {
-        let d = Detector::new(Limits::default()).unwrap();
-        let now = Instant::now();
+        let d = fixture_detector(Limits::default());
+        let now = fixture_epoch();
         let p = policy();
         let token = (0, 0);
         let old_job = job(&d, now);
@@ -3170,7 +3186,7 @@ mod tests {
 
     #[test]
     fn exact_common_set_allows_extras_order_and_rejects_overlap_chain() {
-        let now = Instant::now();
+        let now = fixture_epoch();
         let a = post(1, 1, now, &[1, 2]);
         let b = post(2, 2, now, &[2, 1, 3]);
         let c = post(3, 3, now, &[1, 2]);
@@ -3191,7 +3207,7 @@ mod tests {
     }
     #[test]
     fn matcher_agrees_with_small_exhaustive_common_intersection_oracle() {
-        let now = Instant::now();
+        let now = fixture_epoch();
         let values = |mask: u8| (0..4).filter(|i| mask & (1 << i) != 0).collect::<Vec<u8>>();
         for a in 0u8..16 {
             for b in 0u8..16 {
@@ -3214,8 +3230,8 @@ mod tests {
     }
     #[test]
     fn candidates_are_author_guild_and_channel_scoped_and_metadata_is_not_proof() {
-        let now = Instant::now();
-        let d = Detector::new(Limits::default()).unwrap();
+        let now = fixture_epoch();
+        let d = fixture_detector(Limits::default());
         assert!(admit(&d, 1, 10, now).is_none());
         assert!(admit(&d, 2, 10, now).is_none());
         assert!(matches!(
@@ -3255,8 +3271,8 @@ mod tests {
     #[test]
     fn edit_delete_and_guild_loss_cancel_inflight_results_and_duplicate_creates() {
         for kind in 0..3 {
-            let now = Instant::now();
-            let d = Detector::new(Limits::default()).unwrap();
+            let now = fixture_epoch();
+            let d = fixture_detector(Limits::default());
             let j = job(&d, now);
             match kind {
                 0 => d.invalidate(1, 100, 10),
@@ -3272,14 +3288,13 @@ mod tests {
     }
     #[test]
     fn invalidation_reclaims_slots_and_bytes_without_resurrecting_ids() {
-        let now = Instant::now();
-        let d = Detector::new(Limits {
+        let now = fixture_epoch();
+        let d = fixture_detector(Limits {
             max_posts_per_author: 2,
             metadata_bytes: 4096,
             metadata_bytes_per_guild: 4096,
             ..Limits::default()
-        })
-        .unwrap();
+        });
         assert!(admit(&d, 1, 10, now).is_none());
         assert!(admit(&d, 2, 11, now).is_none());
         assert!(admit(&d, 3, 12, now).is_none());
@@ -3331,8 +3346,8 @@ mod tests {
     }
     #[test]
     fn original_window_expires_even_when_hashes_arrive_late() {
-        let now = Instant::now();
-        let d = Detector::new(Limits::default()).unwrap();
+        let now = fixture_epoch();
+        let d = fixture_detector(Limits::default());
         let j = job(&d, now);
         assert_eq!(
             d.complete(
@@ -3352,8 +3367,8 @@ mod tests {
     }
     #[test]
     fn settings_change_drops_old_observations_and_old_job() {
-        let now = Instant::now();
-        let d = Detector::new(Limits::default()).unwrap();
+        let now = fixture_epoch();
+        let d = fixture_detector(Limits::default());
         let j = job(&d, now);
         assert!(matches!(
             d.admit(
@@ -3380,9 +3395,9 @@ mod tests {
     }
     #[test]
     fn config_token_change_clears_an_incomplete_notice_reservation() {
-        let now = Instant::now();
+        let now = fixture_epoch();
         let p = policy();
-        let d = Detector::new(Limits::default()).unwrap();
+        let d = fixture_detector(Limits::default());
         let mut pending = job(&d, now);
         for post in &mut pending.posts {
             post.hashes = None;
@@ -3406,7 +3421,7 @@ mod tests {
             assert!(bucket.reported_until <= now);
         }
 
-        let parked = Detector::new(Limits::default()).unwrap();
+        let parked = fixture_detector(Limits::default());
         let mut parked_pending = job(&parked, now);
         for post in &mut parked_pending.posts {
             post.hashes = None;
@@ -3435,7 +3450,7 @@ mod tests {
             assert!(parked_bucket.reported_until <= now);
         }
 
-        let retry_d = Detector::new(Limits::default()).unwrap();
+        let retry_d = fixture_detector(Limits::default());
         let mut retry_pending = job(&retry_d, now);
         for post in &mut retry_pending.posts {
             post.hashes = None;
@@ -3466,9 +3481,9 @@ mod tests {
 
     #[test]
     fn config_token_change_keeps_a_verified_window() {
-        let now = Instant::now();
+        let now = fixture_epoch();
         let p = policy();
-        let d = Detector::new(Limits::default()).unwrap();
+        let d = fixture_detector(Limits::default());
         let window = complete_verified_window(&d, now);
         let reported_until = d.state.lock().guilds[&1].authors[&2].reported_until;
         let mut next = post(20, 120, now, &[1, 2]);
@@ -3522,8 +3537,8 @@ mod tests {
 
     #[test]
     fn reports_are_throttled_and_failures_never_claim_a_match() {
-        let now = Instant::now();
-        let d = Detector::new(Limits::default()).unwrap();
+        let now = fixture_epoch();
+        let d = fixture_detector(Limits::default());
         let mut pending = job(&d, now);
         for post in &mut pending.posts {
             post.hashes = None;
@@ -3552,14 +3567,13 @@ mod tests {
     }
     #[test]
     fn rate_and_memory_caps_fail_closed_without_reset_on_settings_change() {
-        let now = Instant::now();
-        let d = Detector::new(Limits {
+        let now = fixture_epoch();
+        let d = fixture_detector(Limits {
             max_authors: 1,
             max_authors_per_guild: 1,
             requests_per_author_minute: 5,
             ..Limits::default()
-        })
-        .unwrap();
+        });
         let mut j = job(&d, now);
         clear_stored_hashes(&d);
         for p in &mut j.posts {
@@ -3596,13 +3610,12 @@ mod tests {
     }
     #[test]
     fn invalidation_parks_replay_watermark_without_holding_author_slots() {
-        let now = Instant::now();
-        let d = Detector::new(Limits {
+        let now = fixture_epoch();
+        let d = fixture_detector(Limits {
             max_authors: 1,
             max_authors_per_guild: 1,
             ..Limits::default()
-        })
-        .unwrap();
+        });
         assert!(admit(&d, 1, 10, now).is_none());
         assert!(matches!(
             d.admit(
@@ -3635,13 +3648,12 @@ mod tests {
     }
     #[test]
     fn metadata_budget_and_author_post_limit_do_not_grow() {
-        let now = Instant::now();
-        let d = Detector::new(Limits {
+        let now = fixture_epoch();
+        let d = fixture_detector(Limits {
             metadata_bytes: 4096,
             metadata_bytes_per_guild: 4096,
             ..Limits::default()
-        })
-        .unwrap();
+        });
         for id in 1..100 {
             admit(&d, id, id, now);
         }
@@ -3728,8 +3740,8 @@ mod tests {
 
     #[test]
     fn proven_hashes_keep_a_match_reason_and_evidence_when_download_is_marked_failed() {
-        let now = Instant::now();
-        let d = Detector::new(Limits::default()).unwrap();
+        let now = fixture_epoch();
+        let d = fixture_detector(Limits::default());
         let Report::Verified(image_match) = complete_report(&d, job(&d, now), &policy(), true, now)
             .expect("a hash-proven match is a hit")
         else {
@@ -3753,8 +3765,8 @@ mod tests {
 
     #[test]
     fn blocked_download_is_not_a_successful_spam_hit() {
-        let now = Instant::now();
-        let d = Detector::new(Limits::default()).unwrap();
+        let now = fixture_epoch();
+        let d = fixture_detector(Limits::default());
         let mut pending = job(&d, now);
         for post in &mut pending.posts {
             post.hashes = None;
@@ -3791,12 +3803,11 @@ mod tests {
 
     #[test]
     fn comparison_budget_block_is_not_a_spam_hit() {
-        let now = Instant::now();
-        let detector = Detector::new(Limits {
+        let now = fixture_epoch();
+        let detector = fixture_detector(Limits {
             comparison_steps: 1,
             ..Limits::default()
-        })
-        .unwrap();
+        });
         assert!(matches!(
             detector.complete(job(&detector, now), &policy(), false, transport_gate(), now),
             CompleteOutcome::Report(Report::Unverified(AnalysisGate::ComparisonSteps { .. }))
@@ -3818,11 +3829,10 @@ mod tests {
             "{notice}"
         );
         assert!(!notice.contains("http"), "{notice}");
-        let failed_download = Detector::new(Limits {
+        let failed_download = fixture_detector(Limits {
             comparison_steps: 1,
             ..Limits::default()
-        })
-        .unwrap();
+        });
         assert!(matches!(
             failed_download.complete(
                 job(&failed_download, now),
@@ -3892,8 +3902,8 @@ mod tests {
 
     #[test]
     fn in_flight_proven_match_replaces_a_blocked_notice_window() {
-        let now = Instant::now();
-        let detector = Detector::new(Limits::default()).unwrap();
+        let now = fixture_epoch();
+        let detector = fixture_detector(Limits::default());
         let mut pending = job(&detector, now);
         for post in &mut pending.posts {
             post.hashes = None;
@@ -4048,12 +4058,18 @@ mod tests {
     enum DispatchChange {
         None,
         PurgeLastHour,
+        UnrelatedRuleDuringBan,
+        AddHashDuringSweep,
         DryRunPurge,
+        EditRule,
+        RemoveRule,
         RemoveHash,
         Invalidate,
         Expire,
         OwnDeleteEcho,
+        OwnBulkDeleteEcho,
         ExternalDeleteDuringRequest,
+        UnknownMessageWithoutEcho,
         OwnEchoAndExternalDelete,
         OwnEchoAndExternalBulkDelete,
         OwnEchoAndRemoveHash,
@@ -4213,7 +4229,10 @@ mod tests {
         .unwrap();
         if matches!(
             change,
-            DispatchChange::PurgeLastHour | DispatchChange::DryRunPurge
+            DispatchChange::PurgeLastHour
+                | DispatchChange::UnrelatedRuleDuringBan
+                | DispatchChange::AddHashDuringSweep
+                | DispatchChange::DryRunPurge
         ) {
             rule.actions[1].purge_last_hour = true;
         }
@@ -4244,7 +4263,15 @@ mod tests {
         crate::db::upsert_log_channel(&app.db, 1, "automod", 999)
             .await
             .unwrap();
-        let purge = matches!(change, DispatchChange::PurgeLastHour);
+        let purge = matches!(
+            change,
+            DispatchChange::PurgeLastHour
+                | DispatchChange::UnrelatedRuleDuringBan
+                | DispatchChange::AddHashDuringSweep
+        );
+        let add_hash_during_sweep = matches!(change, DispatchChange::AddHashDuringSweep);
+        // A separate writer does not update the bot's in-process configuration floor.
+        let sweep_writer = add_hash_during_sweep.then(|| crate::db::Db::open(&path, 2).unwrap());
         if !log_post_delay.is_zero() || purge {
             crate::db::upsert_log_channel(&app.db, 1, "automod_delete", 998)
                 .await
@@ -4260,6 +4287,8 @@ mod tests {
         app.poll_config_version().await.unwrap();
         let cfg = app.configs.get(&app.db, 1).await.unwrap();
         let policy = policy_for_config(&cfg, cfg.rules.get("attachment_flood").unwrap()).unwrap();
+        let mut unrelated_rule = cfg.rules["velocity"].clone();
+        unrelated_rule.log_automod = !unrelated_rule.log_automod;
         assert_eq!(
             policy.enforce,
             !matches!(change, DispatchChange::DryRunPurge)
@@ -4324,6 +4353,10 @@ mod tests {
             }
             .message(ctx.clone(), message.clone())
             .await;
+            if add_hash_during_sweep {
+                app.recent_messages
+                    .remember(1, 99, 198, 989, message.timestamp.timestamp_millis());
+            }
             message.id = 991.into();
             crate::handlers::Handler {
                 app: Arc::clone(&app),
@@ -4376,9 +4409,20 @@ mod tests {
                                     .push(serde_json::from_str::<serde_json::Value>(body).unwrap());
                             }
                         }
-                        let status = (method == "DELETE"
-                            && matches!(change, DispatchChange::ExternalDeleteDuringRequest))
-                        .then_some("404 Not Found");
+                        let status = match change {
+                            DispatchChange::ExternalDeleteDuringRequest if method == "DELETE" => {
+                                Some(("404 Not Found", ""))
+                            }
+                            DispatchChange::UnknownMessageWithoutEcho
+                                if method == trigger.0 && path.ends_with(&trigger.1) =>
+                            {
+                                Some((
+                                    "404 Not Found",
+                                    r#"{"code":10008,"message":"Unknown Message"}"#,
+                                ))
+                            }
+                            _ => None,
+                        };
                         use serenity::client::EventHandler;
                         use serenity::model::id::{ChannelId, MessageId};
                         let handler = crate::handlers::Handler {
@@ -4388,6 +4432,7 @@ mod tests {
                             && matches!(
                                 change,
                                 DispatchChange::OwnDeleteEcho
+                                    | DispatchChange::OwnBulkDeleteEcho
                                     | DispatchChange::ExternalDeleteDuringRequest
                                     | DispatchChange::OwnEchoAndExternalDelete
                                     | DispatchChange::OwnEchoAndExternalBulkDelete
@@ -4399,12 +4444,21 @@ mod tests {
                             let parts: Vec<_> = path.split('/').collect();
                             let message = parts.last().unwrap().parse::<u64>().unwrap();
                             let channel = parts[parts.len() - 3].parse::<u64>().unwrap();
-                            runtime.block_on(handler.message_delete(
-                                server_ctx.clone(),
-                                ChannelId::new(channel),
-                                MessageId::new(message),
-                                Some(GuildId::new(1)),
-                            ));
+                            if matches!(change, DispatchChange::OwnBulkDeleteEcho) {
+                                runtime.block_on(handler.message_delete_bulk(
+                                    server_ctx.clone(),
+                                    ChannelId::new(channel),
+                                    vec![MessageId::new(message), MessageId::new(80)],
+                                    Some(GuildId::new(1)),
+                                ));
+                            } else {
+                                runtime.block_on(handler.message_delete(
+                                    server_ctx.clone(),
+                                    ChannelId::new(channel),
+                                    MessageId::new(message),
+                                    Some(GuildId::new(1)),
+                                ));
+                            }
                             assert_eq!(
                                 server_app.image_spam.author_of(1, channel, message),
                                 None,
@@ -4430,7 +4484,54 @@ mod tests {
                             | DispatchChange::PurgeLastHour
                             | DispatchChange::DryRunPurge
                             | DispatchChange::OwnDeleteEcho
+                            | DispatchChange::OwnBulkDeleteEcho
+                            | DispatchChange::UnknownMessageWithoutEcho
                             | DispatchChange::ExternalDeleteDuringRequest => {}
+                            DispatchChange::EditRule => {
+                                rule.whitelist_users.push(99);
+                                runtime
+                                    .block_on(crate::db::upsert_rule(
+                                        &server_app.db,
+                                        1,
+                                        "attachment_flood",
+                                        &rule,
+                                    ))
+                                    .unwrap();
+                            }
+                            DispatchChange::RemoveRule => {
+                                runtime
+                                    .block_on(crate::db::delete_rule(
+                                        &server_app.db,
+                                        1,
+                                        "attachment_flood",
+                                    ))
+                                    .unwrap();
+                            }
+                            DispatchChange::UnrelatedRuleDuringBan => {
+                                runtime
+                                    .block_on(crate::db::upsert_rule(
+                                        &server_app.db,
+                                        1,
+                                        "velocity",
+                                        &unrelated_rule,
+                                    ))
+                                    .unwrap();
+                            }
+                            DispatchChange::AddHashDuringSweep => {
+                                let saved = runtime
+                                    .block_on(crate::db::apply_control(
+                                        sweep_writer.as_ref().unwrap(),
+                                        None,
+                                        crate::db::ControlOp::AddKnownBadImage {
+                                            scope: scope.clone(),
+                                            hash: "03".repeat(32),
+                                            note: None,
+                                        },
+                                        None,
+                                    ))
+                                    .unwrap();
+                                assert!(matches!(saved, crate::db::ControlReply::Saved { .. }));
+                            }
                             DispatchChange::OwnEchoAndWhitelistRole => {
                                 let event = serde_json::from_value(serde_json::json!({
                                     "guild_id": "1",
@@ -4565,11 +4666,7 @@ mod tests {
             "live enforcement reaches the request boundary; dry-run never dispatches"
         );
         let seen = lines.lock().clone();
-        let seconds = if matches!(change, DispatchChange::PurgeLastHour) {
-            3600
-        } else {
-            0
-        };
+        let seconds = if purge { 3600 } else { 0 };
         for ban in seen
             .iter()
             .filter(|line| line.starts_with("PUT ") && line.contains("/bans/"))
@@ -4585,7 +4682,25 @@ mod tests {
         if matches!(change, DispatchChange::DryRunPurge) {
             assert!(seen.is_empty(), "{seen:?}");
         }
+        if matches!(change, DispatchChange::UnknownMessageWithoutEcho) {
+            let missing = expected_deletes as u64 - 1;
+            assert_eq!(
+                app.image_spam.author_of(1, 100 + missing, 10 + missing),
+                None
+            );
+            if !known_bad {
+                assert_eq!(app.image_spam.author_of(1, 102, 12), Some(99));
+            }
+            assert!(seen.iter().all(|line| !line.contains("/bans/")), "{seen:?}");
+        }
 
+        if add_hash_during_sweep {
+            assert!(
+                seen.iter()
+                    .all(|line| line != "DELETE /api/v10/channels/198/messages/989"),
+                "the next sweep delete must stop after the hash list changes: {seen:?}"
+            );
+        }
         if purge {
             assert!(
                 seen.iter()
@@ -4616,6 +4731,7 @@ mod tests {
             if matches!(
                 change,
                 DispatchChange::OwnDeleteEcho
+                    | DispatchChange::OwnBulkDeleteEcho
                     | DispatchChange::ExternalDeleteDuringRequest
                     | DispatchChange::OwnEchoAndExternalDelete
                     | DispatchChange::OwnEchoAndExternalBulkDelete
@@ -4702,6 +4818,40 @@ mod tests {
             "/members/99",
             0,
             0,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn image_rule_changes_after_proof_stop_pending_punishment() {
+        for change in [DispatchChange::EditRule, DispatchChange::RemoveRule] {
+            image_dispatch_race(false, change, "GET", "/members/99", 0, 0).await;
+            image_dispatch_race(false, change, "GET", "/bans/99", 3, 0).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn image_ban_purge_rechecks_unchanged_rule_after_unrelated_save() {
+        image_dispatch_race(
+            false,
+            DispatchChange::UnrelatedRuleDuringBan,
+            "PUT",
+            "/bans/99",
+            3,
+            1,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn image_ban_purge_stops_after_another_writer_edits_hashes() {
+        image_dispatch_race(
+            false,
+            DispatchChange::AddHashDuringSweep,
+            "DELETE",
+            "/messages/990",
+            3,
+            1,
         )
         .await;
     }
@@ -4816,10 +4966,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn image_unknown_message_without_echo_invalidates_proof_and_stops() {
+        for (known_bad, route, attempted_deletes) in [
+            (false, "/messages/10", 1),
+            (true, "/messages/10", 1),
+            (false, "/messages/11", 2),
+        ] {
+            image_dispatch_race(
+                known_bad,
+                DispatchChange::UnknownMessageWithoutEcho,
+                "DELETE",
+                route,
+                attempted_deletes,
+                0,
+            )
+            .await;
+        }
+    }
+
+    #[tokio::test]
     async fn repeated_image_own_delete_echoes_preserve_remaining_deletes_and_ban() {
         image_dispatch_race(
             false,
             DispatchChange::OwnDeleteEcho,
+            "DELETE",
+            "/messages/10",
+            3,
+            1,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn repeated_image_own_bulk_delete_echoes_preserve_remaining_deletes_and_ban() {
+        image_dispatch_race(
+            false,
+            DispatchChange::OwnBulkDeleteEcho,
             "DELETE",
             "/messages/10",
             3,
@@ -4976,8 +5158,8 @@ mod tests {
         for guild_wide in [false, true] {
             for echo_first in [false, true] {
                 for retain_live_post in [false, true] {
-                    let detector = Detector::new(Limits::default()).unwrap();
-                    let now = Instant::now();
+                    let detector = fixture_detector(Limits::default());
+                    let now = fixture_epoch();
                     let policy = known_bad_policy();
                     detector.admit(1, 2, post(10, 100, now, &[1]), (0, 0), &policy, now, false);
                     if retain_live_post {
@@ -5036,8 +5218,8 @@ mod tests {
 
     #[test]
     fn own_delete_receipts_cannot_outlive_config_change() {
-        let detector = Detector::new(Limits::default()).unwrap();
-        let now = Instant::now();
+        let detector = fixture_detector(Limits::default());
+        let now = fixture_epoch();
         let policy = known_bad_policy();
         detector.admit(1, 2, post(10, 100, now, &[1]), (0, 0), &policy, now, false);
         let mut deleted = detector.begin_delete(1, 2, (0, 0), 100, 10).unwrap();
@@ -5071,12 +5253,11 @@ mod tests {
 
     #[test]
     fn own_delete_receipts_fail_closed_when_tombstone_is_evicted() {
-        let detector = Detector::new(Limits {
+        let detector = fixture_detector(Limits {
             max_authors_per_guild: 1,
             ..Limits::default()
-        })
-        .unwrap();
-        let now = Instant::now();
+        });
+        let now = fixture_epoch();
         let policy = known_bad_policy();
         detector.admit(1, 2, post(10, 100, now, &[1]), (0, 0), &policy, now, false);
         let mut deleted = detector.begin_delete(1, 2, (0, 0), 100, 10).unwrap();
@@ -5109,8 +5290,8 @@ mod tests {
 
     #[test]
     fn own_delete_proof_requires_success_and_expires_at_original_time() {
-        let detector = Detector::new(Limits::default()).unwrap();
-        let now = Instant::now();
+        let detector = fixture_detector(Limits::default());
+        let now = fixture_epoch();
         let policy = known_bad_policy();
         detector.admit(1, 2, post(10, 100, now, &[1]), (0, 0), &policy, now, false);
         let mut deleted = detector.begin_delete(1, 2, (0, 0), 100, 10).unwrap();
@@ -5160,8 +5341,8 @@ mod tests {
 
     #[test]
     fn own_delete_echo_cannot_revive_an_edited_observation() {
-        let detector = Detector::new(Limits::default()).unwrap();
-        let now = Instant::now();
+        let detector = fixture_detector(Limits::default());
+        let now = fixture_epoch();
         let policy = known_bad_policy();
         detector.admit(1, 2, post(10, 100, now, &[1]), (0, 0), &policy, now, false);
         let mut deleted = detector.begin_delete(1, 2, (0, 0), 100, 10).unwrap();
@@ -5198,7 +5379,7 @@ mod tests {
 
     #[test]
     fn known_bad_hashes_never_match_missing_or_different_data() {
-        let now = Instant::now();
+        let now = fixture_epoch();
         let p = known_bad_policy();
         let mut missing = post(1, 10, now, &[1]);
         missing.hashes = None;
@@ -5217,8 +5398,8 @@ mod tests {
 
     #[test]
     fn failed_job_with_none_hashes_does_not_clear_stored_some() {
-        let now = Instant::now();
-        let d = Detector::new(Limits::default()).unwrap();
+        let now = fixture_epoch();
+        let d = fixture_detector(Limits::default());
         // Two channels do not open a verified window, so complete reaches the merge.
         assert!(admit(&d, 10, 100, now).is_none());
         assert!(matches!(
@@ -5290,8 +5471,8 @@ mod tests {
 
     #[test]
     fn process_restart_clears_incomplete_window() {
-        let now = Instant::now();
-        let a = Detector::new(Limits::default()).unwrap();
+        let now = fixture_epoch();
+        let a = fixture_detector(Limits::default());
         let mut pending = job(&a, now);
         for post in &mut pending.posts {
             post.hashes = None;
@@ -5301,7 +5482,7 @@ mod tests {
             a.complete(pending, &policy(), true, transport_gate(), now),
             CompleteOutcome::Report(Report::Unverified(_))
         ));
-        let b = Detector::new(Limits::default()).unwrap();
+        let b = fixture_detector(Limits::default());
         assert!(b.state.lock().guilds.is_empty());
         assert!(admit(&b, 10, 100, now).is_none());
         assert!(admit(&b, 11, 101, now).is_none());
@@ -5329,12 +5510,11 @@ mod tests {
 
     #[test]
     fn reserve_miss_does_not_charge_author_budget() {
-        let now = Instant::now();
-        let d = Detector::new(Limits {
+        let now = fixture_epoch();
+        let d = fixture_detector(Limits {
             requests_per_author_minute: 5,
             ..Limits::default()
-        })
-        .unwrap();
+        });
         let mut j = job(&d, now);
         clear_stored_hashes(&d);
         for p in &mut j.posts {
@@ -5353,15 +5533,14 @@ mod tests {
 
     #[test]
     fn reserve_miss_after_window_reset_reports_current_counters() {
-        let now = Instant::now();
+        let now = fixture_epoch();
         let expired = now - Duration::from_secs(60);
-        let d = Detector::new(Limits {
+        let d = fixture_detector(Limits {
             requests_per_minute: 100,
             requests_per_guild_minute: 100,
             requests_per_author_minute: 1,
             ..Limits::default()
-        })
-        .unwrap();
+        });
         let mut author_job = job(&d, now);
         clear_stored_hashes(&d);
         for post in &mut author_job.posts {
@@ -5387,13 +5566,12 @@ mod tests {
             })
         ));
 
-        let process = Detector::new(Limits {
+        let process = fixture_detector(Limits {
             requests_per_minute: 1,
             requests_per_guild_minute: 100,
             requests_per_author_minute: 100,
             ..Limits::default()
-        })
-        .unwrap();
+        });
         let mut process_job = job(&process, now);
         clear_stored_hashes(&process);
         for post in &mut process_job.posts {
@@ -5499,8 +5677,8 @@ mod tests {
 
     #[test]
     fn parked_watermark_restores_blocked_notice_for_incomplete_window() {
-        let now = Instant::now();
-        let d = Detector::new(Limits::default()).unwrap();
+        let now = fixture_epoch();
+        let d = fixture_detector(Limits::default());
         let mut pending = job(&d, now);
         for post in &mut pending.posts {
             post.hashes = None;
@@ -6859,8 +7037,8 @@ mod tests {
 
     #[test]
     fn non_match_complete_stores_some_then_failed_job_preserves_hashes() {
-        let now = Instant::now();
-        let d = Detector::new(Limits::default()).unwrap();
+        let now = fixture_epoch();
+        let d = fixture_detector(Limits::default());
         assert!(admit(&d, 10, 100, now).is_none());
         assert!(matches!(
             d.admit(
@@ -6920,8 +7098,8 @@ mod tests {
 
     #[test]
     fn verified_window_blocks_late_none_or_different_some_hash_writebacks() {
-        let now = Instant::now();
-        let d = Detector::new(Limits::default()).unwrap();
+        let now = fixture_epoch();
+        let d = fixture_detector(Limits::default());
         complete_report(&d, job(&d, now), &policy(), false, now).unwrap();
         let stored = d.state.lock().guilds[&1].authors[&2].posts[0]
             .hashes
@@ -6970,8 +7148,8 @@ mod tests {
 
     #[test]
     fn stored_some_survives_unverified_none_and_second_unverified_is_suppressed() {
-        let now = Instant::now();
-        let d = Detector::new(Limits::default()).unwrap();
+        let now = fixture_epoch();
+        let d = fixture_detector(Limits::default());
         assert!(admit(&d, 10, 100, now).is_none());
         assert!(matches!(
             d.admit(
@@ -7043,8 +7221,8 @@ mod tests {
 
     #[test]
     fn incomplete_parked_author_restores_and_suppresses_second_failure() {
-        let now = Instant::now();
-        let d = Detector::new(Limits::default()).unwrap();
+        let now = fixture_epoch();
+        let d = fixture_detector(Limits::default());
         let mut pending = job(&d, now);
         for post in &mut pending.posts {
             post.hashes = None;
@@ -7085,8 +7263,8 @@ mod tests {
 
     #[test]
     fn partial_job_writes_only_posts_with_some_hashes() {
-        let now = Instant::now();
-        let d = Detector::new(Limits::default()).unwrap();
+        let now = fixture_epoch();
+        let d = fixture_detector(Limits::default());
         job(&d, now);
         clear_stored_hashes(&d);
         let posts = d.state.lock().guilds[&1].authors[&2].posts.clone();
@@ -7116,8 +7294,8 @@ mod tests {
 
     #[test]
     fn verified_parked_watermark_clears_blocked_flag_and_blocks_admit_until_retryable() {
-        let now = Instant::now();
-        let d = Detector::new(Limits::default()).unwrap();
+        let now = fixture_epoch();
+        let d = fixture_detector(Limits::default());
         let window = complete_verified_window(&d, now);
         d.invalidate_author(1, 2);
         assert!(
@@ -7147,12 +7325,11 @@ mod tests {
 
     #[test]
     fn reserve_success_then_failed_complete_keeps_budget_charged() {
-        let now = Instant::now();
-        let d = Detector::new(Limits {
+        let now = fixture_epoch();
+        let d = fixture_detector(Limits {
             requests_per_author_minute: 20,
             ..Limits::default()
-        })
-        .unwrap();
+        });
         let mut job = job(&d, now);
         for post in &mut job.posts {
             post.hashes = None;
@@ -7177,8 +7354,8 @@ mod tests {
 
     #[test]
     fn reserve_skips_posts_that_already_have_hashes() {
-        let now = Instant::now();
-        let d = Detector::new(Limits::default()).unwrap();
+        let now = fixture_epoch();
+        let d = fixture_detector(Limits::default());
         let mut job = job(&d, now);
         clear_stored_hashes(&d);
         for (index, post) in job.posts.iter_mut().enumerate() {
@@ -7207,8 +7384,8 @@ mod tests {
 
     #[test]
     fn prune_past_keep_drops_watermark_and_guild() {
-        let now = Instant::now();
-        let d = Detector::new(Limits::default()).unwrap();
+        let now = fixture_epoch();
+        let d = fixture_detector(Limits::default());
         let mut pending = job(&d, now);
         for post in &mut pending.posts {
             post.hashes = None;
@@ -7227,14 +7404,13 @@ mod tests {
 
     #[test]
     fn reserve_counts_hashes_stored_since_admission() {
-        let now = Instant::now();
-        let covered = Detector::new(Limits {
+        let now = fixture_epoch();
+        let covered = fixture_detector(Limits {
             requests_per_minute: 2,
             requests_per_guild_minute: 100,
             requests_per_author_minute: 2,
             ..Limits::default()
-        })
-        .unwrap();
+        });
         let mut stale = job(&covered, now);
         for post in &mut stale.posts {
             post.hashes = None;
@@ -7247,13 +7423,12 @@ mod tests {
         assert!(stale.posts.iter().all(|post| post.hashes.is_some()));
         assert_eq!(covered.author_budget_requests(1, 2), before);
 
-        let partial = Detector::new(Limits {
+        let partial = fixture_detector(Limits {
             requests_per_minute: 4,
             requests_per_guild_minute: 100,
             requests_per_author_minute: 4,
             ..Limits::default()
-        })
-        .unwrap();
+        });
         let mut partial_job = job(&partial, now);
         {
             let mut state = partial.state.lock();
@@ -7285,13 +7460,12 @@ mod tests {
         assert!(partial_job.posts[2].hashes.is_none());
         assert_eq!(partial.author_budget_requests(1, 2), 4);
 
-        let tight = Detector::new(Limits {
+        let tight = fixture_detector(Limits {
             requests_per_minute: 100,
             requests_per_guild_minute: 100,
             requests_per_author_minute: 3,
             ..Limits::default()
-        })
-        .unwrap();
+        });
         let mut tight_job = job(&tight, now);
         {
             let mut state = tight.state.lock();
@@ -7325,8 +7499,8 @@ mod tests {
 
     #[test]
     fn budget_miss_does_not_notify_when_live_hashes_cover_posts() {
-        let now = Instant::now();
-        let d = Detector::new(Limits::default()).unwrap();
+        let now = fixture_epoch();
+        let d = fixture_detector(Limits::default());
         let policy = policy();
         for (id, channel, values) in [(10, 100, [1, 2]), (11, 101, [3, 4]), (12, 102, [5, 6])] {
             let mut observed = post(id, channel, now, &values);
@@ -7384,8 +7558,8 @@ mod tests {
 
     #[test]
     fn budget_miss_still_notifies_when_a_live_hash_is_missing() {
-        let now = Instant::now();
-        let d = Detector::new(Limits::default()).unwrap();
+        let now = fixture_epoch();
+        let d = fixture_detector(Limits::default());
         let policy = policy();
         for (id, channel, values) in [(10, 100, [1, 2]), (11, 101, [3, 4]), (12, 102, [5, 6])] {
             let mut observed = post(id, channel, now, &values);
@@ -7428,8 +7602,8 @@ mod tests {
 
     #[test]
     fn release_incomplete_notice_does_not_clear_verified_window() {
-        let now = Instant::now();
-        let d = Detector::new(Limits::default()).unwrap();
+        let now = fixture_epoch();
+        let d = fixture_detector(Limits::default());
         let window = complete_verified_window(&d, now);
         let until = d.state.lock().guilds[&1].authors[&2].reported_until;
         d.release_incomplete_notice(1, 2, window, now + Duration::from_secs(1));
@@ -7439,8 +7613,8 @@ mod tests {
 
     #[test]
     fn release_incomplete_notice_clears_parked_watermark() {
-        let now = Instant::now();
-        let d = Detector::new(Limits::default()).unwrap();
+        let now = fixture_epoch();
+        let d = fixture_detector(Limits::default());
         let mut pending = job(&d, now);
         for post in &mut pending.posts {
             post.hashes = None;

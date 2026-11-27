@@ -16,8 +16,8 @@ use std::time::{Duration, Instant};
 #[cfg(debug_assertions)]
 pub use crate::db_compat::test_drop_next_commit_response;
 use crate::db_compat::{
-    Connection, DbRuntime, OptionalExtension, Row, Value, database_operation_timed_out,
-    params_from_iter,
+    BEGIN_PRIMARY_SNAPSHOT, Connection, DbRuntime, OptionalExtension, Row, Value,
+    database_operation_timed_out, local_database_timeout_operation, params_from_iter,
 };
 #[doc(hidden)]
 pub use crate::db_compat::{
@@ -125,6 +125,9 @@ pub fn set_user_version_unfenced(path: &Path, version: i64) -> Result<()> {
 /// Startup and the bot keep this bound. Interactive API work uses
 /// [`API_REMOTE_OPERATION_TIMEOUT`].
 const REMOTE_OPERATION_TIMEOUT: Duration = Duration::from_secs(75);
+
+const WAIT_FOR_CONNECTION: &str = "waiting for connection";
+const CHECKOUT_CONNECTION: &str = "checking out connection";
 
 /// Interactive API and web database work must fail inside the browser abort.
 /// Two of these plus one Discord call stay under that 30 second budget.
@@ -465,6 +468,8 @@ type BeforeFinalLeaseHook = Box<dyn FnOnce() + Send>;
 type BeforeFinalLeaseReread = Arc<Mutex<Option<BeforeFinalLeaseHook>>>;
 #[cfg(test)]
 type DuringLeasedGuildCommit = Arc<Mutex<Option<BeforeFinalLeaseHook>>>;
+#[cfg(test)]
+type AdvisedClaimHook = Box<dyn FnOnce() + Send>;
 
 #[derive(Clone)]
 pub struct Db {
@@ -502,6 +507,10 @@ pub struct Db {
     before_final_lease_reread: BeforeFinalLeaseReread,
     #[cfg(test)]
     during_leased_guild_commit: DuringLeasedGuildCommit,
+    #[cfg(test)]
+    after_advised_due_read: Arc<Mutex<Option<AdvisedClaimHook>>>,
+    #[cfg(test)]
+    after_advised_busy: Arc<Mutex<Option<AdvisedClaimHook>>>,
     #[cfg(debug_assertions)]
     test_config_snapshot: Arc<Mutex<Option<(u64, String, ConfigParts)>>>,
 }
@@ -1169,6 +1178,10 @@ impl Db {
                 before_final_lease_reread: Arc::new(Mutex::new(None)),
                 #[cfg(test)]
                 during_leased_guild_commit: Arc::new(Mutex::new(None)),
+                #[cfg(test)]
+                after_advised_due_read: Arc::new(Mutex::new(None)),
+                #[cfg(test)]
+                after_advised_busy: Arc::new(Mutex::new(None)),
                 #[cfg(debug_assertions)]
                 test_config_snapshot: Arc::new(Mutex::new(None)),
             })
@@ -1345,25 +1358,62 @@ impl Db {
         F: FnOnce(&mut Connection) -> Result<T> + Send + 'static,
         T: Send + 'static,
     {
+        self.with_conn_before(None, f).await
+    }
+
+    async fn with_conn_before<T, F>(
+        &self,
+        write_deadline: Option<tokio::time::Instant>,
+        f: F,
+    ) -> Result<T>
+    where
+        F: FnOnce(&mut Connection) -> Result<T> + Send + 'static,
+        T: Send + 'static,
+    {
+        if let Some(deadline) = write_deadline {
+            self.connections
+                .runtime
+                .remaining_until(WAIT_FOR_CONNECTION, deadline)?;
+        }
         if !self.remote {
-            return self.with_ungated_conn(f).await;
+            return self.with_conn_inner(f, None, write_deadline).await;
         }
         let gate = &self.connections.outage;
         let generation = match gate.admit()? {
             Admission::Work(generation) => generation,
             Admission::Probe(probe) => {
                 let result = self
-                    .with_ungated_conn(|conn| {
-                        let tx = conn.transaction_primary_snapshot()?;
-                        tx.query_row("SELECT 1", (), |_| Ok(()))?;
-                        tx.finish_read()
-                    })
+                    .with_conn_inner(
+                        move |conn| {
+                            let tx = conn.transaction_primary_snapshot_before(write_deadline)?;
+                            tx.query_row("SELECT 1", (), |_| Ok(()))?;
+                            tx.finish_read()
+                        },
+                        None,
+                        write_deadline,
+                    )
                     .await;
-                probe.finish(result)?
+                match result {
+                    Err(error)
+                        if write_deadline.is_some()
+                            && matches!(
+                                local_database_timeout_operation(&error),
+                                Some(
+                                    WAIT_FOR_CONNECTION
+                                        | CHECKOUT_CONNECTION
+                                        | BEGIN_PRIMARY_SNAPSHOT
+                                )
+                            ) =>
+                    {
+                        probe.release_without_attempt();
+                        return Err(error);
+                    }
+                    result => probe.finish(result)?,
+                }
             }
         };
         let started = Instant::now();
-        self.with_conn_inner(f, Some(generation))
+        self.with_conn_inner(f, Some(generation), write_deadline)
             .await
             .map_err(|error| gate.record_failure(generation, started.elapsed(), error))
     }
@@ -1373,27 +1423,41 @@ impl Db {
         F: FnOnce(&mut Connection) -> Result<T> + Send + 'static,
         T: Send + 'static,
     {
-        self.with_conn_inner(f, None).await
+        self.with_conn_inner(f, None, None).await
     }
 
-    async fn with_conn_inner<T, F>(&self, f: F, generation: Option<u64>) -> Result<T>
+    async fn with_conn_inner<T, F>(
+        &self,
+        f: F,
+        generation: Option<u64>,
+        write_deadline: Option<tokio::time::Instant>,
+    ) -> Result<T>
     where
         F: FnOnce(&mut Connection) -> Result<T> + Send + 'static,
         T: Send + 'static,
     {
         let acquire = Arc::clone(&self.permits).acquire_owned();
-        let permit = match self.permit_timeout {
-            Some(timeout) => tokio::time::timeout(timeout, acquire)
+        let runtime = &self.connections.runtime;
+        let permit = match (write_deadline, self.permit_timeout) {
+            (Some(deadline), permit_timeout) => {
+                runtime
+                    .wait_locally_before(WAIT_FOR_CONNECTION, deadline, permit_timeout, acquire)
+                    .await?
+            }
+            (None, Some(timeout)) => tokio::time::timeout(timeout, acquire)
                 .await
-                .map_err(|_| database_operation_timed_out("waiting for connection", timeout))?,
-            None => acquire.await,
+                .map_err(|_| database_operation_timed_out(WAIT_FOR_CONNECTION, timeout))?,
+            (None, None) => acquire.await,
         }
         .context("database connection limiter closed")?;
         let connections = Arc::clone(&self.connections);
         let required_config_version = Arc::clone(&self.required_config_version);
         let config_write_generation = Arc::clone(&self.config_write_generation);
         let config_floor_lock = Arc::clone(&self.config_floor_lock);
-        run_cancellable_db_work(move || {
+        let (checked_out, checkout) = write_deadline
+            .map(|_| tokio::sync::oneshot::channel())
+            .unzip();
+        let work = run_cancellable_db_work(move || {
             // The permit belongs to the blocking task, not its awaiter. Tokio
             // cannot cancel blocking work, so an aborted request must not let
             // another operation exceed the configured pool bound. Dropping the
@@ -1401,10 +1465,20 @@ impl Db {
             // back and return the permit instead of keeping both until the
             // operation deadline.
             let _permit = permit;
+            if let Some(deadline) = write_deadline {
+                connections
+                    .runtime
+                    .remaining_until(CHECKOUT_CONNECTION, deadline)?;
+            }
             if let Some(generation) = generation {
                 connections.outage.check(generation)?;
             }
             let mut connection = ConnectionLease::checkout(connections)?;
+            if let Some(checked_out) = checked_out {
+                checked_out
+                    .send(())
+                    .map_err(|_| anyhow::anyhow!("database connection checkout abandoned"))?;
+            }
             let result = f(&mut connection);
             if result.is_ok()
                 || result
@@ -1434,8 +1508,27 @@ impl Db {
                 connection.discard();
             }
             result
-        })
-        .await
+        });
+        tokio::pin!(work);
+        if let (Some(deadline), Some(mut checkout)) = (write_deadline, checkout) {
+            // Bound dispatch to the blocking pool and stream reset. After
+            // checkout, the transaction owns the deadline and any cleanup.
+            tokio::select! {
+                biased;
+                result = runtime.wait_locally_before(CHECKOUT_CONNECTION, deadline, None, &mut checkout) => {
+                    if let Err(error) = result {
+                        // Prevent SQL from starting if expiry won the handoff.
+                        // If the worker already sent, await its actual outcome.
+                        checkout.close();
+                        if checkout.try_recv().is_err() {
+                            return Err(error);
+                        }
+                    }
+                }
+                result = &mut work => return result,
+            }
+        }
+        work.await
     }
 
     /// Serialized, dedicated connection for the two narrow lease CAS operations.

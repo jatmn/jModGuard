@@ -380,30 +380,38 @@ pub async fn clear_erased_placement(
         guild > 0 && expected.guild_id() == guild,
         "invalid guild id"
     );
-    let store_id = expected.store_id().as_str().to_owned();
-    let revision = expected.revision().to_owned();
+    let expected = expected.clone();
     db.with_conn(move |conn| {
         let mut tx = conn.transaction_primary_write()?;
-        match placement_conn(&tx, guild)? {
-            Some(current)
-                if current.store_id.as_str() == store_id && current.revision == revision =>
-            {
-                tx.prepare_reclaim()?;
-                tx.execute_reclaim(
-                    "DELETE FROM guild_store_placements WHERE guild_id=?1 AND store_id=?2 AND revision=?3",
-                    params![guild, store_id.as_str(), revision.as_str()],
-                )?;
-                tx.commit()?;
-                Ok(true)
-            }
-            None => {
-                tx.finish_read()?;
-                Ok(false)
-            }
-            Some(_) => Err(CatalogConflict::Placement.into()),
+        refuse_fenced_write(&tx, guild)?;
+        let cleared = clear_erased_placement_conn(&mut tx, &expected)?;
+        if cleared {
+            tx.commit()?;
+        } else {
+            tx.finish_read()?;
         }
+        Ok(cleared)
     })
     .await
+}
+
+/// Caller holds the fenced primary write transaction. False proves absence.
+pub(super) fn clear_erased_placement_conn(
+    tx: &mut crate::db_compat::Transaction,
+    expected: &GuildPlacement,
+) -> Result<bool> {
+    let guild = expected.guild_id();
+    let Some(current) = placement_conn(tx, guild)? else {
+        return Ok(false);
+    };
+    anyhow::ensure!(&current == expected, GuildWriteFenced);
+    tx.prepare_reclaim()?;
+    let removed = tx.execute_reclaim(
+        "DELETE FROM guild_store_placements WHERE guild_id=?1 AND store_id=?2 AND revision=?3",
+        params![guild, expected.store_id().as_str(), expected.revision()],
+    )?;
+    anyhow::ensure!(removed == 1, GuildWriteFenced);
+    Ok(true)
 }
 
 pub async fn shared_store_registration(db: &Db) -> Result<Option<StoreRegistration>> {

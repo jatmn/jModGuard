@@ -7,12 +7,12 @@ use crate::db::guild_data::{
 };
 use crate::db::guild_stores::{
     GuildWriteFenced, StoreId, StorePolicy, StoreRegistration, admit_tenant_placement,
-    clear_erased_placement, dedicated_store_registration, guild_is_write_fenced, guild_placement,
-    register_store, shared_store_registration,
+    dedicated_store_registration, guild_is_write_fenced, guild_placement, register_store,
+    shared_store_registration,
 };
 use crate::db::{
-    self, Db, GuildEnrollment, GuildErasureJob, SqlExecutor, finish_guild_erasure,
-    next_guild_erasure_after, queue_guild_erasure, wipe_departed_directory_guild_data,
+    self, Db, ErasureCoreProgress, ErasureCoreStep, GuildEnrollment, GuildErasureJob, SqlExecutor,
+    advance_erasure_core_step, finish_guild_erasure, next_guild_erasure_after, queue_guild_erasure,
 };
 use crate::db_compat::OptionalExtension;
 use anyhow::{Context, Result, anyhow, bail};
@@ -73,14 +73,14 @@ impl ErasureCursor {
 
 // Process-local progress only. On failure/cancellation the durable job is replayed
 // from its captured identities; each operation rechecks its own prerequisites.
+#[cfg_attr(test, derive(PartialEq))]
 enum ErasurePhase {
     CloseMembership,
     CancelEvidence,
     CleanupEvidence,
     PurgeCases,
     EraseScope,
-    Directory,
-    Placement,
+    Core(ErasureCoreStep),
     FinishJob,
 }
 
@@ -967,6 +967,8 @@ impl TenantRuntime {
         Ok(())
     }
 
+    /// Returns true when a job is settled, including a superseded job.
+    /// A write fence defers erasure to a later tick.
     pub async fn drive_erasure(&self) -> Result<bool> {
         let job = {
             let mut cursor = self.inner.erasure_cursor.lock().await;
@@ -981,11 +983,15 @@ impl TenantRuntime {
             return Ok(false);
         };
         let guild_id = job.guild_id;
-        {
+        let completed = {
             let lock = self.lock(guild_id);
             let _guard = lock.lock().await;
-            self.erase_job(&job).await?;
-        }
+            match self.erase_job(&job).await {
+                Ok(()) => true,
+                Err(error) if error.is::<GuildWriteFenced>() => false,
+                Err(error) => return Err(error),
+            }
+        };
         let mut locks = self.inner.locks.lock();
         if locks
             .get(&guild_id)
@@ -993,20 +999,22 @@ impl TenantRuntime {
         {
             locks.remove(&guild_id);
         }
-        Ok(true)
+        Ok(completed)
     }
 
     async fn erase_job(&self, job: &GuildErasureJob) -> Result<()> {
         if guild_is_write_fenced(&self.core, job.guild_id).await? {
-            return Ok(());
+            return Err(GuildWriteFenced.into());
         }
         let handle = self.handle(job.placement.store_id()).await?;
         let scope = GuildDataScope::new(job.placement.clone(), job.enrollment.clone())?;
         let mut phase = match handle.finish_empty_erasure_progress(scope.clone()).await? {
-            ErasureProgress::Complete => ErasurePhase::Directory,
+            ErasureProgress::Complete => ErasurePhase::Core(ErasureCoreStep::Directory),
             ErasureProgress::Remaining => ErasurePhase::CloseMembership,
         };
         loop {
+            #[cfg(test)]
+            tests::before_erasure_phase(&self.core, job.guild_id, &phase).await;
             phase = match phase {
                 ErasurePhase::CloseMembership => {
                     handle.close_membership(scope.clone()).await?;
@@ -1046,22 +1054,27 @@ impl TenantRuntime {
                 ErasurePhase::EraseScope => {
                     match handle.erase_closed_scope_progress(scope.clone()).await? {
                         ErasureProgress::Remaining => ErasurePhase::EraseScope,
-                        ErasureProgress::Complete => ErasurePhase::Directory,
+                        ErasureProgress::Complete => ErasurePhase::Core(ErasureCoreStep::Directory),
                     }
                 }
-                ErasurePhase::Directory => {
-                    if !wipe_departed_directory_guild_data(&self.core, job.guild_id).await? {
-                        tracing::info!(
-                            guild_id = job.guild_id,
-                            departed_enrollment = %job.enrollment.id,
-                            "preserved directory data for a newer active guild enrollment"
-                        );
+                ErasurePhase::Core(step) => {
+                    match advance_erasure_core_step(&self.core, job, step).await? {
+                        ErasureCoreProgress::Advanced => match step {
+                            ErasureCoreStep::Directory => {
+                                ErasurePhase::Core(ErasureCoreStep::Placement)
+                            }
+                            ErasureCoreStep::Placement => ErasurePhase::FinishJob,
+                        },
+                        ErasureCoreProgress::Superseded => {
+                            tracing::info!(
+                                guild_id = job.guild_id,
+                                departed_enrollment = %job.enrollment.id,
+                                ?step,
+                                "settled superseded guild erasure job"
+                            );
+                            return Ok(());
+                        }
                     }
-                    ErasurePhase::Placement
-                }
-                ErasurePhase::Placement => {
-                    clear_erased_placement(&self.core, job.guild_id, &job.placement).await?;
-                    ErasurePhase::FinishJob
                 }
                 ErasurePhase::FinishJob => return finish_guild_erasure(&self.core, job).await,
             };

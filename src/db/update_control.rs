@@ -154,6 +154,8 @@ pub struct UpdateControl {
     /// API launcher only: the bot launcher link for paired-upgrade steps.
     launcher: Option<crate::control::WriterLink>,
     launcher_authority: Arc<Mutex<LauncherAuthority>>,
+    #[cfg(feature = "test-support")]
+    launcher_fence_clock: fn() -> std::time::Instant,
 }
 
 /// Immutable application compatibility of this container's baked image. A
@@ -678,6 +680,8 @@ impl UpdateControl {
             writer: None,
             launcher: None,
             launcher_authority: Arc::new(Mutex::new(LauncherAuthority::Unconfirmed)),
+            #[cfg(feature = "test-support")]
+            launcher_fence_clock: std::time::Instant::now,
         }))
     }
 
@@ -687,7 +691,24 @@ impl UpdateControl {
             writer: None,
             launcher: None,
             launcher_authority: Arc::new(Mutex::new(LauncherAuthority::Unconfirmed)),
+            #[cfg(feature = "test-support")]
+            launcher_fence_clock: std::time::Instant::now,
         }
+    }
+
+    /// Drive the local authority horizon from a fixture clock. The persisted
+    /// lease still uses the database writer's wall clock.
+    #[cfg(feature = "test-support")]
+    pub fn with_launcher_fence_clock_for_test(mut self, clock: fn() -> std::time::Instant) -> Self {
+        self.launcher_fence_clock = clock;
+        self
+    }
+
+    fn launcher_fence_clock(&self) -> fn() -> std::time::Instant {
+        #[cfg(feature = "test-support")]
+        return self.launcher_fence_clock;
+        #[cfg(not(feature = "test-support"))]
+        std::time::Instant::now
     }
 
     pub fn with_writer_link(mut self, link: crate::control::WriterLink) -> Self {
@@ -718,7 +739,7 @@ impl UpdateControl {
             && self.db.launcher_instance().is_some()
             && self
                 .launcher_fence_deadline()
-                .is_some_and(|deadline| std::time::Instant::now() < deadline);
+                .is_some_and(|deadline| (self.launcher_fence_clock())() < deadline);
         if !fenced {
             return Ok(ControlReply::Failed {
                 code: None,
@@ -829,7 +850,7 @@ impl UpdateControl {
     fn confirm_launcher_fence(&self, requested_at: std::time::Instant) -> Result<()> {
         let next = requested_at + Duration::from_millis(LAUNCHER_FENCE_TTL_MS as u64);
         anyhow::ensure!(
-            std::time::Instant::now() < next,
+            (self.launcher_fence_clock())() < next,
             "launcher fence acquisition completed too late"
         );
         *self.launcher_authority.lock().unwrap() = LauncherAuthority::ConfirmedUntil(next);
@@ -853,7 +874,8 @@ impl UpdateControl {
         let Some(deadline) = self.launcher_fence_deadline() else {
             return Ok(false);
         };
-        let requested_at = std::time::Instant::now();
+        let monotonic_now = self.launcher_fence_clock();
+        let requested_at = monotonic_now();
         anyhow::ensure!(
             requested_at < deadline,
             "launcher fence authority window expired"
@@ -867,7 +889,7 @@ impl UpdateControl {
                     if conn.execute_lease_cas(
                         crate::db_compat::LAUNCHER_FENCE_CAS,
                         params![next, format!("{instance} "), now],
-                        deadline.saturating_duration_since(std::time::Instant::now()),
+                        deadline.saturating_duration_since(monotonic_now()),
                     )? == 1
                     {
                         return Ok(FenceCas::Renewed);
@@ -893,7 +915,7 @@ impl UpdateControl {
                 FenceCas::Contended => Ok(FenceRenewal::NotRenewed),
                 FenceCas::Missing => {
                     anyhow::ensure!(
-                        std::time::Instant::now() < deadline,
+                        monotonic_now() < deadline,
                         "launcher fence renewal completed too late"
                     );
                     Ok(if self.acquire_launcher_fence().await? {
@@ -909,7 +931,7 @@ impl UpdateControl {
             .context("launcher fence renewal timed out")??;
         // timeout_at can poll a ready response before its timer on a busy executor.
         anyhow::ensure!(
-            std::time::Instant::now() < deadline,
+            monotonic_now() < deadline,
             "launcher fence renewal completed too late"
         );
         match renewal {
@@ -931,7 +953,7 @@ impl UpdateControl {
         if !self.writes_locally() || self.db.launcher_instance().is_none() {
             return Ok(false);
         }
-        let requested_at = std::time::Instant::now();
+        let requested_at = (self.launcher_fence_clock())();
         let renewed = self.acquire_launcher_fence().await?;
         if renewed {
             self.confirm_launcher_fence(requested_at)?;

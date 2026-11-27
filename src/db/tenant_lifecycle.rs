@@ -1,5 +1,7 @@
 //! Directory-side tenant lifecycle: erasure jobs and core wipe.
-use super::guild_stores::{GuildPlacement, StoreId};
+use super::guild_stores::{
+    GuildPlacement, GuildWriteFenced, StoreId, clear_erased_placement_conn, refuse_fenced_write,
+};
 use super::*;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -7,6 +9,18 @@ pub struct GuildErasureJob {
     pub guild_id: i64,
     pub enrollment: GuildEnrollment,
     pub placement: GuildPlacement,
+}
+
+#[derive(Debug, Clone, Copy)]
+#[cfg_attr(test, derive(PartialEq))]
+pub(crate) enum ErasureCoreStep {
+    Directory,
+    Placement,
+}
+
+pub(crate) enum ErasureCoreProgress {
+    Advanced,
+    Superseded,
 }
 
 pub async fn queue_guild_erasure(
@@ -120,38 +134,109 @@ pub(crate) async fn next_guild_erasure_after(
 }
 
 pub async fn finish_guild_erasure(db: &Db, job: &GuildErasureJob) -> Result<()> {
-    let guild = job.guild_id;
+    let job = job.clone();
     db.with_conn(move |conn| {
         let mut tx = conn.transaction_primary_write()?;
-        tx.prepare_reclaim()?;
-        tx.execute_reclaim(
-            "DELETE FROM guild_erasure_jobs WHERE guild_id=?1",
-            params![guild],
-        )?;
+        refuse_fenced_write(&tx, job.guild_id)?;
+        finish_guild_erasure_conn(&mut tx, &job)?;
         tx.commit()
+    })
+    .await
+}
+
+fn finish_guild_erasure_conn(
+    tx: &mut crate::db_compat::Transaction,
+    job: &GuildErasureJob,
+) -> Result<()> {
+    tx.prepare_reclaim()?;
+    let removed = tx.execute_reclaim(
+        "DELETE FROM guild_erasure_jobs WHERE guild_id=?1 AND enrollment_id=?2
+         AND joined_at_ns=?3 AND store_id=?4 AND placement_revision=?5",
+        params![
+            job.guild_id,
+            job.enrollment.id.as_str(),
+            job.enrollment.joined_at_ns,
+            job.placement.store_id().as_str(),
+            job.placement.revision()
+        ],
+    )?;
+    anyhow::ensure!(removed == 1, GuildWriteFenced);
+    Ok(())
+}
+
+pub(crate) async fn advance_erasure_core_step(
+    db: &Db,
+    job: &GuildErasureJob,
+    step: ErasureCoreStep,
+) -> Result<ErasureCoreProgress> {
+    let job = job.clone();
+    db.with_conn(move |conn| {
+        let mut tx = conn.transaction_primary_write()?;
+        refuse_fenced_write(&tx, job.guild_id)?;
+        let current: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM guild_erasure_jobs WHERE guild_id=?1 AND enrollment_id=?2
+             AND joined_at_ns=?3 AND store_id=?4 AND placement_revision=?5)",
+            params![
+                job.guild_id,
+                job.enrollment.id.as_str(),
+                job.enrollment.joined_at_ns,
+                job.placement.store_id().as_str(),
+                job.placement.revision()
+            ],
+            |row| Ok(row.get(0)?),
+        )?;
+        anyhow::ensure!(current, GuildWriteFenced);
+        let advanced = match step {
+            ErasureCoreStep::Directory => {
+                wipe_departed_directory_guild_data_conn(&mut tx, job.guild_id)?
+            }
+            ErasureCoreStep::Placement => clear_erased_placement_conn(&mut tx, &job.placement)?,
+        };
+        let progress = if advanced {
+            ErasureCoreProgress::Advanced
+        } else {
+            // A newer enrollment owns the directory, or the placement is already
+            // absent. Settle only this job while that proof still holds.
+            finish_guild_erasure_conn(&mut tx, &job)?;
+            ErasureCoreProgress::Superseded
+        };
+        tx.commit()?;
+        Ok(progress)
     })
     .await
 }
 
 /// Delete a departed guild's directory-owned configuration and core moderation rows.
 ///
-/// The active-enrollment check and deletes share one primary transaction. A stale
-/// erasure job may still remove its closed guild-store scope, but it must not wipe
-/// directory data after a newer membership has become active.
+/// The write-fence check, active-enrollment check and deletes share one primary
+/// transaction. A stale erasure job may still remove its closed guild-store scope,
+/// but it must not wipe directory data after a newer membership has become active.
 pub async fn wipe_departed_directory_guild_data(db: &Db, guild: i64) -> Result<bool> {
     anyhow::ensure!(guild > 0, "invalid guild id");
     db.with_conn(move |conn| {
         let mut tx = conn.transaction_primary_write()?;
-        if super::enrollments::active_enrollment_conn(&tx, guild)?.is_some() {
+        refuse_fenced_write(&tx, guild)?;
+        let wiped = wipe_departed_directory_guild_data_conn(&mut tx, guild)?;
+        if wiped {
+            tx.commit()?;
+        } else {
             tx.finish_read()?;
-            return Ok(false);
         }
-        tx.prepare_reclaim()?;
-        wipe_directory_guild_data_conn(&tx, guild, true)?;
-        tx.commit()?;
-        Ok(true)
+        Ok(wiped)
     })
     .await
+}
+
+fn wipe_departed_directory_guild_data_conn(
+    tx: &mut crate::db_compat::Transaction,
+    guild: i64,
+) -> Result<bool> {
+    if super::enrollments::active_enrollment_conn(tx, guild)?.is_some() {
+        return Ok(false);
+    }
+    tx.prepare_reclaim()?;
+    wipe_directory_guild_data_conn(tx, guild, true)?;
+    Ok(true)
 }
 
 /// Caller holds the primary write transaction and has proved departure.

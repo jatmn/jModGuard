@@ -1,6 +1,7 @@
 //! Durable action storage with current and captured membership checks.
 use super::*;
 use crate::bot_actions::{Action, Limits};
+use crate::db_compat::Transaction;
 use serde::Deserialize;
 
 // Stored and wire strings remain adapters; unknown values remain readable.
@@ -437,15 +438,87 @@ pub async fn claim_bot_action(db: &Db, now: i64) -> Result<Option<BotAction>> {
         if !due {
             return Ok(None);
         }
-        claim_bot_action_conn(conn, now)
+        claim_bot_action_tx(conn.transaction_immediate()?, now)
     })
     .await
 }
 
 /// Revalidate a positive scheduler advisory on the primary.
 pub async fn claim_advised_bot_action(db: &Db, now: i64) -> Result<Option<BotAction>> {
-    db.with_conn(move |conn| claim_bot_action_conn(conn, now))
-        .await
+    let write_deadline = if db.is_remote() && !db.is_read_only() {
+        let write_deadline = db.connections.runtime.capture_write_deadline();
+        #[cfg(test)]
+        let after_due_read = db.after_advised_due_read.lock().unwrap().take();
+        let result = db
+            .with_conn(move |conn| {
+                claim_advised_bot_action_conn(
+                    conn,
+                    now,
+                    true,
+                    write_deadline,
+                    #[cfg(test)]
+                    after_due_read,
+                )
+            })
+            .await;
+        match result {
+            // A concurrent commit can invalidate a deferred transaction's
+            // promotion. Recheck due work on a fresh primary snapshot.
+            Err(ref error) if crate::db_compat::is_database_busy(error) => {
+                #[cfg(test)]
+                if let Some(hook) = db.after_advised_busy.lock().unwrap().take() {
+                    hook();
+                }
+                write_deadline
+            }
+            result => return result,
+        }
+    } else {
+        None
+    };
+    db.with_conn_before(write_deadline, move |conn| {
+        claim_advised_bot_action_conn(
+            conn,
+            now,
+            false,
+            write_deadline,
+            #[cfg(test)]
+            None,
+        )
+    })
+    .await
+}
+
+fn claim_advised_bot_action_conn(
+    conn: &Connection,
+    now: i64,
+    promote: bool,
+    write_deadline: Option<tokio::time::Instant>,
+    #[cfg(test)] after_due_read: Option<super::AdvisedClaimHook>,
+) -> Result<Option<BotAction>> {
+    let mut tx = if promote {
+        conn.transaction_capture_before(write_deadline, false)?
+    } else {
+        conn.transaction_primary_snapshot_before(write_deadline)?
+    };
+    let due: bool = tx.query_row(&poll_due_sql(), params![now], |r| Ok(r.get(0)?))?;
+    if !due {
+        tx.finish_read()?;
+        return Ok(None);
+    }
+    let tx = if promote {
+        // The positive check and the write share one primary transaction.
+        #[cfg(test)]
+        if let Some(hook) = after_due_read {
+            hook();
+        }
+        tx.prepare_capture_write()?;
+        tx
+    } else {
+        tx.finish_read()?;
+        conn.transaction_immediate_before(write_deadline)?
+    };
+    claim_bot_action_tx(tx, now)
 }
 
 const EXPIRE_UNSTARTED_SQL: &str =
@@ -457,8 +530,7 @@ const MARK_EXPIRED_RUNNING_UNCERTAIN_SQL: &str =
          WHERE id IN (SELECT id FROM bot_actions
          WHERE state='running' AND expires_at<=?1 LIMIT 64)";
 
-fn claim_bot_action_conn(conn: &mut Connection, now: i64) -> Result<Option<BotAction>> {
-    let tx = conn.transaction_immediate()?;
+fn claim_bot_action_tx(tx: Transaction, now: i64) -> Result<Option<BotAction>> {
     tx.execute_matching(EXPIRE_UNSTARTED_SQL, params![now])?;
     tx.execute_matching(MARK_EXPIRED_RUNNING_UNCERTAIN_SQL, params![now])?;
     let job = tx
