@@ -444,8 +444,17 @@ pub async fn claim_bot_action(db: &Db, now: i64) -> Result<Option<BotAction>> {
 
 /// Revalidate a positive scheduler advisory on the primary.
 pub async fn claim_advised_bot_action(db: &Db, now: i64) -> Result<Option<BotAction>> {
-    db.with_conn(move |conn| claim_bot_action_conn(conn, now))
-        .await
+    db.with_conn(move |conn| {
+        // Confirm the hint without reserving the writer or preparing a receipt.
+        let tx = conn.transaction_primary_snapshot()?;
+        let due: bool = tx.query_row(&poll_due_sql(), params![now], |r| Ok(r.get(0)?))?;
+        tx.finish_read()?;
+        if !due {
+            return Ok(None);
+        }
+        claim_bot_action_conn(conn, now)
+    })
+    .await
 }
 
 const EXPIRE_UNSTARTED_SQL: &str =

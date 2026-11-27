@@ -2014,9 +2014,11 @@ async fn scheduler_combines_idle_checks_and_runs_actions_before_expiries() {
         };
         let app = crate::state::BotState::new(Default::default(), f.db.clone()).unwrap();
         app.activation.mark_lock_held(true);
-        if action_due {
-            f.enqueue(GUILD, "queued", unban(ACTION_USER)).await;
-        }
+        let action = if action_due {
+            Some(f.enqueue(GUILD, "queued", unban(ACTION_USER)).await)
+        } else {
+            None
+        };
         if expiry_due {
             let enrollment = db::enroll_guild(&f.db, GUILD, 1).await.unwrap().unwrap();
             db::record_ban(&f.db, GUILD, EXPIRY_USER, None, "temporary")
@@ -2039,6 +2041,12 @@ async fn scheduler_combines_idle_checks_and_runs_actions_before_expiries() {
             .chain(expiry_due.then_some((GUILD, EXPIRY_USER, "Ban duration expired".into())))
             .collect();
         assert_eq!(*discord.unbans.lock().unwrap(), expected);
+        if let Some(action) = action {
+            assert_eq!(
+                f.persisted_status(&action).await,
+                ("succeeded".into(), Some("unbanned".into()))
+            );
+        }
         if !action_due && !expiry_due {
             assert_eq!(
                 probe.queries() - queries,
@@ -2047,6 +2055,96 @@ async fn scheduler_combines_idle_checks_and_runs_actions_before_expiries() {
             );
             assert_eq!(probe.transactions(), transactions);
         }
+    }
+}
+
+#[tokio::test]
+async fn stale_action_advisory_opens_no_primary_write_transaction() {
+    const GUILD: i64 = 10;
+
+    for fenced_overdue in [false, true] {
+        let probe = std::sync::Arc::new(db::StartupProbe::default());
+        let primary = {
+            let _probe = db::enter_startup_probe(Some(probe.clone()));
+            Fixture::new()
+        };
+        let replica = Fixture::new();
+        let hinted = replica.enqueue(GUILD, "queued", unban(20)).await;
+        let (action, now) = if fenced_overdue {
+            let action = primary.enqueue(GUILD, "queued", unban(20)).await;
+            primary.fence_guild(GUILD).await;
+            let now = action.expires_at;
+            (Some(action), now)
+        } else {
+            (None, hinted.created_at)
+        };
+        assert_eq!(
+            db::bot_work_due(&replica.db, now, &[]).await.unwrap(),
+            db::BotWorkDue::Action
+        );
+
+        let app = crate::state::BotState::new(Default::default(), primary.db.clone()).unwrap();
+        app.activation.mark_lock_held(true);
+        let discord = MockDiscord::default();
+        let immediate = probe.immediate();
+        drain_with_advisory_db(&app, &replica.db, &discord, &WorkerLimits::default(), now)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            probe.immediate(),
+            immediate,
+            "a stale hint must skip the write transaction that creates mutation receipts on remote databases"
+        );
+        assert_eq!(discord.calls.load(Ordering::SeqCst), 0);
+        if let Some(action) = action {
+            assert_eq!(
+                primary.persisted_status(&action).await,
+                ("pending".into(), None),
+                "fenced overdue work alone must not record an expiry outcome"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn advised_action_wake_reconciles_overdue_work_without_dispatch() {
+    for (was_running, state, outcome) in [
+        (false, "expired", "expired_before_execution"),
+        (true, "uncertain", "worker_outcome_unknown"),
+    ] {
+        let f = Fixture::new();
+        let action = f.enqueue(10, "overdue", unban(20)).await;
+        if was_running {
+            let claim = db::claim_bot_action(&f.db, action.created_at)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(
+                db::begin_bot_action(&f.db, &claim, action.created_at)
+                    .await
+                    .unwrap()
+            );
+        }
+        let app = crate::state::BotState::new(Default::default(), f.db.clone()).unwrap();
+        app.activation.mark_lock_held(true);
+        let discord = MockDiscord::default();
+
+        drain_with_advisory_db(
+            &app,
+            &f.db,
+            &discord,
+            &WorkerLimits::default(),
+            action.expires_at,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(discord.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            f.persisted_status(&action).await,
+            (state.into(), Some(outcome.into()))
+        );
     }
 }
 
