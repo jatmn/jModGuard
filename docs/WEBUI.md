@@ -440,12 +440,14 @@ directories it writes; the container's root filesystem is not measured because i
 totals belong to the host; database size is on Database Usage), and process facts
 (version, commit, uptime, last restart, restarts in the range, pod, region, ready).
 The memory panel shows estimated capacity and headroom in local 64 MiB blocks
-for fresh, usable readings from disjoint cgroups. It also shows the range's
-peak combined memory in blocks. That peak adds both processes' highest
-readings for each stored minute (hour for 7-day and 30-day ranges) that both
-recorded, so it can overstate the true combined peak. The panel explains when
-a combined figure is unavailable. For shared, overlapping, or unverified
-memory scopes, it shows one available reading. Private mounts can hide the
+for fresh, usable readings from disjoint cgroups. It also shows the peak combined
+memory in blocks over paired periods and how many minutes (hours for 7-day and
+30-day ranges) out of the selected range had memory readings from both processes.
+The peak uses the highest sum of the processes' individual maxima in any paired
+period. The maxima can occur at different times, so their sum can overstate the
+peak within paired periods. Gaps can hide higher peaks. The panel shows a message
+when zero periods have paired memory readings. For shared, overlapping, or
+unverified memory scopes, it shows one available reading. Private mounts can hide the
 ancestry needed to verify separation. Operators can independently verify
 separation and enable a default-off declaration, which the panel labels
 when used. Optional hourly and 30-day USD estimates use the scope comparison

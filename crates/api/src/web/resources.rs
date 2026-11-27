@@ -361,7 +361,7 @@ fn current(status: Option<&ProcessStatus>, now_ms: i64) -> Value {
 
 /// The largest bot plus API memory peak over stored periods that both
 /// processes recorded. Each process's peak can come at a different moment of
-/// the period, so this is an upper bound on their combined peak.
+/// the period, so the sum is an upper bound within those paired periods.
 fn combined_memory_peak(bot: &[Rollup], api: &[Rollup], from_secs: i64, to_secs: i64) -> Value {
     let in_range = |row: &&Rollup| row.start_secs >= from_secs && row.start_secs < to_secs;
     let api: HashMap<i64, u64> = api

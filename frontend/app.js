@@ -1535,9 +1535,17 @@ function MemoryBillingPanel({ snapshot, nowMs }) {
     : null;
   const blockText = blocks && `${formatExact(blocks.count)} block${blocks.count === 1 ? "" : "s"} (${formatExact(blocks.capacity)} MiB) · ${blocks.headroom} headroom to the next block in this estimate`;
   const peakBytes = snapshot.combined_memory_peak?.peak_bytes;
-  const peakBlocks = Number.isSafeInteger(peakBytes) && peakBytes >= 0 && blockMib > 0 ? memoryBlocks(peakBytes, blockMib) : null;
-  const peakText = peakBlocks && `${formatMemoryMiB(peakBytes)} · ${formatExact(peakBlocks.count)} block${peakBlocks.count === 1 ? "" : "s"} (${formatExact(peakBlocks.capacity)} MiB)`;
+  const pairedPeriods = snapshot.combined_memory_peak?.periods;
+  const totalPeriods = (snapshot.to_secs - snapshot.from_secs) / snapshot.span_secs;
   const peakPeriod = snapshot.span_secs === 3600 ? "hour" : "minute";
+  const coverage = Number.isSafeInteger(pairedPeriods) && pairedPeriods >= 0
+    && Number.isSafeInteger(totalPeriods) && totalPeriods > 0 && pairedPeriods <= totalPeriods
+    ? `${formatExact(pairedPeriods)} of ${formatExact(totalPeriods)} ${peakPeriod}${totalPeriods === 1 ? "" : "s"}`
+    : null;
+  const peakBlocks = pairedPeriods > 0 && Number.isSafeInteger(peakBytes) && peakBytes >= 0 && blockMib > 0
+    ? memoryBlocks(peakBytes, blockMib) : null;
+  const peakText = pairedPeriods === 0 ? "No paired memory readings"
+    : peakBlocks && `${formatMemoryMiB(peakBytes)} · ${formatExact(peakBlocks.count)} block${peakBlocks.count === 1 ? "" : "s"} (${formatExact(peakBlocks.capacity)} MiB)`;
   const useApiMemory = apiBytes != null && (botBytes == null || readings[1].age_ms <= readings[0].age_ms);
   const memoryRows = combineMemory
     ? [
@@ -1545,7 +1553,8 @@ function MemoryBillingPanel({ snapshot, nowMs }) {
       ["Bot memory", formatMemoryMiB(botBytes)],
       ["API memory", formatMemoryMiB(apiBytes)],
       ["Estimated blocks", blockText],
-      [`Peak combined memory in ${snapshot.range}`, peakText],
+      ["Paired-period peak combined memory", peakText],
+      ["Paired memory coverage", coverage],
     ]
     : [[
       memoryRelation === "shared" ? "Shared cgroup memory" : useApiMemory ? "API cgroup memory" : botBytes != null ? "Bot cgroup memory" : "Cgroup memory",
@@ -1575,8 +1584,11 @@ function MemoryBillingPanel({ snapshot, nowMs }) {
       ...memoryRows.map(([label, value]) => h("div", { key: label }, h("dt", null, label), h("dd", null, resourceValue(value)))),
     ),
     h("p", { className: "an-note muted" }, blockNote),
-    combineMemory && h("p", { className: "an-note muted" },
-      `The peak adds each process’s highest reading for every stored ${peakPeriod} that both recorded, so it can overstate the combined peak.`,
+    combineMemory && peakBlocks && h("p", { className: "an-note muted" },
+      `The peak uses each process’s highest reading in each paired ${peakPeriod}. Those readings can occur at different times, so their sum can overstate the peak within paired periods.`,
+    ),
+    combineMemory && coverage && pairedPeriods > 0 && pairedPeriods < totalPeriods && h("p", { className: "an-note muted" },
+      "Periods without both readings can hide higher peaks.",
     ),
     rates
       ? h("div", null,
