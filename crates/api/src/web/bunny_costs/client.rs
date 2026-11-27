@@ -2,6 +2,7 @@ use std::collections::BTreeMap;
 use std::time::Duration;
 
 use chrono::{DateTime, NaiveDate, SecondsFormat, Utc};
+use jmodguard::db::bunny_costs::MAGIC_CONTAINER_CPU_CORES_PER_PERCENT;
 use reqwest::header::HeaderValue;
 use serde::{Deserialize, de::DeserializeOwned};
 
@@ -126,35 +127,37 @@ impl Client {
             .await?;
         let range = window.from..to;
         let hours = hours as f64;
-        // A daily CPU mean has no duration. Only closed hourly CPU points
-        // contribute to the per-day sum of core-hours.
+        // The measured CPU chart is a percentage of the pod allocation.
+        // Only closed hourly CPU points contribute to the sum of core-hours.
         if hourly {
             for series in charts.cpu.into_values() {
-                let mut samples = series.chart.range(range.clone());
-                for (&time, &value) in samples.clone() {
+                let mut latest = None;
+                for (&time, &percent) in series.chart.range(range.clone()) {
+                    let cores = nonnegative(percent)? * MAGIC_CONTAINER_CPU_CORES_PER_PERCENT;
                     let day = data.days.entry(time.date_naive()).or_default();
-                    *day.hourly_cpu_cost.get_or_insert(0.0) += nonnegative(value)? * CPU_CORE_HOUR;
+                    *day.hourly_cpu_cost.get_or_insert(0.0) += cores * CPU_CORE_HOUR;
+                    latest = Some((time, cores));
                 }
-                if let Some((&sampled_at, &value)) = samples.next_back() {
+                if let Some((sampled_at, cores)) = latest {
                     match &mut data.cpu_hourly_averages {
                         Some(cpu) if sampled_at < cpu.sampled_at => {}
                         Some(cpu) if sampled_at == cpu.sampled_at => {
-                            cpu.min = cpu.min.min(value);
-                            cpu.max = cpu.max.max(value);
+                            cpu.min = cpu.min.min(cores);
+                            cpu.max = cpu.max.max(cores);
                         }
                         _ => {
                             data.cpu_hourly_averages = Some(BunnyCpuAverages {
                                 sampled_at,
-                                min: value,
-                                max: value,
+                                min: cores,
+                                max: cores,
                             });
                         }
                     }
                 }
             }
         }
-        // Daily RAM points average their raw samples. Traffic points are
-        // byte totals for their bucket at either granularity.
+        // RAM points are sample-weighted means. Traffic points sum bytes
+        // for their bucket at either granularity.
         let days = &mut data.days;
         for series in charts.ram.into_values() {
             for (&time, &value) in series.chart.range(range.clone()) {

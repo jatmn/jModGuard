@@ -210,6 +210,7 @@ async fn collect(
                     .await?;
             }
             data.magic_cpu_from_current_hours = true;
+            data.magic_cpu_percent_converted = true;
         }
         Service::CoreDatabase | Service::GuildDatabase => {
             data.days = client.database_days(source, window, !historical).await?;

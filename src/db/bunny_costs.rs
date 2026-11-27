@@ -11,6 +11,9 @@ use super::{BoundedWrites as _, Db, OptionalExtension as _, Result, SqlExecutor,
 pub type SourceDigest = [u8; 32];
 pub type CostDays = BTreeMap<NaiveDate, BunnyDayCost>;
 
+const MAGIC_CONTAINER_POD_CPU_ALLOCATION: f64 = 8.0;
+pub const MAGIC_CONTAINER_CPU_CORES_PER_PERCENT: f64 = MAGIC_CONTAINER_POD_CPU_ALLOCATION / 100.0;
+
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum BunnyService {
@@ -71,6 +74,8 @@ pub struct BunnyMonthData {
     pub days: CostDays,
     #[serde(default)]
     pub magic_cpu_from_current_hours: bool,
+    #[serde(default)]
+    pub magic_cpu_percent_converted: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cpu_hourly_averages: Option<BunnyCpuAverages>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -82,6 +87,24 @@ pub struct BunnyMonthData {
 }
 
 impl BunnyMonthData {
+    fn convert_legacy_magic_cpu(&mut self) {
+        if self.magic_cpu_percent_converted {
+            return;
+        }
+        // The previous collector treated percentages as cores for both
+        // the displayed averages and the linear core-hour charge.
+        for day in self.days.values_mut() {
+            if let Some(cost) = &mut day.hourly_cpu_cost {
+                *cost *= MAGIC_CONTAINER_CPU_CORES_PER_PERCENT;
+            }
+        }
+        if let Some(cpu) = &mut self.cpu_hourly_averages {
+            cpu.min *= MAGIC_CONTAINER_CPU_CORES_PER_PERCENT;
+            cpu.max *= MAGIC_CONTAINER_CPU_CORES_PER_PERCENT;
+        }
+        self.magic_cpu_percent_converted = true;
+    }
+
     /// Coverage is based on completed observations for each UTC day.
     pub fn covers(&self, from: NaiveDate, to: NaiveDate) -> bool {
         from.iter_days()
@@ -181,6 +204,7 @@ impl BunnyCostSnapshot {
         if service != BunnyService::MagicContainers {
             return;
         }
+        self.data.convert_legacy_magic_cpu();
         if !self.data.magic_cpu_from_current_hours
             && let Some(end) = self.month.checked_add_months(Months::new(1))
             && self.fetched_at >= midnight_secs(end)
@@ -279,6 +303,9 @@ pub(super) async fn store_bunny_cost_snapshot(
             && row.data.projection.is_none_or(valid_amount),
         "invalid Bunny cost snapshot"
     );
+    if service == BunnyService::MagicContainers {
+        row.data.convert_legacy_magic_cpu();
+    }
     db.with_conn(move |conn| {
         let mut tx = conn.transaction_primary_write()?;
         let digest = digest.to_vec();
@@ -331,6 +358,44 @@ pub(super) async fn store_bunny_cost_snapshot(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn legacy_magic_cpu_prices_and_averages_are_converted_once() {
+        let month = NaiveDate::from_ymd_opt(2026, 11, 1).unwrap();
+        let start = midnight_secs(month);
+        let mut row = BunnyCostSnapshot {
+            month,
+            fetched_at: start + 3600,
+            data: BunnyMonthData {
+                days: [(
+                    month,
+                    BunnyDayCost {
+                        hourly_cpu_cost: Some(0.25),
+                        ram: 0.125,
+                        egress: 0.0625,
+                        ..BunnyDayCost::default()
+                    },
+                )]
+                .into(),
+                magic_cpu_from_current_hours: true,
+                cpu_hourly_averages: Some(BunnyCpuAverages {
+                    sampled_at: DateTime::from_timestamp(start, 0).unwrap(),
+                    min: 12.5,
+                    max: 25.0,
+                }),
+                projection: Some(2.38),
+                ..BunnyMonthData::default()
+            },
+        };
+        for _ in 0..2 {
+            row.refresh_stored_total(BunnyService::MagicContainers);
+            let cpu = row.data.cpu_hourly_averages.unwrap();
+            assert_eq!((cpu.min, cpu.max), (1.0, 2.0));
+            assert_eq!(row.data.days[&month].hourly_cpu_cost, Some(0.02));
+            assert!((row.data.month_to_date.unwrap() - 0.2075).abs() < 1e-12);
+            assert_eq!(row.data.projection, Some(2.38));
+        }
+    }
 
     #[test]
     fn magic_subtotal_includes_known_volume_with_empty_charts() {

@@ -1858,7 +1858,7 @@ function BunnyCostPanel({ provider }) {
     ),
     (breakdown || cpu) && h("dl", { className: "du-facts", "aria-label": "Magic Containers month-to-date estimate components" },
       h("div", null, h("dt", null, "CPU cost"), h("dd", null, bunnyUsd(breakdown?.cpu))),
-      h("div", null, h("dt", null, "Hourly average CPU cores per pod"),
+      h("div", null, h("dt", null, "Estimated hourly average CPU cores per pod"),
         h("dd", null, cpuAverage,
           cpu && h("span", { className: "muted" }, " · ",
             cpuSampleTime ? "Sampled " : "Sample time unavailable",
@@ -1870,7 +1870,7 @@ function BunnyCostPanel({ provider }) {
         h("div", { key }, h("dt", null, label), h("dd", null, key === "egress" && breakdown.egress_rate_unknown ? "Unknown regional rate" : bunnyUsd(breakdown[key]))),
       ),
     ),
-    h("p", { className: "an-note muted" }, "Database uses Bunny’s free public-preview rate. Storage assumes one Standard region. Magic Containers egress uses Bunny’s regional rates. An unknown egress rate leaves the usage total unavailable. Estimates exclude Bunny’s $1 monthly account minimum."),
+    h("p", { className: "an-note muted" }, "Database uses Bunny’s free public-preview rate. Storage assumes one Standard region. Magic Containers egress uses Bunny’s regional rates. An unknown egress rate leaves the usage total unavailable. Volume estimates use the reported allocation because volume chart units are unverified. Estimates exclude Bunny’s $1 monthly account minimum."),
     h(BunnyCostHistory, { history: provider.history ?? [] }),
   ));
 }

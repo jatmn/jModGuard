@@ -213,7 +213,7 @@ async fn allowed_routes_keep_identifier_case_and_send_required_query_windows() {
         let result = collect(&client, source, window, false).await.unwrap();
         match source.service {
             Service::MagicContainers => {
-                let expected = 0.5 * 0.02 + 2.0 * 0.0003125 + 0.005;
+                let expected = 0.0008 + 2.0 * 0.0003125 + 0.005;
                 assert!((result.month_to_date.unwrap() - expected).abs() < 1e-10);
                 assert_eq!(result.projection, Some(2.50));
             }
@@ -284,8 +284,8 @@ async fn magic_container_chart_fixtures_price_closed_hourly_and_daily_buckets() 
 
     // 232, 248, 272 and 304 MiB round to 4, 4, 5 and 5 blocks.
     let ram = 0.005625;
-    // 0.875 + 1 + 1.125 + 1.25 yields 4.25 core-hours.
-    let cpu = 0.085;
+    // 4.25 percent-hours of an eight-CPU allocation is 0.34 core-hours.
+    let cpu = 0.0068;
     // Traffic sums to 20,000,000 bytes (4.8 + 6.2 + 5.4 + 3.6 MB).
     let egress = 0.0002;
     // The summary's 6 GB are prorated over 24.5 hours of a 30-day month.
@@ -328,7 +328,7 @@ async fn magic_container_chart_fixtures_price_closed_hourly_and_daily_buckets() 
     assert!((volume_report - volume).abs() < 1e-12);
     assert_eq!(
         report["magic_cpu_hourly_averages"],
-        json!({"sampled_at": "2026-11-01T23:00:00Z", "min": 1.25, "max": 1.25})
+        json!({"sampled_at": "2026-11-01T23:00:00Z", "min": 0.1, "max": 0.1})
     );
 
     let daily = include_str!("fixtures/magic_containers_daily_representative.json");
@@ -355,6 +355,49 @@ async fn magic_container_chart_fixtures_price_closed_hourly_and_daily_buckets() 
     for (query, granularity) in chart_queries.iter().zip(["Hourly", "Daily"]) {
         assert!(query.ends_with(granularity));
     }
+}
+
+#[tokio::test]
+async fn magic_container_cpu_counts_the_utc_midnight_bucket_only_after_it_closes() {
+    let mock = Mock::start().await;
+    let charts = include_str!("fixtures/magic_containers_hourly_representative.json");
+    mock.state.lock().unwrap().charts = Some(serde_json::from_str(charts).unwrap());
+    let client = mock.client(Duration::from_secs(2));
+    let cfg = config();
+    let source = &cfg.sources[0];
+    let observed: DateTime<Utc> = "2026-11-01T16:30:00-08:00".parse().unwrap();
+    let utc_day = observed.date_naive();
+    let month = month_start(utc_day);
+    let window = Window {
+        month,
+        from: midnight(month),
+        to: observed,
+    };
+    let open = collect(&client, source, window, false).await.unwrap();
+    assert_eq!(open.days.keys().copied().collect::<Vec<_>>(), [month]);
+    let cpu = open.cpu_hourly_averages.unwrap();
+    assert_eq!(cpu.sampled_at, midnight(utc_day) - Duration::from_hours(1));
+    assert_eq!((cpu.min, cpu.max), (0.1, 0.1));
+
+    let window = Window {
+        to: observed + Duration::from_hours(1),
+        ..window
+    };
+    let closed = collect(&client, source, window, false).await.unwrap();
+    assert_eq!(
+        closed.days.keys().copied().collect::<Vec<_>>(),
+        [month, utc_day]
+    );
+    assert_eq!(
+        closed.days[&month].hourly_cpu_cost,
+        open.days[&month].hourly_cpu_cost
+    );
+    // 12.5 percent of eight CPUs is one core, billed for one closed hour.
+    assert_eq!(closed.days[&utc_day].hourly_cpu_cost, Some(0.02));
+    assert!(!closed.days[&utc_day].complete);
+    let cpu = closed.cpu_hourly_averages.unwrap();
+    assert_eq!(cpu.sampled_at, midnight(utc_day));
+    assert_eq!((cpu.min, cpu.max), (1.0, 1.0));
 }
 
 #[tokio::test]
@@ -385,9 +428,10 @@ async fn magic_container_cpu_range_uses_pods_from_the_latest_hour() {
         .unwrap();
     let cpu = data.cpu_hourly_averages.unwrap();
     assert_eq!(cpu.sampled_at, latest.parse::<DateTime<Utc>>().unwrap());
-    assert_eq!((cpu.min, cpu.max), (0.98, 1.04));
+    assert!((cpu.min - 0.0784).abs() < 1e-12);
+    assert!((cpu.max - 0.0832).abs() < 1e-12);
     let cpu_cost = data.days[&now.date_naive()].hourly_cpu_cost.unwrap();
-    assert!((cpu_cost - 0.0812).abs() < 1e-12);
+    assert!((cpu_cost - 0.006496).abs() < 1e-12);
 }
 
 #[tokio::test]
@@ -417,7 +461,7 @@ async fn magic_container_estimates_apply_regional_egress_rates() {
     let current = collect(&client, source, window, false).await.unwrap();
     let costs = current.days[&day];
     let cpu = current.cpu_hourly_averages.unwrap();
-    assert_eq!((cpu.min, cpu.max), (0.5, 0.5));
+    assert_eq!((cpu.min, cpu.max), (0.04, 0.04));
     close_enough(costs.ram, 2.0 * 0.0003125);
     assert_eq!(current.allocated_volume_cost, None);
     close_enough(costs.egress, 0.01 + 0.045 + 0.03 + 0.06);
@@ -742,17 +786,17 @@ async fn stored_magic_costs_discard_legacy_charges_and_fill_in_verified_cpu() {
         .unwrap();
     assert_eq!(mock.state.lock().unwrap().requests.len(), 3);
     let report = serde_json::to_value(app.bunny_costs.view(now).unwrap()).unwrap();
-    assert_eq!(report["magic_cpu_hourly_averages"]["min"], 0.5);
-    assert_eq!(report["magic_cpu_hourly_averages"]["max"], 0.5);
+    assert_eq!(report["magic_cpu_hourly_averages"]["min"], 0.04);
+    assert_eq!(report["magic_cpu_hourly_averages"]["max"], 0.04);
     assert_eq!(report["magic_containers"]["projected_usd"], 2.50);
     let breakdown = &report["magic_breakdown"];
-    assert!((breakdown["cpu"].as_f64().unwrap() - 0.01).abs() < 1e-12);
+    assert!((breakdown["cpu"].as_f64().unwrap() - 0.0008).abs() < 1e-12);
     assert_eq!(breakdown["ram"], 0.125);
     assert_eq!(breakdown["volume"], Value::Null);
     let subtotal = report["magic_containers"]["month_to_date_usd"]
         .as_f64()
         .unwrap();
-    assert!((subtotal - 0.1975).abs() < 1e-12);
+    assert!((subtotal - 0.1883).abs() < 1e-12);
 
     let mut current = feed.months[&month].data.clone();
     current.allocated_volume_cost = Some(0.25);
@@ -788,7 +832,7 @@ async fn stored_magic_costs_discard_legacy_charges_and_fill_in_verified_cpu() {
     .await
     .unwrap();
     let saved = feed.months[&month].data.days[&cpu_day];
-    assert_eq!(saved.hourly_cpu_cost, Some(0.01));
+    assert_eq!(saved.hourly_cpu_cost, Some(0.0008));
     assert!(!saved.complete);
 
     {
@@ -812,9 +856,9 @@ async fn stored_magic_costs_discard_legacy_charges_and_fill_in_verified_cpu() {
     let closed = &feed.months[&month].data;
     assert_eq!(closed.allocated_volume_cost, Some(0.25));
     assert_eq!(closed.days[&month].hourly_cpu_cost, None);
-    assert_eq!(closed.days[&cpu_day].hourly_cpu_cost, Some(0.01));
+    assert_eq!(closed.days[&cpu_day].hourly_cpu_cost, Some(0.0008));
     assert!(closed.days[&cpu_day].complete);
-    assert!((closed.month_to_date.unwrap() - 0.455).abs() < 1e-12);
+    assert!((closed.month_to_date.unwrap() - 0.4458).abs() < 1e-12);
     let requests = &mock.state.lock().unwrap().requests;
     assert_eq!(requests.len(), 5);
     assert!(requests[3..].iter().all(|request| {
@@ -1070,7 +1114,7 @@ async fn magic_close_out_and_backfill_preserve_completed_usage_days() {
             (day.complete, day.ram, day.egress, day.hourly_cpu_cost)
         })
     };
-    let expected = [(true, saved.ram, saved.egress, saved.hourly_cpu_cost); 2];
+    let expected = [(true, saved.ram, saved.egress, Some(0.0025)); 2];
     assert_eq!([usage(&closed), usage(&stored[0].data)], [expected; 2]);
 }
 

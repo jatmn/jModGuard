@@ -89,15 +89,15 @@ read CDN statistics.
 Costs use UTC calendar months and USD. Bunny's app-summary `monthlyCost` is
 the authoritative Magic Containers projection. The month-to-date subtotal
 and history estimate CPU, RAM, traffic and any available allocated volume cost.
-The chart schema defines numeric samples. Live measurements established the
-units and daily rollups below. The client filters chart buckets by the requested
-UTC range because Bunny can return points beyond `toDate`. Estimates use closed
-hours or full days. Today's daily bucket is dropped.
+Chart keys mark bucket starts in UTC, and daily buckets follow the UTC calendar.
+The client filters by the requested range because Bunny can return buckets
+beyond `toDate`, including the current partial hour or day. Only closed
+buckets contribute to chart estimates and displayed averages.
 
 | Chart field | Observed or published scope | Treatment |
 | --- | --- | --- |
-| `cpuUsageSplitChart` | Mean cores per pod | Closed hourly points are priced at $0.02 per core-hour. The latest closed hour also shows the per-pod average cores. |
-| `ramUsageSplitChart` | Mean bytes per pod | Rounded up to whole 64 MiB blocks per pod and priced per hour. |
+| `cpuUsageSplitChart` | Mean percentage of the standard 8-CPU pod allocation. The unit is inferred from a match with billed costs. The public chart docs omit the unit. | Convert to estimated cores as `percent / 100 × 8` and price closed hours at $0.02 per core-hour. The latest closed hour also shows the estimated average cores per pod. |
+| `ramUsageSplitChart` | Sample-weighted mean bytes per pod, including daily buckets | Rounded up to whole 64 MiB blocks per pod and priced per hour. |
 | `trafficSplitChart` | Bytes summed per bucket, with daily values equal to the sum of hourly values | Priced as egress at the rate for the reporting pod's region |
 
 Daily CPU and RAM values are sample-weighted means of the underlying readings.
@@ -108,8 +108,9 @@ resulting blocks over 24 hours.
 
 Persistent volume cost uses the app summary's `totalVolumeSizeInGb` at
 $0.10/GB-month. The current allocated size is prorated over the elapsed UTC
-month. Volume charts do not contribute to estimates. A missing allocation
-leaves the volume cost unavailable. Historical backfill preserves any
+month. Volume chart units are unverified and those charts are excluded from
+estimates. A missing allocation leaves the volume cost unavailable.
+Historical backfill preserves any
 month-to-date volume estimate saved in that month and has no allocation
 history to fill in the remaining cost. A known volume estimate contributes
 to the partial subtotal even before any chart data is available.

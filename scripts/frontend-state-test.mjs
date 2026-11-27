@@ -14385,8 +14385,8 @@ test('Bot Resources hides Bunny costs without config and renders partial provide
   snapshot = resourceSnapshot({ provider: {
     status: 'configured', month: '2026-11',
     magic_containers: { status: 'available', month_to_date_usd: 2.25, projected_usd: 4.75, last_updated_secs: RESOURCE_NOW_MS / 1000 },
-    magic_breakdown: { cpu: 0.24, ram: 0.30, egress: 0.75, volume: null },
-    magic_cpu_hourly_averages: { sampled_at: sampledAt, min: 1.125, max: 1.625 },
+    magic_breakdown: { cpu: 0.02, ram: 0.30, egress: 0.75, volume: null },
+    magic_cpu_hourly_averages: { sampled_at: sampledAt, min: 0.08, max: 0.1 },
     database: { status: 'unavailable', configured_resources: 1 },
     storage: { status: 'unavailable', month_to_date_usd: 0.005, projected_usd: 0.01, last_updated_secs: RESOURCE_NOW_MS / 1000, partial: true },
     cdn: { status: 'unavailable' },
@@ -14400,12 +14400,13 @@ test('Bot Resources hides Bunny costs without config and renders partial provide
   assert.match(textOf(panel), /Partial estimates cover CPU, RAM, egress, and allocated volumes when available/);
   assert.match(textOf(panel), /Projected month \(USD\)Month-to-date estimate \(USD\)/);
   assert.match(textOf(panel), /Estimated costs/);
-  assert.match(textOf(detail()), /CPU cost\$0\.24Hourly average CPU cores per pod1\.125–1\.625/);
+  assert.match(textOf(detail()), /CPU cost\$0\.02Estimated hourly average CPU cores per pod0\.08–0\.1/);
+  assert.match(textOf(panel), /volume chart units are unverified/);
   assert.match(textOf(detail()), /VolumesNot available/);
   const sampleTime = detail().querySelector('dd time');
   assert.equal(sampleTime?.dateTime, sampledAt);
   assert.equal(sampleTime.textContent, new Date(sampledAt).toLocaleString(undefined, { timeZoneName: 'short' }));
-  assert.match(textOf(sampleTime.closest('dd')), /1\.125–1\.625 · Sampled /);
+  assert.match(textOf(sampleTime.closest('dd')), /0\.08–0\.1 · Sampled /);
   assert.equal(panel.querySelector('tbody strong').textContent, '$4.75');
   assert.match(textOf(panel), /Magic Containers\$4.75\$2.25 \(partial\)/);
   assert.match(textOf(panel), /Database \(1 database\)Not available/);
@@ -14425,7 +14426,7 @@ test('Bot Resources hides Bunny costs without config and renders partial provide
   assert.match(textOf(section()), /EgressUnknown regional rate/);
   assert.match(textOf(detail()), /Volumes\$0\.00/);
   assert.match(textOf(section()), /2026-10Unknown egress rate \(partial\)/);
-  assert.match(textOf(detail()), /1\.125–1\.625 · Sample time unavailable/);
+  assert.match(textOf(detail()), /0\.08–0\.1 · Sample time unavailable/);
   assert.equal(detail().querySelector('time'), null);
 
   const volume = 0.60 * 0.5 / 720;

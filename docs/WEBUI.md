@@ -468,7 +468,8 @@ When configured, **Bunny cost estimates** shows accrued and projected USD by
 service for the UTC billing month, with up to 12 past months of stored
 estimates. The Magic Containers projection comes from Bunny's monthly summary.
 Its partial estimates cover CPU, RAM, egress, and allocated volumes when
-available. The CPU detail shows average cores per pod for the latest closed hour.
+available. The CPU detail shows estimated average cores per pod for the latest
+closed hour, converted from the reported percentage of the standard allocation.
 The history marks incomplete months and keeps missing values
 separate from $0. Scoped Bunny keys leave CDN costs unavailable. The owner
 page reads snapshots and stays usable during a provider outage.
