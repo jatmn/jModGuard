@@ -33,8 +33,14 @@ impl BunnyService {
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Serialize)]
 pub struct BunnyDayCost {
+    // The legacy `cpu` field used unverified chart units.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cpu_core_cost: Option<f64>,
     pub ram: f64,
     pub egress: f64,
+    // Retain a zero on the writer wire for older peers and discard legacy
+    // chart-derived volume costs when reading.
+    #[serde(skip_deserializing)]
     pub volume: f64,
     pub storage: f64,
     #[serde(default)]
@@ -53,8 +59,12 @@ pub struct BunnyCpuAverages {
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct BunnyMonthData {
     pub days: CostDays,
+    #[serde(default)]
+    pub magic_cpu_priced: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cpu_hourly_averages: Option<BunnyCpuAverages>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allocated_volume_cost: Option<f64>,
     pub month_to_date: Option<f64>,
     pub projection: Option<f64>,
     pub closed: bool,
@@ -77,8 +87,9 @@ impl BunnyMonthData {
         (!self.days.is_empty() && !self.egress_rate_unknown()).then(|| {
             self.days
                 .values()
-                .map(|day| day.ram + day.egress + day.volume)
-                .sum()
+                .map(|day| day.cpu_core_cost.unwrap_or_default() + day.ram + day.egress)
+                .sum::<f64>()
+                + self.allocated_volume_cost.unwrap_or_default()
         })
     }
 
@@ -90,7 +101,17 @@ impl BunnyMonthData {
                     // Keep a collected full day, including its original
                     // hourly detail, when a later rollup revisits that date.
                     if saved.complete {
-                        *day = saved;
+                        // Fill in verified CPU pricing when a legacy snapshot
+                        // already has a full day of RAM and traffic.
+                        let cpu_core_cost = if day.complete {
+                            saved.cpu_core_cost.or(day.cpu_core_cost)
+                        } else {
+                            saved.cpu_core_cost
+                        };
+                        *day = BunnyDayCost {
+                            cpu_core_cost,
+                            ..saved
+                        };
                     }
                 })
                 .or_insert(saved);
@@ -137,7 +158,7 @@ pub struct BunnyCostSnapshot {
 impl BunnyCostSnapshot {
     fn refresh_stored_total(&mut self, service: BunnyService) {
         if service == BunnyService::MagicContainers {
-            // Earlier snapshots included an estimated CPU charge in the total.
+            // Earlier snapshots included unverified chart charges in the total.
             self.data.month_to_date = self.data.magic_subtotal();
         }
     }
@@ -203,10 +224,12 @@ pub(super) async fn store_bunny_cost_snapshot(
                     && date.month() == row.month.month()
                     && *date <= observed.date_naive()
                     && (!cost.complete || *date < observed.date_naive())
-                    && [cost.ram, cost.egress, cost.volume, cost.storage]
+                    && cost.cpu_core_cost.is_none_or(valid_amount)
+                    && [cost.ram, cost.egress, cost.storage]
                         .into_iter()
                         .all(valid_amount)
             })
+            && row.data.allocated_volume_cost.is_none_or(valid_amount)
             && row.data.cpu_hourly_averages.is_none_or(|cpu| {
                 service == BunnyService::MagicContainers
                     && cpu.sampled_at.year() == row.month.year()
@@ -236,6 +259,11 @@ pub(super) async fn store_bunny_cost_snapshot(
                 tx.finish_read()?;
                 previous.refresh_stored_total(service);
                 return Ok(previous);
+            }
+            if observed.date_naive() >= row.month + Months::new(1) {
+                // Backfill has no allocation history. Keep the volume cost
+                // estimated by the last observation within the month.
+                row.data.allocated_volume_cost = previous.data.allocated_volume_cost;
             }
             row.data.merge_days(previous.data.days);
         }

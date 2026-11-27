@@ -1827,7 +1827,7 @@ function BunnyCostPanel({ provider }) {
   }
   return analyticsPanel("Bunny cost estimates", "resources-bunny-costs", h("div", null,
     h("p", { className: "an-note muted" },
-      `${provider.month} (UTC). Bunny’s monthly figure is the authoritative Magic Containers projection. The partial chart estimates cover RAM, egress, and allocated volumes.`,
+      `${provider.month} (UTC). Bunny’s monthly figure is the authoritative Magic Containers projection. Partial estimates cover CPU, RAM, egress, and allocated volumes when available.`,
     ),
     h("div", { className: "table-scroll rounded-box", tabIndex: 0, role: "region", "aria-label": "Current Bunny costs" },
       h("table", { className: "table table-sm" },
@@ -1857,8 +1857,8 @@ function BunnyCostPanel({ provider }) {
       ),
     ),
     (breakdown || cpu) && h("dl", { className: "du-facts", "aria-label": "Magic Containers month-to-date estimate components" },
-      h("div", null, h("dt", null, "CPU cost"), h("dd", null, "Not computed")),
-      h("div", null, h("dt", null, "CPU raw hourly average per pod (unit unverified)"),
+      h("div", null, h("dt", null, "CPU cost"), h("dd", null, bunnyUsd(breakdown?.cpu))),
+      h("div", null, h("dt", null, "Hourly average CPU cores per pod"),
         h("dd", null, cpuAverage,
           cpu && h("span", { className: "muted" }, " · ",
             cpuSampleTime ? "Sampled " : "Sample time unavailable",
@@ -1867,7 +1867,7 @@ function BunnyCostPanel({ provider }) {
         ),
       ),
       ...(breakdown ? [["RAM", "ram"], ["Egress", "egress"], ["Volumes", "volume"]] : []).map(([label, key]) =>
-        h("div", { key }, h("dt", null, label), h("dd", null, key === "egress" && breakdown[key] == null ? "Unknown regional rate" : bunnyUsd(breakdown[key]))),
+        h("div", { key }, h("dt", null, label), h("dd", null, key === "egress" && breakdown.egress_rate_unknown ? "Unknown regional rate" : bunnyUsd(breakdown[key]))),
       ),
     ),
     h("p", { className: "an-note muted" }, "Database uses Bunny’s free public-preview rate. Storage assumes one Standard region. Magic Containers egress uses Bunny’s regional rates. An unknown egress rate leaves the usage total unavailable. Estimates exclude Bunny’s $1 monthly account minimum."),

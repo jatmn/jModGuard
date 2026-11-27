@@ -182,14 +182,11 @@ async fn collect(
             if historical {
                 client.mc_days(source, window, false, &mut data).await?;
             } else {
-                data.projection = Some(client.mc_projection(source).await?);
+                client.mc_summary(source, window, &mut data).await?;
                 // Bunny's hourly charts are limited to a seven-day window.
                 // Use the most recent six full days plus today's closed hours.
                 let recent = midnight(window.to.date_naive() - CalendarDays::new(6));
                 let split = window.from.max(recent);
-                let to_hour =
-                    DateTime::from_timestamp(window.to.timestamp().div_euclid(3600) * 3600, 0)
-                        .ok_or(Failure::Response)?;
                 client
                     .mc_days(
                         source,
@@ -206,7 +203,6 @@ async fn collect(
                         source,
                         Window {
                             from: split,
-                            to: to_hour,
                             ..window
                         },
                         true,
@@ -214,6 +210,7 @@ async fn collect(
                     )
                     .await?;
             }
+            data.magic_cpu_priced = true;
         }
         Service::CoreDatabase | Service::GuildDatabase => {
             data.days = client.database_days(source, window, !historical).await?;
@@ -297,14 +294,19 @@ impl Cache {
             }
         }
         let mc_month = magic.first().and_then(|feed| feed.months.get(&month));
-        let breakdown = mc_month.filter(|row| !row.data.days.is_empty()).map(|row| {
+        let breakdown = mc_month.map(|row| {
             let days = row.data.days.values();
+            let egress_rate_unknown = row.data.egress_rate_unknown();
             MagicBreakdown {
-                cpu: None,
-                ram: days.clone().map(|day| day.ram).sum(),
-                egress: (!row.data.egress_rate_unknown())
+                cpu: days
+                    .clone()
+                    .filter_map(|day| day.cpu_core_cost)
+                    .reduce(|a, b| a + b),
+                ram: (!row.data.days.is_empty()).then(|| days.clone().map(|day| day.ram).sum()),
+                egress: (!row.data.days.is_empty() && !egress_rate_unknown)
                     .then(|| days.clone().map(|day| day.egress).sum()),
-                volume: days.map(|day| day.volume).sum(),
+                egress_rate_unknown,
+                volume: row.data.allocated_volume_cost,
             }
         });
         Some(Report {
@@ -337,9 +339,10 @@ pub(super) struct Report {
 #[derive(Serialize)]
 struct MagicBreakdown {
     cpu: Option<f64>,
-    ram: f64,
+    ram: Option<f64>,
     egress: Option<f64>,
-    volume: f64,
+    egress_rate_unknown: bool,
+    volume: Option<f64>,
 }
 
 #[derive(Serialize)]
@@ -472,7 +475,8 @@ async fn refresh_current(
     }
     if !feed.failed
         && feed.months.get(&month).is_some_and(|row| {
-            (0..REFRESH.as_secs() as i64).contains(&(now.timestamp() - row.fetched_at))
+            (source.service != Service::MagicContainers || row.data.magic_cpu_priced)
+                && (0..REFRESH.as_secs() as i64).contains(&(now.timestamp() - row.fetched_at))
         })
     {
         return Ok(());
@@ -502,8 +506,10 @@ async fn backfill(
 ) -> Result<(), Failure> {
     for window in backfill_windows(source.service, now) {
         if feed.months.get(&window.month).is_some_and(|row| {
-            row.data
-                .covers(window.from.date_naive(), window.to.date_naive())
+            (source.service != Service::MagicContainers || row.data.magic_cpu_priced)
+                && row
+                    .data
+                    .covers(window.from.date_naive(), window.to.date_naive())
         }) {
             continue;
         }

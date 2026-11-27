@@ -88,19 +88,28 @@ read CDN statistics.
 
 Costs use UTC calendar months and USD. Bunny's app-summary `monthlyCost` is
 the authoritative Magic Containers projection. The month-to-date subtotal
-and history are partial estimates covering RAM, egress, and volumes.
-The chart endpoint provides data for
-CPU, RAM, traffic, and allocated volume capacity. The [chart response schema](https://bunny.net/docs/api-reference/magic-containers/applications/get-application-statistics-charts.md)
-defines numeric samples. Monitoring documents hourly and daily chart points
-and period summaries. The CPU unit, daily RAM aggregation, volume sample unit
-and reducer, timestamp alignment, and partial-bucket rules remain unverified.
+and history estimate CPU, RAM, traffic and any available allocated volume cost.
+The chart schema defines numeric samples. Live measurements established the
+units and daily rollups below. The client filters chart buckets by the requested
+UTC range because Bunny can return points beyond `toDate`. Estimates use closed
+hours or full days. Today's daily bucket is dropped.
 
 | Chart field | Observed or published scope | Treatment |
 | --- | --- | --- |
-| `cpuUsageSplitChart` | Hourly mean per pod | Raw readings from the latest closed hour, shown as a range for multiple pods with different values. Unit unverified. CPU cost is uncomputed. |
-| `ramUsageSplitChart` | Hourly mean in bytes per pod | Rounded into 64 MiB blocks for each pod. The daily estimate uses the daily value as a mean. |
+| `cpuUsageSplitChart` | Mean cores per pod | Priced at $0.02 per core-hour. The latest closed hour also shows the per-pod average cores. |
+| `ramUsageSplitChart` | Mean bytes per pod | Rounded up to whole 64 MiB blocks per pod and priced per hour. |
 | `trafficSplitChart` | Bytes summed per bucket, with daily values equal to the sum of hourly values | Priced as egress at the rate for the reporting pod's region |
-| `volumesSplitCapacityChart` | Allocated capacity per volume instance | Provisioned bytes applied for the bucket's duration |
+
+Daily CPU and RAM values are sample-weighted means of the underlying readings.
+Daily estimates apply those means over 24 hours. RAM uses the daily mean for
+rounding when hourly data is outside the lookback window.
+
+Persistent volume cost uses the app summary's `totalVolumeSizeInGb` at
+$0.10/GB-month. The current allocated size is prorated over the elapsed UTC
+month. Volume charts do not contribute to estimates. A missing allocation
+leaves the volume cost unavailable. Historical backfill preserves any
+month-to-date volume estimate saved in that month and has no allocation
+history to fill in the remaining cost.
 
 Missing values can leave gaps in these estimates. Bunny's billed RAM
 includes variable system overhead, and traffic billing covers egress

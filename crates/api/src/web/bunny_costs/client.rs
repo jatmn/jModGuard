@@ -13,6 +13,7 @@ const RAM_BLOCK: f64 = 64.0 * 1024.0 * 1024.0;
 // List prices checked 2026-11-26. See docs/CONFIGURATION.md for the sources
 // and assumptions, including the Storage tier.
 const RAM_BLOCK_HOUR: f64 = 0.0003125;
+const CPU_CORE_HOUR: f64 = 0.02;
 const VOLUME_GB_MONTH: f64 = 0.10;
 const STORAGE_GB_MONTH: f64 = 0.01;
 
@@ -76,9 +77,21 @@ impl Client {
         serde_json::from_slice(&body).map_err(|_| Failure::Response)
     }
 
-    pub(super) async fn mc_projection(&self, source: &Source) -> Result<f64, Failure> {
+    pub(super) async fn mc_summary(
+        &self,
+        source: &Source,
+        window: Window,
+        data: &mut MonthData,
+    ) -> Result<(), Failure> {
         let summary: McSummary = self.get(source, &["mc", "apps"], &["summary"], &[]).await?;
-        nonnegative(summary.monthly_cost)
+        data.projection = Some(nonnegative(summary.monthly_cost)?);
+        let elapsed_days =
+            (window.to - super::midnight(window.month)).num_seconds() as f64 / 86_400.0;
+        data.allocated_volume_cost = summary
+            .total_volume_size_in_gb
+            .and_then(|gb| nonnegative(gb).ok())
+            .map(|gb| gb * VOLUME_GB_MONTH * elapsed_days / window.month_days());
+        Ok(())
     }
 
     pub(super) async fn mc_days(
@@ -88,10 +101,16 @@ impl Client {
         hourly: bool,
         data: &mut MonthData,
     ) -> Result<(), Failure> {
-        if window.from >= window.to {
+        let hours = if hourly { 1 } else { 24 };
+        let seconds = 3600 * hours;
+        // Bunny can return buckets past toDate, including the open bucket.
+        // Restrict queries and pricing to complete hours or UTC days.
+        let to = DateTime::from_timestamp(window.to.timestamp().div_euclid(seconds) * seconds, 0)
+            .ok_or(Failure::Response)?;
+        if window.from >= to {
             return Ok(());
         }
-        let (from, to) = window.query_dates();
+        let (from_date, to_date) = Window { to, ..window }.query_dates();
         let granularity = if hourly { "Hourly" } else { "Daily" };
         let charts: McCharts = self
             .get(
@@ -99,19 +118,24 @@ impl Client {
                 &["mc", "apps"],
                 &["statistics", "charts"],
                 &[
-                    ("fromDate", &from),
-                    ("toDate", &to),
+                    ("fromDate", &from_date),
+                    ("toDate", &to_date),
                     ("granularity", granularity),
                 ],
             )
             .await?;
-        if hourly {
-            for series in charts.cpu.into_values() {
-                let Some((&sampled_at, &value)) =
-                    series.chart.range(window.from..window.to).next_back()
-                else {
-                    continue;
-                };
+        let range = window.from..to;
+        let hours = hours as f64;
+        // CPU and RAM daily points already average all their raw samples.
+        // Traffic points are byte totals for their bucket at either granularity.
+        for series in charts.cpu.into_values() {
+            let mut samples = series.chart.range(range.clone());
+            for (&time, &value) in samples.clone() {
+                let day = data.days.entry(time.date_naive()).or_default();
+                *day.cpu_core_cost.get_or_insert(0.0) +=
+                    nonnegative(value)? * hours * CPU_CORE_HOUR;
+            }
+            if hourly && let Some((&sampled_at, &value)) = samples.next_back() {
                 match &mut data.cpu_hourly_averages {
                     Some(cpu) if sampled_at < cpu.sampled_at => {}
                     Some(cpu) if sampled_at == cpu.sampled_at => {
@@ -128,37 +152,22 @@ impl Client {
                 }
             }
         }
-        // Price RAM bytes, traffic bytes per bucket, and provisioned volume.
         let days = &mut data.days;
-        let hours = if hourly { 1.0 } else { 24.0 };
-        let month_hours = window.month_days() * 24.0;
         for series in charts.ram.into_values() {
-            for (time, value) in series.chart {
-                if let Some(day) = window.day(time) {
-                    let blocks = (nonnegative(value)? / RAM_BLOCK).ceil().max(1.0);
-                    days.entry(day).or_default().ram += blocks * hours * RAM_BLOCK_HOUR;
-                }
+            for (&time, &value) in series.chart.range(range.clone()) {
+                let blocks = (nonnegative(value)? / RAM_BLOCK).ceil().max(1.0);
+                days.entry(time.date_naive()).or_default().ram += blocks * hours * RAM_BLOCK_HOUR;
             }
         }
         for series in charts.traffic.into_values() {
             let rate = series.region.as_deref().and_then(egress_usd_per_gb);
-            for (time, value) in series.chart {
-                if let Some(day) = window.day(time) {
-                    let bytes = nonnegative(value)?;
-                    let cost = days.entry(day).or_default();
-                    if let Some(rate) = rate {
-                        cost.egress += bytes / GB * rate;
-                    } else if bytes > 0.0 {
-                        cost.egress_rate_unknown = true;
-                    }
-                }
-            }
-        }
-        for series in charts.volumes.into_values() {
-            for (time, value) in series.chart {
-                if let Some(day) = window.day(time) {
-                    days.entry(day).or_default().volume +=
-                        nonnegative(value)? / GB * hours / month_hours * VOLUME_GB_MONTH;
+            for (&time, &value) in series.chart.range(range.clone()) {
+                let bytes = nonnegative(value)?;
+                let cost = days.entry(time.date_naive()).or_default();
+                if let Some(rate) = rate {
+                    cost.egress += bytes / GB * rate;
+                } else if bytes > 0.0 {
+                    cost.egress_rate_unknown = true;
                 }
             }
         }
@@ -311,6 +320,7 @@ fn parse_storage_date(date: &str) -> Option<NaiveDate> {
 #[serde(rename_all = "camelCase")]
 struct McSummary {
     monthly_cost: f64,
+    total_volume_size_in_gb: Option<f64>,
 }
 
 #[derive(Deserialize)]
@@ -321,8 +331,6 @@ struct McCharts {
     ram: BTreeMap<String, McSeries>,
     #[serde(rename = "trafficSplitChart")]
     traffic: BTreeMap<String, McSeries>,
-    #[serde(rename = "volumesSplitCapacityChart", default)]
-    volumes: BTreeMap<String, McSeries>,
 }
 
 #[derive(Deserialize)]

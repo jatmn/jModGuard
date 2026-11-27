@@ -49,6 +49,7 @@ struct MockData {
     requests: Vec<Uri>,
     charts: Option<Value>,
     monthly_cost: Option<f64>,
+    allocated_volume_gb: Option<f64>,
     traffic: Option<Value>,
     storage: Option<BTreeMap<NaiveDate, u64>>,
 }
@@ -90,7 +91,7 @@ async fn mock_reply(
     headers: HeaderMap,
 ) -> Response {
     assert_eq!(headers.get("accesskey").unwrap(), KEY);
-    let (status, delay, charts, monthly_cost, traffic, storage) = {
+    let (status, delay, charts, monthly_cost, allocated_volume_gb, traffic, storage) = {
         let mut state = state.lock().unwrap();
         state.requests.push(uri.clone());
         (
@@ -98,6 +99,7 @@ async fn mock_reply(
             state.delay,
             state.charts.clone(),
             state.monthly_cost.unwrap_or(2.50),
+            state.allocated_volume_gb,
             state.traffic.clone(),
             state.storage.clone(),
         )
@@ -109,7 +111,11 @@ async fn mock_reply(
     let date = "2026-11-17T00:00:00Z";
     let body = match uri.path() {
         path if path == format!("/mc/apps/{MC}/summary") => {
-            json!({"monthlyCost": monthly_cost, "unused": KEY, "unusedId": MC})
+            let mut summary = json!({"monthlyCost": monthly_cost, "unused": KEY, "unusedId": MC});
+            if let Some(gb) = allocated_volume_gb {
+                summary["totalVolumeSizeInGb"] = json!(gb);
+            }
+            summary
         }
         path if path == format!("/mc/apps/{MC}/statistics/charts") => charts.unwrap_or_else(|| json!({
             "cpuUsageSplitChart": {"placeholder-pod": {"chart": {date: 0.5}}},
@@ -207,7 +213,7 @@ async fn allowed_routes_keep_identifier_case_and_send_required_query_windows() {
         let result = collect(&client, source, window, false).await.unwrap();
         match source.service {
             Service::MagicContainers => {
-                let expected = 2.0 * 0.0003125 + 0.005 + 0.10 / 720.0;
+                let expected = 0.5 * 0.02 + 2.0 * 0.0003125 + 0.005;
                 assert!((result.month_to_date.unwrap() - expected).abs() < 1e-10);
                 assert_eq!(result.projection, Some(2.50));
             }
@@ -253,13 +259,14 @@ async fn allowed_routes_keep_identifier_case_and_send_required_query_windows() {
 }
 
 #[tokio::test]
-async fn magic_container_chart_fixtures_price_closed_samples_and_surface_raw_cpu() {
+async fn magic_container_chart_fixtures_price_closed_hourly_and_daily_buckets() {
     let mock = Mock::start().await;
     let hourly = include_str!("fixtures/magic_containers_hourly_representative.json");
     {
         let mut state = mock.state.lock().unwrap();
         state.charts = Some(serde_json::from_str(hourly).unwrap());
         state.monthly_cost = Some(2.38);
+        state.allocated_volume_gb = Some(6.0);
     }
     let client = mock.client(Duration::from_secs(2));
     let cfg = config();
@@ -275,26 +282,27 @@ async fn magic_container_chart_fixtures_price_closed_samples_and_surface_raw_cpu
     assert_eq!(data.days.len(), 1);
     let costs = data.days[&month];
 
-    // The reported closed hours averaged 232, 256 and 260 MiB of RAM.
-    // Round each mean up to whole 64 MiB blocks (4 + 4 + 5).
-    // The missing 22:00 RAM point is not filled in.
-    let ram = 13.0 * 0.0003125;
+    // 232, 248, 272 and 304 MiB round to 4, 4, 5 and 5 blocks.
+    let ram = 0.005625;
+    // 0.875 + 1 + 1.125 + 1.25 yields 4.25 core-hours.
+    let cpu = 0.085;
     // Traffic sums to 20,000,000 bytes (4.8 + 6.2 + 5.4 + 3.6 MB).
     let egress = 0.0002;
-    // One GB of allocated volume for four hours of a 30-day month.
-    let volume = 0.10 * 4.0 / 720.0;
-    // The following day's 00:00 points fall in the open hour.
+    // The summary's 6 GB are prorated over 24.5 hours of a 30-day month.
+    let volume = 0.60 * 24.5 / 720.0;
+    // The response also has buckets before fromDate and at/after toDate.
     for (component, actual, expected) in [
+        ("CPU", costs.cpu_core_cost.unwrap(), cpu),
         ("RAM", costs.ram, ram),
         ("egress", costs.egress, egress),
-        ("volume", costs.volume, volume),
+        ("volume", data.allocated_volume_cost.unwrap(), volume),
     ] {
         assert!(
             (actual - expected).abs() < 1e-12,
             "{component}: {actual} != {expected}"
         );
     }
-    let subtotal = ram + egress + volume;
+    let subtotal = cpu + ram + egress + volume;
     assert!((data.month_to_date.unwrap() - subtotal).abs() < 1e-12);
     assert_eq!(data.projection, Some(2.38));
 
@@ -314,21 +322,34 @@ async fn magic_container_chart_fixtures_price_closed_samples_and_surface_raw_cpu
     };
     cache.publish(source.service, &feed);
     let report = serde_json::to_value(cache.view(observed).unwrap()).unwrap();
-    assert_eq!(report["magic_breakdown"].get("cpu"), Some(&Value::Null));
+    let cpu_report = report["magic_breakdown"]["cpu"].as_f64().unwrap();
+    assert!((cpu_report - cpu).abs() < 1e-12);
+    let volume_report = report["magic_breakdown"]["volume"].as_f64().unwrap();
+    assert!((volume_report - volume).abs() < 1e-12);
     assert_eq!(
         report["magic_cpu_hourly_averages"],
-        json!({"sampled_at": "2026-11-01T23:00:00Z", "min": 1.04, "max": 1.04})
+        json!({"sampled_at": "2026-11-01T23:00:00Z", "min": 1.25, "max": 1.25})
     );
 
     let daily = include_str!("fixtures/magic_containers_daily_representative.json");
     mock.state.lock().unwrap().charts = Some(serde_json::from_str(daily).unwrap());
-    let daily_window = Window {
-        to: midnight(observed.date_naive()),
-        ..window
-    };
-    let daily = collect(&client, source, daily_window, true).await.unwrap();
-    assert!((daily.days[&month].egress - egress).abs() < 1e-12);
+    let daily = collect(&client, source, window, true).await.unwrap();
+    assert_eq!(
+        daily.days.len(),
+        1,
+        "drop the partial day and earlier bucket"
+    );
+    let costs = daily.days[&month];
+    assert!(costs.complete);
+    // The provider's daily mean is weighted by sample counts (see fixture README).
+    // 250 MiB takes 4 blocks, while an unweighted 264 MiB would take 5.
+    assert!((costs.ram - 0.03).abs() < 1e-12);
+    // Mean 0.984375 cores × 24 h × $0.02, instead of mean 1.0625 cores.
+    assert!((costs.cpu_core_cost.unwrap() - 0.4725).abs() < 1e-12);
+    assert!((costs.egress - egress).abs() < 1e-12);
     assert!(daily.cpu_hourly_averages.is_none());
+    assert!(daily.allocated_volume_cost.is_none());
+    assert!((daily.month_to_date.unwrap() - 0.5027).abs() < 1e-12);
 }
 
 #[tokio::test]
@@ -360,6 +381,8 @@ async fn magic_container_cpu_range_uses_pods_from_the_latest_hour() {
     let cpu = data.cpu_hourly_averages.unwrap();
     assert_eq!(cpu.sampled_at, latest.parse::<DateTime<Utc>>().unwrap());
     assert_eq!((cpu.min, cpu.max), (0.98, 1.04));
+    let cpu_cost = data.days[&now.date_naive()].cpu_core_cost.unwrap();
+    assert!((cpu_cost - 0.0812).abs() < 1e-12);
 }
 
 #[tokio::test]
@@ -391,7 +414,7 @@ async fn magic_container_estimates_apply_regional_egress_rates() {
     let cpu = current.cpu_hourly_averages.unwrap();
     assert_eq!((cpu.min, cpu.max), (0.5, 0.5));
     close_enough(costs.ram, 2.0 * 0.0003125);
-    close_enough(costs.volume, 0.10 / (30.0 * 24.0));
+    assert_eq!(current.allocated_volume_cost, None);
     close_enough(costs.egress, 0.01 + 0.045 + 0.03 + 0.06);
     assert!(!current.egress_rate_unknown());
     assert_eq!(current.projection, Some(2.50));
@@ -403,7 +426,7 @@ async fn magic_container_estimates_apply_regional_egress_rates() {
     let daily = collect(&client, source, historical, true).await.unwrap();
     assert!(daily.cpu_hourly_averages.is_none());
     close_enough(daily.days[&day].ram, costs.ram * 24.0);
-    close_enough(daily.days[&day].volume, costs.volume * 24.0);
+    assert_eq!(daily.allocated_volume_cost, None);
     close_enough(daily.days[&day].egress, costs.egress);
 
     let mut idle = priced.clone();
@@ -478,16 +501,29 @@ async fn provider_errors_and_timeouts_are_bounded_and_redacted() {
     async {
         let client = mock.client(Duration::from_secs(2));
         let source = &config().sources[0];
+        let now = instant();
+        let month = month_start(now.date_naive());
+        let window = Window {
+            month,
+            from: midnight(month),
+            to: now,
+        };
         assert!(source.key.is_sensitive());
         for code in [301, 400, 401, 403, 404, 429, 500, 503] {
             mock.state.lock().unwrap().status = Some(StatusCode::from_u16(code).unwrap());
-            let failure = client.mc_projection(source).await.unwrap_err();
+            let failure = client
+                .mc_summary(source, window, &mut MonthData::default())
+                .await
+                .unwrap_err();
             assert_eq!(failure, Failure::Http(code));
             warn(source.service, failure);
         }
         mock.state.lock().unwrap().delay = Duration::from_secs(1);
         let short = mock.client(Duration::from_millis(50));
-        let failure = short.mc_projection(source).await.unwrap_err();
+        let failure = short
+            .mc_summary(source, window, &mut MonthData::default())
+            .await
+            .unwrap_err();
         assert_eq!(failure, Failure::Timeout);
         warn(source.service, failure);
     }
@@ -554,7 +590,7 @@ impl Drop for DbFile {
 }
 
 #[tokio::test]
-async fn stored_magic_costs_exclude_legacy_cpu_charges() {
+async fn stored_magic_costs_discard_legacy_charges_and_fill_in_verified_cpu() {
     let file =
         DbFile(std::env::temp_dir().join(format!("bunny_costs_{}.db", rand::random::<u64>())));
     let mut api_cfg = ApiProcessConfig::default();
@@ -603,16 +639,21 @@ async fn stored_magic_costs_exclude_legacy_cpu_charges() {
 
     let mock = Mock::start().await;
     let client = mock.client(Duration::from_secs(2));
-    let mut feed = Feed::default();
-    refresh_current(&app, &client, source, &mut feed, now)
+    let stored = db::bunny_cost_snapshots(&app.db, source.service, digest, prior, month)
         .await
         .unwrap();
+    let mut feed = Feed {
+        months: stored.into_iter().map(|row| (row.month, row)).collect(),
+        ..Feed::default()
+    };
+    app.bunny_costs.publish(source.service, &feed);
     let report = serde_json::to_value(app.bunny_costs.view(now).unwrap()).unwrap();
-    assert_eq!(report["magic_containers"]["month_to_date_usd"], 0.25);
+    assert_eq!(report["magic_containers"]["month_to_date_usd"], 0.1875);
     assert_eq!(report["magic_containers"]["projected_usd"], 3.50);
     assert_eq!(report["magic_breakdown"]["cpu"], Value::Null);
+    assert_eq!(report["magic_breakdown"]["volume"], Value::Null);
     assert!(report["magic_cpu_hourly_averages"].is_null());
-    assert_eq!(report["history"][0]["magic_containers"]["usd"], 0.25);
+    assert_eq!(report["history"][0]["magic_containers"]["usd"], 0.1875);
     assert!(mock.state.lock().unwrap().requests.is_empty());
 
     save(
@@ -625,32 +666,67 @@ async fn stored_magic_costs_exclude_legacy_cpu_charges() {
     )
     .await
     .unwrap();
-    assert_eq!(feed.months[&month].data.month_to_date, Some(0.25));
+    assert_eq!(feed.months[&month].data.month_to_date, Some(0.1875));
 
-    let observed = now + chrono::TimeDelta::seconds(1);
-    let data = collect(
+    let day = "2026-11-01T00:00:00Z";
+    let hour = "2026-11-17T00:00:00Z";
+    mock.state.lock().unwrap().charts = Some(json!({
+        "cpuUsageSplitChart": {"pod-example": {"chart": {day: 0.25, hour: 0.5}}},
+        "ramUsageSplitChart": {"pod-example": {"chart": {day: 268_435_456}}},
+        "trafficSplitChart": {},
+    }));
+    // A fresh legacy snapshot normally suppresses polling for six hours.
+    // Refresh it now to fill in CPU from the daily bucket without replacing saved RAM.
+    refresh_current(&app, &client, source, &mut feed, now)
+        .await
+        .unwrap();
+    refresh_current(&app, &client, source, &mut feed, now)
+        .await
+        .unwrap();
+    assert_eq!(mock.state.lock().unwrap().requests.len(), 3);
+    let report = serde_json::to_value(app.bunny_costs.view(now).unwrap()).unwrap();
+    assert_eq!(report["magic_cpu_hourly_averages"]["min"], 0.5);
+    assert_eq!(report["magic_cpu_hourly_averages"]["max"], 0.5);
+    assert_eq!(report["magic_containers"]["projected_usd"], 2.50);
+    let breakdown = &report["magic_breakdown"];
+    assert!((breakdown["cpu"].as_f64().unwrap() - 0.13).abs() < 1e-12);
+    assert_eq!(breakdown["ram"], 0.125);
+    assert_eq!(breakdown["volume"], Value::Null);
+    let subtotal = report["magic_containers"]["month_to_date_usd"]
+        .as_f64()
+        .unwrap();
+    assert!((subtotal - 0.3175).abs() < 1e-12);
+
+    let mut current = feed.months[&month].data.clone();
+    current.allocated_volume_cost = Some(0.25);
+    save(&app, source, &mut feed, month, now.timestamp(), current)
+        .await
+        .unwrap();
+    let closing = midnight(shift_month(month, 1));
+    let historical = collect(
         &client,
         source,
         Window {
             month,
             from: midnight(month),
-            to: observed,
+            to: closing,
         },
-        false,
+        true,
     )
     .await
     .unwrap();
-    save(&app, source, &mut feed, month, observed.timestamp(), data)
-        .await
-        .unwrap();
-    refresh_current(&app, &client, source, &mut feed, observed)
-        .await
-        .unwrap();
-    let report = serde_json::to_value(app.bunny_costs.view(observed).unwrap()).unwrap();
-    assert_eq!(report["magic_cpu_hourly_averages"]["min"], 0.5);
-    assert_eq!(report["magic_cpu_hourly_averages"]["max"], 0.5);
-    assert_eq!(report["magic_containers"]["projected_usd"], 2.50);
-    assert_eq!(report["magic_breakdown"]["cpu"], Value::Null);
+    assert!(historical.allocated_volume_cost.is_none());
+    save(
+        &app,
+        source,
+        &mut feed,
+        month,
+        closing.timestamp(),
+        historical,
+    )
+    .await
+    .unwrap();
+    assert_eq!(feed.months[&month].data.allocated_volume_cost, Some(0.25));
 }
 
 #[tokio::test]
