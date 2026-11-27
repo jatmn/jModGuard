@@ -359,6 +359,9 @@ async fn gateway_case(
     let revoke_bot_kick = event_kind == "role removal bot lost kick";
     let removal_cancelled = removal_paused || revoke_bot_kick;
     let removal_rejected = event_kind == "role removal partial";
+    let bot_lookup_timeout = event_kind == "role removal bot lookup timeout";
+    let bot_lookup_error = event_kind == "role removal bot lookup error";
+    let bot_lookup_failed = bot_lookup_timeout || bot_lookup_error;
     let mut config = jmodguard::config::BotProcessConfig::default();
     if ungrouped {
         config.log.group_automod_cleanup_deletes = false;
@@ -560,14 +563,19 @@ async fn gateway_case(
                     }
                     let (status, body) = match call.method {
                         Method::GET if call.path.ends_with(&bot_path) => {
-                            let body = match bot_without_kick_json {
-                                Some(json) if captured.lock().iter().any(|previous| {
+                            let after_removal = (bot_lookup_failed || bot_without_kick_json.is_some())
+                                && captured.lock().iter().any(|previous| {
                                     previous.method == Method::DELETE
                                         && previous.path.ends_with("/members/30/roles/25")
-                                }) => json,
-                                _ => bot_json,
-                            };
-                            (200, body)
+                                });
+                            match (after_removal, bot_without_kick_json) {
+                                (true, _) if bot_lookup_timeout => std::future::pending().await,
+                                (true, _) if bot_lookup_error => (
+                                    403, r#"{"code":50013,"message":"Missing Permissions"}"#.into(),
+                                ),
+                                (true, Some(json)) => (200, json),
+                                _ => (200, bot_json),
+                            }
                         }
                         Method::GET if call.path.contains("/members/") => {
                             let body = if staff_veto.load(Ordering::Relaxed) {
@@ -964,9 +972,13 @@ async fn gateway_case(
         let effects = if remove_roles && event_kind != "role removal no permission" {
             assert_eq!(effects[0].0, Method::DELETE);
             assert!(effects[0].1.ends_with("/members/30/roles/25"));
-            assert_eq!(effects[1].0, Method::DELETE);
-            assert!(effects[1].1.ends_with("/members/30/roles/24"));
-            &effects[2..]
+            if bot_lookup_failed {
+                &effects[1..]
+            } else {
+                assert_eq!(effects[1].0, Method::DELETE);
+                assert!(effects[1].1.ends_with("/members/30/roles/24"));
+                &effects[2..]
+            }
         } else {
             effects
         };
@@ -1062,7 +1074,9 @@ async fn gateway_case(
         if remove_roles {
             let (confirmed, unconfirmed) = match event_kind {
                 "role removal no permission" => (0, 2),
-                "role removal partial" => (1, 1),
+                "role removal partial"
+                | "role removal bot lookup timeout"
+                | "role removal bot lookup error" => (1, 1),
                 _ => (2, 0),
             };
             assert!(automod_log.2.contains(&format!(
@@ -1442,6 +1456,35 @@ async fn losing_the_bots_kick_role_after_a_removal_stops_the_sequence() {
             ),
         )
         .await;
+}
+
+async fn bot_member_lookup_failure_case(event_kind: &str) {
+    let now = Timestamp::from_millis(FIXTURE_NOW_MS).unwrap();
+    let member = member(MEMBER, &[TRAP_ROLE, 24, 25], now);
+    FIXTURE_NOW
+        .scope(
+            now,
+            gateway_case(
+                member.clone(),
+                member,
+                guild(Permissions::empty()),
+                event_kind,
+                30,
+                false,
+                true,
+            ),
+        )
+        .await;
+}
+
+#[tokio::test]
+async fn bot_member_lookup_timeout_skips_further_removal_and_kicks() {
+    bot_member_lookup_failure_case("role removal bot lookup timeout").await;
+}
+
+#[tokio::test]
+async fn bot_member_lookup_error_skips_further_removal_and_kicks() {
+    bot_member_lookup_failure_case("role removal bot lookup error").await;
 }
 
 #[tokio::test]

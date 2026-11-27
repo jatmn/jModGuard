@@ -675,10 +675,7 @@ impl DispatchGuard<'_> {
         let bot = if removal_roles.is_empty() {
             None
         } else {
-            let bot = tokio::time::timeout(DISCORD_REST_TIMEOUT, self.bot_member())
-                .await
-                .ok()
-                .flatten();
+            let bot = self.bot_member().await;
             refresh_rule(self.app, enrollment, self.matched, &mut dry_run).await?;
             bot
         };
@@ -753,7 +750,7 @@ impl DispatchGuard<'_> {
             prepared.guild = guild;
             prepared.member = member;
             prepared.rule = rule;
-            prepared.bot = Some(bot);
+            prepared.bot = bot;
         }
 
         let started_at_ms = now().timestamp_millis();
@@ -769,29 +766,39 @@ impl DispatchGuard<'_> {
 
     async fn bot_member(&self) -> Option<Member> {
         let bot_id = self.cache.current_user().id;
-        let member = self.http.get_member(self.event.guild, bot_id).await.ok()?;
+        let member = tokio::time::timeout(
+            DISCORD_REST_TIMEOUT,
+            self.http.get_member(self.event.guild, bot_id),
+        )
+        .await
+        .ok()?
+        .ok()?;
         (member.user.id == bot_id).then_some(member)
     }
 
     async fn recheck(
         &self,
         enrollment: &db::GuildEnrollment,
-    ) -> Option<(PartialGuild, Member, RuleDef, Member)> {
+    ) -> Option<(PartialGuild, Member, RuleDef, Option<Member>)> {
         let guild_id = self.event.guild;
-        let (guild, member, bot) = tokio::time::timeout(DISCORD_REST_TIMEOUT, async {
-            tokio::join!(
-                self.http.get_guild(guild_id),
-                self.http.get_member(guild_id, self.event.user.id),
-                self.bot_member(),
-            )
-        })
-        .await
-        .ok()?;
-        let (guild, member, bot) = (guild.ok()?, member.ok()?, bot?);
+        let (guild_and_target, bot) = tokio::join!(
+            tokio::time::timeout(DISCORD_REST_TIMEOUT, async {
+                tokio::try_join!(
+                    self.http.get_guild(guild_id),
+                    self.http.get_member(guild_id, self.event.user.id),
+                )
+            }),
+            self.bot_member(),
+        );
+        let (guild, member) = guild_and_target.ok()?.ok()?;
         let mut dry_run = false;
         let rule = refresh_rule(self.app, enrollment, self.matched, &mut dry_run).await?;
+        // Missing bot membership evidence skips later removals. A fresh member
+        // without kick capability still vetoes the kick.
         (!dry_run
-            && bot_can_act(&guild, &bot, &member, Permissions::KICK_MEMBERS)
+            && bot
+                .as_ref()
+                .is_none_or(|bot| bot_can_act(&guild, bot, &member, Permissions::KICK_MEMBERS))
             && self.member_admits(&guild, &member, &rule, false)
             && self
                 .claim
