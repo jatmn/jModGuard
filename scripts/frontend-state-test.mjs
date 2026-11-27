@@ -14383,24 +14383,27 @@ test('Bot Resources hides Bunny costs without config and renders partial provide
   snapshot = resourceSnapshot({ provider: {
     status: 'configured', month: '2026-11',
     magic_containers: { status: 'available', month_to_date_usd: 2.25, projected_usd: 4.75, last_updated_secs: RESOURCE_NOW_MS / 1000 },
-    magic_breakdown: { cpu: 1.20, ram: 0.30, egress: 0.75, volume: 0 },
+    magic_breakdown: { cpu: null, ram: 0.30, egress: 0.75, volume: 0 },
+    magic_cpu_hourly_averages: { sampled_at: '2026-11-18T11:00:00Z', min: 1.125, max: 1.625 },
     database: { status: 'unavailable', configured_resources: 1 },
     storage: { status: 'unavailable', month_to_date_usd: 0.005, projected_usd: 0.01, last_updated_secs: RESOURCE_NOW_MS / 1000, partial: true },
     cdn: { status: 'unavailable' },
-    history: [{ month: '2026-10', magic_containers: { usd: 3.25, partial: true }, database: { usd: 0 }, storage: null }],
+    history: [{ month: '2026-10', magic_containers: { usd: 3.25, partial: false }, database: { usd: 0 }, storage: null }],
   } });
   await fire(h.nodes.get('#refresh-resources'), 'click');
   const panel = section();
   assert.ok(panel);
   assert.match(textOf(panel), /2026-11 \(UTC\)/);
-  assert.match(textOf(panel), /Bunny supplies the Magic Containers projection/);
-  assert.match(textOf(panel), /chart estimates.*sample units and bucket aggregation/);
-  assert.match(textOf(panel), /Month-to-date estimate \(USD\)/);
+  assert.match(textOf(panel), /Bunny’s monthly figure is the authoritative Magic Containers projection/);
+  assert.match(textOf(panel), /partial chart estimates cover RAM, egress, and allocated volumes/);
+  assert.match(textOf(panel), /Projected month \(USD\)Month-to-date estimate \(USD\)/);
   assert.match(textOf(panel), /Estimated costs/);
-  assert.ok(panel.querySelector('[aria-label="Magic Containers month-to-date estimate components"]'));
-  assert.match(textOf(panel), /Magic Containers\$2.25\$4.75/);
+  const detail = panel.querySelector('[aria-label="Magic Containers month-to-date estimate components"]');
+  assert.match(textOf(detail), /CPU costNot computedCPU raw hourly average per pod \(unit unverified\)1.125–1.625/);
+  assert.equal(panel.querySelector('tbody strong').textContent, '$4.75');
+  assert.match(textOf(panel), /Magic Containers\$4.75\$2.25 \(partial\)/);
   assert.match(textOf(panel), /Database \(1 database\)Not available/);
-  assert.match(textOf(panel), /Storage<\$0.01 \(partial\)\$0.01.*last successful figures shown/);
+  assert.match(textOf(panel), /Storage\$0.01<\$0.01 \(partial\).*last successful figures shown/);
   assert.match(textOf(panel), /CDN.*Not available with scoped Bunny keys/);
   assert.match(textOf(panel), /2026-10\$3.25 \(partial\)\$0.00Not available/);
   assert.ok(h.nodes.get('#content').querySelector('[aria-labelledby="resources-memory-billing"]'));
@@ -14409,7 +14412,7 @@ test('Bot Resources hides Bunny costs without config and renders partial provide
   snapshot.provider.magic_breakdown.egress = null;
   snapshot.provider.history[0].magic_containers = { usd: null, egress_rate_unknown: true, partial: true };
   await fire(h.nodes.get('#refresh-resources'), 'click');
-  assert.match(textOf(section()), /Magic ContainersNot available\$4.75/);
+  assert.match(textOf(section()), /Magic Containers\$4.75Not available/);
   assert.match(textOf(section()), /EgressUnknown regional rate/);
   assert.match(textOf(section()), /2026-10Unknown egress rate \(partial\)/);
 

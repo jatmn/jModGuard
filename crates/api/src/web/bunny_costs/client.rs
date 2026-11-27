@@ -5,7 +5,7 @@ use chrono::{DateTime, NaiveDate, SecondsFormat, Utc};
 use reqwest::header::HeaderValue;
 use serde::{Deserialize, de::DeserializeOwned};
 
-use super::{Cost, Days, Failure, Source, Window};
+use super::{BunnyCpuAverages, Cost, Days, Failure, MonthData, Source, Window};
 
 const MAX_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
 const GB: f64 = 1_000_000_000.0;
@@ -13,7 +13,6 @@ const RAM_BLOCK: f64 = 64.0 * 1024.0 * 1024.0;
 // List prices checked 2026-11-26. See docs/CONFIGURATION.md for the sources
 // and assumptions, including the Storage tier.
 const RAM_BLOCK_HOUR: f64 = 0.0003125;
-const CORE_HOUR: f64 = 0.02;
 const VOLUME_GB_MONTH: f64 = 0.10;
 const STORAGE_GB_MONTH: f64 = 0.01;
 
@@ -87,7 +86,7 @@ impl Client {
         source: &Source,
         window: Window,
         hourly: bool,
-        days: &mut Days,
+        data: &mut MonthData,
     ) -> Result<(), Failure> {
         if window.from >= window.to {
             return Ok(());
@@ -106,18 +105,33 @@ impl Client {
                 ],
             )
             .await?;
-        // The published chart schema leaves sample units and bucket reducers
-        // unspecified. The estimate models average cores, average RAM bytes,
-        // traffic bytes per bucket, and provisioned volume bytes for the bucket.
-        let hours = if hourly { 1.0 } else { 24.0 };
-        let month_hours = window.month_days() * 24.0;
-        for series in charts.cpu.into_values() {
-            for (time, value) in series.chart {
-                if let Some(day) = window.day(time) {
-                    days.entry(day).or_default().cpu += nonnegative(value)? * hours * CORE_HOUR;
+        if hourly {
+            for series in charts.cpu.into_values() {
+                let Some((&sampled_at, &value)) =
+                    series.chart.range(window.from..window.to).next_back()
+                else {
+                    continue;
+                };
+                match &mut data.cpu_hourly_averages {
+                    Some(cpu) if sampled_at < cpu.sampled_at => {}
+                    Some(cpu) if sampled_at == cpu.sampled_at => {
+                        cpu.min = cpu.min.min(value);
+                        cpu.max = cpu.max.max(value);
+                    }
+                    _ => {
+                        data.cpu_hourly_averages = Some(BunnyCpuAverages {
+                            sampled_at,
+                            min: value,
+                            max: value,
+                        });
+                    }
                 }
             }
         }
+        // Price RAM bytes, traffic bytes per bucket, and provisioned volume.
+        let days = &mut data.days;
+        let hours = if hourly { 1.0 } else { 24.0 };
+        let month_hours = window.month_days() * 24.0;
         for series in charts.ram.into_values() {
             for (time, value) in series.chart {
                 if let Some(day) = window.day(time) {
@@ -301,7 +315,7 @@ struct McSummary {
 
 #[derive(Deserialize)]
 struct McCharts {
-    #[serde(rename = "cpuUsageSplitChart")]
+    #[serde(rename = "cpuUsageSplitChart", default)]
     cpu: BTreeMap<String, McSeries>,
     #[serde(rename = "ramUsageSplitChart")]
     ram: BTreeMap<String, McSeries>,

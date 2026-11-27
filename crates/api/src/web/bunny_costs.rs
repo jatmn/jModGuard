@@ -9,8 +9,8 @@ use std::time::Duration;
 
 use chrono::{DateTime, Datelike as _, Days as CalendarDays, Months, NaiveDate, Utc};
 use jmodguard::db::bunny_costs::{
-    self as db, BunnyCostSnapshot, BunnyDayCost as Cost, BunnyMonthData as MonthData,
-    BunnyService as Service, CostDays as Days, SourceDigest,
+    self as db, BunnyCostSnapshot, BunnyCpuAverages, BunnyDayCost as Cost,
+    BunnyMonthData as MonthData, BunnyService as Service, CostDays as Days, SourceDigest,
 };
 use jmodguard::db::{ControlOp, ControlReply};
 use reqwest::header::HeaderValue;
@@ -176,14 +176,13 @@ async fn collect(
     window: Window,
     historical: bool,
 ) -> Result<MonthData, Failure> {
-    let mut projection = None;
-    let mut days = match source.service {
+    let mut data = MonthData::default();
+    match source.service {
         Service::MagicContainers => {
-            let mut days = Days::new();
             if historical {
-                client.mc_days(source, window, false, &mut days).await?;
+                client.mc_days(source, window, false, &mut data).await?;
             } else {
-                projection = Some(client.mc_projection(source).await?);
+                data.projection = Some(client.mc_projection(source).await?);
                 // Bunny's hourly charts are limited to a seven-day window.
                 // Use the most recent six full days plus today's closed hours.
                 let recent = midnight(window.to.date_naive() - CalendarDays::new(6));
@@ -199,7 +198,7 @@ async fn collect(
                             ..window
                         },
                         false,
-                        &mut days,
+                        &mut data,
                     )
                     .await?;
                 client
@@ -211,17 +210,16 @@ async fn collect(
                             ..window
                         },
                         true,
-                        &mut days,
+                        &mut data,
                     )
                     .await?;
             }
-            days
         }
         Service::CoreDatabase | Service::GuildDatabase => {
-            client.database_days(source, window, !historical).await?
+            data.days = client.database_days(source, window, !historical).await?;
         }
-        Service::Storage => client.storage_days(source, window).await?,
-    };
+        Service::Storage => data.days = client.storage_days(source, window).await?,
+    }
     // Allow the same publication lag for a day at the end of a live
     // window as for the final day at month rollover.
     let complete_to = if historical {
@@ -229,14 +227,9 @@ async fn collect(
     } else {
         window.to - REFRESH
     };
-    for (date, day) in &mut days {
+    for (date, day) in &mut data.days {
         day.complete = *date < complete_to.date_naive();
     }
-    let mut data = MonthData {
-        days,
-        projection,
-        ..MonthData::default()
-    };
     data.summarize(source.service, window.month, window.to);
     Ok(data)
 }
@@ -303,11 +296,11 @@ impl Cache {
                 });
             }
         }
-        let mc_days = magic.first().and_then(|feed| feed.months.get(&month));
-        let breakdown = mc_days.filter(|row| !row.data.days.is_empty()).map(|row| {
+        let mc_month = magic.first().and_then(|feed| feed.months.get(&month));
+        let breakdown = mc_month.filter(|row| !row.data.days.is_empty()).map(|row| {
             let days = row.data.days.values();
             MagicBreakdown {
-                cpu: days.clone().map(|day| day.cpu).sum(),
+                cpu: None,
                 ram: days.clone().map(|day| day.ram).sum(),
                 egress: (!row.data.egress_rate_unknown())
                     .then(|| days.clone().map(|day| day.egress).sum()),
@@ -319,6 +312,7 @@ impl Cache {
             month: month.format("%Y-%m").to_string(),
             magic_containers: current(&magic, month),
             magic_breakdown: breakdown,
+            magic_cpu_hourly_averages: mc_month.and_then(|row| row.data.cpu_hourly_averages),
             database: current(&databases, month),
             storage: current(&storage, month),
             cdn: Current::default(),
@@ -333,6 +327,7 @@ pub(super) struct Report {
     month: String,
     magic_containers: Current,
     magic_breakdown: Option<MagicBreakdown>,
+    magic_cpu_hourly_averages: Option<BunnyCpuAverages>,
     database: Current,
     storage: Current,
     cdn: Current,
@@ -341,7 +336,7 @@ pub(super) struct Report {
 
 #[derive(Serialize)]
 struct MagicBreakdown {
-    cpu: f64,
+    cpu: Option<f64>,
     ram: f64,
     egress: Option<f64>,
     volume: f64,

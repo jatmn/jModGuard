@@ -86,20 +86,20 @@ does not trim or change ID case. The Bunny panel appears only when the API can
 start a collector for at least one valid key-and-ID pair. Scoped keys cannot
 read CDN statistics.
 
-Costs use UTC calendar months and USD. The Magic Containers projection uses
-Bunny's app-summary `monthlyCost`. The summary schema leaves its accrual
-window unspecified. The month-to-date estimate, components, and historical
-cost estimates use a chart model for
+Costs use UTC calendar months and USD. Bunny's app-summary `monthlyCost` is
+the authoritative Magic Containers projection. The month-to-date subtotal
+and history are partial estimates covering RAM, egress, and volumes.
+The chart endpoint provides data for
 CPU, RAM, traffic, and allocated volume capacity. The [chart response schema](https://bunny.net/docs/api-reference/magic-containers/applications/get-application-statistics-charts.md)
 defines numeric samples. Monitoring documents hourly and daily chart points
-and period summaries. The raw sample units, bucket reducers, timestamp
-alignment, and partial-bucket rules remain unspecified.
+and period summaries. The CPU unit, daily RAM aggregation, volume sample unit
+and reducer, timestamp alignment, and partial-bucket rules remain unverified.
 
-| Chart field | Published chart scope | Estimate assumption |
+| Chart field | Observed or published scope | Treatment |
 | --- | --- | --- |
-| `cpuUsageSplitChart` | CPU usage per pod | Average cores over the bucket |
-| `ramUsageSplitChart` | Memory usage per pod | Average bytes over the bucket, rounded into 64 MiB blocks |
-| `trafficSplitChart` | Traffic served per pod and region | Transferred egress bytes summed within each bucket |
+| `cpuUsageSplitChart` | Hourly mean per pod | Raw readings from the latest closed hour, shown as a range for multiple pods with different values. Unit unverified. CPU cost is uncomputed. |
+| `ramUsageSplitChart` | Hourly mean in bytes per pod | Rounded into 64 MiB blocks for each pod. The daily estimate uses the daily value as a mean. |
+| `trafficSplitChart` | Bytes summed per bucket, with daily values equal to the sum of hourly values | Priced as egress at the rate for the reporting pod's region |
 | `volumesSplitCapacityChart` | Allocated capacity per volume instance | Provisioned bytes applied for the bucket's duration |
 
 Missing values can leave gaps in these estimates. Bunny's billed RAM

@@ -7,7 +7,7 @@ use axum::{
 };
 use chrono::TimeZone as _;
 use jmodguard::config::ApiProcessConfig;
-use jmodguard::db::Db;
+use jmodguard::db::{Db, SqlExecutor as _, params};
 use serde_json::{Value, json};
 use std::{
     io::{self, Write},
@@ -205,7 +205,7 @@ async fn allowed_routes_keep_identifier_case_and_send_required_query_windows() {
         let result = collect(&client, source, window, false).await.unwrap();
         match source.service {
             Service::MagicContainers => {
-                let expected = 0.01 + 2.0 * 0.0003125 + 0.005 + 0.10 / 720.0;
+                let expected = 2.0 * 0.0003125 + 0.005 + 0.10 / 720.0;
                 assert!((result.month_to_date.unwrap() - expected).abs() < 1e-10);
                 assert_eq!(result.projection, Some(2.50));
             }
@@ -270,15 +270,12 @@ async fn magic_container_hourly_fixture_prices_closed_samples() {
     assert_eq!(data.days.len(), 1);
     let costs = data.days[&month];
 
-    // Under the estimate model, the three closed hours add up to
-    // (0.025 + 0.05 + 0.005) core-hours * $0.02 = $0.0016.
     // RAM has 56 MiB (one block), 96 MiB (two blocks), then a missing point.
     // The two recorded RAM points cost 3 * $0.0003125 = $0.0009375.
     // Traffic costs (2 + 3 + 1) MB / 1000 * $0.01 = $0.00006.
     // One allocated GB over three hours costs $0.10 * 3 / (30 * 24).
     // The 03:00 points belong to the open hour and contribute no cost.
     for (component, actual, expected) in [
-        ("CPU", costs.cpu, 0.0016),
         ("RAM", costs.ram, 0.0009375),
         ("egress", costs.egress, 0.00006),
         ("volume", costs.volume, 0.10 * 3.0 / 720.0),
@@ -288,6 +285,14 @@ async fn magic_container_hourly_fixture_prices_closed_samples() {
             "{component}: {actual} != {expected}"
         );
     }
+    let subtotal = 0.0009375 + 0.00006 + 0.10 * 3.0 / 720.0;
+    assert!((data.month_to_date.unwrap() - subtotal).abs() < 1e-12);
+    let cpu = data.cpu_hourly_averages.unwrap();
+    assert_eq!(
+        cpu.sampled_at,
+        midnight(month) + chrono::TimeDelta::hours(2)
+    );
+    assert_eq!((cpu.min, cpu.max), (1.25, 1.75));
     assert_eq!(data.projection, Some(2.50));
 }
 
@@ -306,9 +311,7 @@ async fn magic_container_estimates_apply_regional_egress_rates() {
         to: instant(),
     };
 
-    // The public API schema leaves these units unspecified. The mock's raw
-    // values represent 0.5 average cores, just over 64 MiB RAM, a 1 GB volume,
-    // and one decimal GB transferred per traffic series in a single bucket.
+    // Each traffic series reports one decimal GB in a single bucket.
     let priced = json!({
         "placeholder-eu": {"region": "AMS", "chart": {date: 1_000_000_000}},
         "placeholder-sa": {"region": "SA", "chart": {date: 1_000_000_000}},
@@ -319,7 +322,8 @@ async fn magic_container_estimates_apply_regional_egress_rates() {
     let close_enough = |actual: f64, expected: f64| assert!((actual - expected).abs() < 1e-10);
     let current = collect(&client, source, window, false).await.unwrap();
     let costs = current.days[&day];
-    close_enough(costs.cpu, 0.5 * 0.02);
+    let cpu = current.cpu_hourly_averages.unwrap();
+    assert_eq!((cpu.min, cpu.max), (0.5, 0.5));
     close_enough(costs.ram, 2.0 * 0.0003125);
     close_enough(costs.volume, 0.10 / (30.0 * 24.0));
     close_enough(costs.egress, 0.01 + 0.045 + 0.03 + 0.06);
@@ -331,7 +335,7 @@ async fn magic_container_estimates_apply_regional_egress_rates() {
         ..window
     };
     let daily = collect(&client, source, historical, true).await.unwrap();
-    close_enough(daily.days[&day].cpu, costs.cpu * 24.0);
+    assert!(daily.cpu_hourly_averages.is_none());
     close_enough(daily.days[&day].ram, costs.ram * 24.0);
     close_enough(daily.days[&day].volume, costs.volume * 24.0);
     close_enough(daily.days[&day].egress, costs.egress);
@@ -481,6 +485,106 @@ impl Drop for DbFile {
         }
         jmodguard::tenant::remove_sidecars(&self.0);
     }
+}
+
+#[tokio::test]
+async fn stored_magic_costs_exclude_legacy_cpu_charges() {
+    let file =
+        DbFile(std::env::temp_dir().join(format!("bunny_costs_{}.db", rand::random::<u64>())));
+    let mut api_cfg = ApiProcessConfig::default();
+    api_cfg.db.path = file.0.clone();
+    let app = ApiState::new(api_cfg, Db::open(&file.0, 2).unwrap()).unwrap();
+    let cfg = config();
+    let source = &cfg.sources[0];
+    app.bunny_costs.enable(&cfg);
+    let now = instant();
+    let month = month_start(now.date_naive());
+    let prior = shift_month(month, -1);
+    let fetched_at = now.timestamp();
+    let digest = source.digest();
+    app.db
+        .with_conn(move |conn| {
+            for (date, projection) in [(month, Some(3.50)), (prior, None)] {
+                let row = json!({
+                    "month": date,
+                    "fetched_at": fetched_at,
+                    "data": {
+                        "days": { (date.to_string()): {
+                            "cpu": 1.25, "ram": 0.125, "egress": 0.0625,
+                            "volume": 0.0625, "storage": 0.0, "complete": true
+                        }},
+                        "month_to_date": 1.50, "projection": projection,
+                        "closed": false, "partial": true
+                    }
+                });
+                conn.execute_bounded(
+                    "INSERT INTO bunny_cost_snapshots (service, month, source_digest, fetched_at, data) \
+                     VALUES (?1, ?2, ?3, ?4, ?5)",
+                    params![
+                        Service::MagicContainers.name(),
+                        midnight(date).timestamp(),
+                        digest.to_vec(),
+                        fetched_at,
+                        row.to_string(),
+                    ],
+                    1024 * 1024,
+                )?;
+            }
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+    let mock = Mock::start().await;
+    let client = mock.client(Duration::from_secs(2));
+    let mut feed = Feed::default();
+    refresh_current(&app, &client, source, &mut feed, now)
+        .await
+        .unwrap();
+    let report = serde_json::to_value(app.bunny_costs.view(now).unwrap()).unwrap();
+    assert_eq!(report["magic_containers"]["month_to_date_usd"], 0.25);
+    assert_eq!(report["magic_containers"]["projected_usd"], 3.50);
+    assert_eq!(report["magic_breakdown"]["cpu"], Value::Null);
+    assert!(report["magic_cpu_hourly_averages"].is_null());
+    assert_eq!(report["history"][0]["magic_containers"]["usd"], 0.25);
+    assert!(mock.state.lock().unwrap().requests.is_empty());
+
+    save(
+        &app,
+        source,
+        &mut feed,
+        month,
+        fetched_at - 1,
+        MonthData::default(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(feed.months[&month].data.month_to_date, Some(0.25));
+
+    let observed = now + chrono::TimeDelta::seconds(1);
+    let data = collect(
+        &client,
+        source,
+        Window {
+            month,
+            from: midnight(month),
+            to: observed,
+        },
+        false,
+    )
+    .await
+    .unwrap();
+    save(&app, source, &mut feed, month, observed.timestamp(), data)
+        .await
+        .unwrap();
+    refresh_current(&app, &client, source, &mut feed, observed)
+        .await
+        .unwrap();
+    let report = serde_json::to_value(app.bunny_costs.view(observed).unwrap()).unwrap();
+    assert_eq!(report["magic_cpu_hourly_averages"]["min"], 0.5);
+    assert_eq!(report["magic_cpu_hourly_averages"]["max"], 0.5);
+    assert_eq!(report["magic_containers"]["projected_usd"], 2.50);
+    assert_eq!(report["magic_breakdown"]["cpu"], Value::Null);
 }
 
 #[tokio::test]

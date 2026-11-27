@@ -466,7 +466,10 @@ See [hosting estimate configuration](CONFIGURATION.md#hosting-estimates).
 
 When configured, **Bunny cost estimates** shows accrued and projected USD by
 service for the UTC billing month, with up to 12 past months of stored
-estimates. The history marks incomplete months and keeps missing values
+estimates. The Magic Containers projection comes from Bunny's monthly summary.
+Its partial chart estimates cover RAM, egress, and volumes. The latest hourly
+CPU averages appear with the unit marked unverified, and CPU cost is uncomputed.
+The history marks incomplete months and keeps missing values
 separate from $0. Scoped Bunny keys leave CDN costs unavailable. The owner
 page reads snapshots and stays usable during a provider outage.
 See [Bunny provider configuration](CONFIGURATION.md#bunny-provider-cost-estimates).

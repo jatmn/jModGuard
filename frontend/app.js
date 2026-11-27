@@ -1796,7 +1796,8 @@ function BunnyCostHistory({ history }) {
             const parts = services.map(([key, label, tone]) => {
               const cost = month[key];
               return {
-                key, label, tone, value: cost?.usd, partial: cost?.partial,
+                key, label, tone, value: cost?.usd,
+                partial: cost?.partial || (key === "magic_containers" && Number.isFinite(cost?.usd)),
                 display: cost?.egress_rate_unknown ? "Unknown egress rate" : bunnyUsd(cost?.usd),
               };
             });
@@ -1804,7 +1805,7 @@ function BunnyCostHistory({ history }) {
               h("th", { scope: "row" }, month.month),
               h("td", null, h(ShareBar, {
                 parts, total: max || 1,
-                summary: parts.map((part) => `${part.label} ${part.display}`).join(", "),
+                summary: parts.map((part) => `${part.label} ${part.display}${part.partial ? " (partial)" : ""}`).join(", "),
               })),
               ...parts.map((part) => h("td", { key: part.key },
                 part.display, part.partial ? " (partial)" : "",
@@ -1818,18 +1819,26 @@ function BunnyCostHistory({ history }) {
 
 function BunnyCostPanel({ provider }) {
   const breakdown = provider.magic_breakdown;
+  const cpu = provider.magic_cpu_hourly_averages;
+  let cpuAverage = "Not available";
+  if (cpu) {
+    cpuAverage = cpu.min === cpu.max ? String(cpu.min) : `${cpu.min}–${cpu.max}`;
+  }
   return analyticsPanel("Bunny cost estimates", "resources-bunny-costs", h("div", null,
     h("p", { className: "an-note muted" },
-      `${provider.month} (UTC). Bunny supplies the Magic Containers projection. Magic Containers month-to-date costs, components, and history are chart estimates. The published chart schema leaves sample units and bucket aggregation unspecified, and the estimates may have gaps.`,
+      `${provider.month} (UTC). Bunny’s monthly figure is the authoritative Magic Containers projection. The partial chart estimates cover RAM, egress, and allocated volumes.`,
     ),
     h("div", { className: "table-scroll rounded-box", tabIndex: 0, role: "region", "aria-label": "Current Bunny costs" },
       h("table", { className: "table table-sm" },
         h("thead", null, h("tr", null,
-          ...["Service", "Month-to-date estimate (USD)", "Projected month (USD)", "Last updated"].map((label) =>
+          ...["Service", "Projected month (USD)", "Month-to-date estimate (USD)", "Last updated"].map((label) =>
             h("th", { key: label, scope: "col" }, label)),
         )),
         h("tbody", null, ...BUNNY_COST_SERVICES.map(([key, label]) => {
           const service = provider[key];
+          const magic = key === "magic_containers";
+          const projection = bunnyUsd(service?.projected_usd);
+          const partial = service?.partial || (magic && Number.isFinite(service?.month_to_date_usd));
           const status = key === "cdn" ? "Not available with scoped Bunny keys"
             : service?.status !== "available" && service?.last_updated_secs
             ? "Not available · last successful figures shown" : null;
@@ -1837,8 +1846,8 @@ function BunnyCostPanel({ provider }) {
             h("th", { scope: "row" }, label,
               key === "database" && service?.configured_resources === 1 ? " (1 database)" : "",
             ),
-            h("td", null, bunnyUsd(service?.month_to_date_usd), service?.partial ? " (partial)" : ""),
-            h("td", null, bunnyUsd(service?.projected_usd)),
+            h("td", null, magic ? h("strong", null, projection) : projection),
+            h("td", null, bunnyUsd(service?.month_to_date_usd), partial ? " (partial)" : ""),
             h("td", null, service?.last_updated_secs ? formatInstant(service.last_updated_secs * 1000) : "—",
               status && h("div", { className: "muted" }, status),
             ),
@@ -1846,8 +1855,11 @@ function BunnyCostPanel({ provider }) {
         })),
       ),
     ),
-    breakdown && h("dl", { className: "du-facts", "aria-label": "Magic Containers month-to-date estimate components" },
-      ...[["CPU", "cpu"], ["RAM", "ram"], ["Egress", "egress"], ["Volumes", "volume"]].map(([label, key]) =>
+    (breakdown || cpu) && h("dl", { className: "du-facts", "aria-label": "Magic Containers month-to-date estimate components" },
+      h("div", null, h("dt", null, "CPU cost"), h("dd", null, "Not computed")),
+      h("div", null, h("dt", null, "CPU raw hourly average per pod (unit unverified)"),
+        h("dd", { title: cpu && formatInstant(Date.parse(cpu.sampled_at)) }, cpuAverage)),
+      ...(breakdown ? [["RAM", "ram"], ["Egress", "egress"], ["Volumes", "volume"]] : []).map(([label, key]) =>
         h("div", { key }, h("dt", null, label), h("dd", null, key === "egress" && breakdown[key] == null ? "Unknown regional rate" : bunnyUsd(breakdown[key]))),
       ),
     ),

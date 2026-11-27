@@ -33,7 +33,6 @@ impl BunnyService {
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Serialize)]
 pub struct BunnyDayCost {
-    pub cpu: f64,
     pub ram: f64,
     pub egress: f64,
     pub volume: f64,
@@ -44,9 +43,18 @@ pub struct BunnyDayCost {
     pub egress_rate_unknown: bool,
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+pub struct BunnyCpuAverages {
+    pub sampled_at: DateTime<Utc>,
+    pub min: f64,
+    pub max: f64,
+}
+
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct BunnyMonthData {
     pub days: CostDays,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cpu_hourly_averages: Option<BunnyCpuAverages>,
     pub month_to_date: Option<f64>,
     pub projection: Option<f64>,
     pub closed: bool,
@@ -63,6 +71,15 @@ impl BunnyMonthData {
 
     pub fn egress_rate_unknown(&self) -> bool {
         self.days.values().any(|day| day.egress_rate_unknown)
+    }
+
+    fn magic_subtotal(&self) -> Option<f64> {
+        (!self.days.is_empty() && !self.egress_rate_unknown()).then(|| {
+            self.days
+                .values()
+                .map(|day| day.ram + day.egress + day.volume)
+                .sum()
+        })
     }
 
     fn merge_days(&mut self, previous: CostDays) {
@@ -87,16 +104,7 @@ impl BunnyMonthData {
         self.partial = !self.covers(month, completed_to);
         self.closed = !self.partial && completed_to == next;
         self.month_to_date = match service {
-            BunnyService::MagicContainers
-                if !self.days.is_empty() && !self.egress_rate_unknown() =>
-            {
-                Some(
-                    self.days
-                        .values()
-                        .map(|day| day.cpu + day.ram + day.egress + day.volume)
-                        .sum(),
-                )
-            }
+            BunnyService::MagicContainers => self.magic_subtotal(),
             BunnyService::Storage if !self.days.is_empty() => {
                 Some(self.days.values().map(|day| day.storage).sum())
             }
@@ -124,6 +132,15 @@ pub struct BunnyCostSnapshot {
     pub month: NaiveDate,
     pub fetched_at: i64,
     pub data: BunnyMonthData,
+}
+
+impl BunnyCostSnapshot {
+    fn refresh_stored_total(&mut self, service: BunnyService) {
+        if service == BunnyService::MagicContainers {
+            // Earlier snapshots included an estimated CPU charge in the total.
+            self.data.month_to_date = self.data.magic_subtotal();
+        }
+    }
 }
 
 fn midnight_secs(date: NaiveDate) -> i64 {
@@ -154,7 +171,11 @@ pub async fn bunny_cost_snapshots(
             |row| Ok(row.get(0)?),
         )?;
         tx.finish_read()?;
-        Ok(serde_json::from_str(&rows)?)
+        let mut rows: Vec<BunnyCostSnapshot> = serde_json::from_str(&rows)?;
+        for row in &mut rows {
+            row.refresh_stored_total(service);
+        }
+        Ok(rows)
     })
     .await
 }
@@ -182,9 +203,18 @@ pub(super) async fn store_bunny_cost_snapshot(
                     && date.month() == row.month.month()
                     && *date <= observed.date_naive()
                     && (!cost.complete || *date < observed.date_naive())
-                    && [cost.cpu, cost.ram, cost.egress, cost.volume, cost.storage]
+                    && [cost.ram, cost.egress, cost.volume, cost.storage]
                         .into_iter()
                         .all(valid_amount)
+            })
+            && row.data.cpu_hourly_averages.is_none_or(|cpu| {
+                service == BunnyService::MagicContainers
+                    && cpu.sampled_at.year() == row.month.year()
+                    && cpu.sampled_at.month() == row.month.month()
+                    && cpu.sampled_at < observed
+                    && cpu.min.is_finite()
+                    && cpu.max.is_finite()
+                    && cpu.min <= cpu.max
             })
             && row.data.month_to_date.is_none_or(valid_amount)
             && row.data.projection.is_none_or(valid_amount),
@@ -201,9 +231,10 @@ pub(super) async fn store_bunny_cost_snapshot(
             )
             .optional()?;
         if let Some(previous) = previous {
-            let previous: BunnyCostSnapshot = serde_json::from_str(&previous)?;
+            let mut previous: BunnyCostSnapshot = serde_json::from_str(&previous)?;
             if previous.fetched_at > row.fetched_at {
                 tx.finish_read()?;
+                previous.refresh_stored_total(service);
                 return Ok(previous);
             }
             row.data.merge_days(previous.data.days);
