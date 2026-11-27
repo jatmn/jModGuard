@@ -90,7 +90,7 @@ impl ResourceRange {
     }
 }
 
-#[derive(PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 struct ResourceWindow {
     span_secs: i64,
     bucket_secs: i64,
@@ -102,6 +102,7 @@ struct ResourceWindow {
 struct CachedHistory {
     /// Completion time of the last read attempt, including failures.
     checked_at: Instant,
+    /// The last attempt's window, which can differ from the prepared data.
     window: ResourceWindow,
     prepared: Option<Arc<PreparedHistory>>,
     stale: bool,
@@ -120,6 +121,7 @@ impl CachedHistory {
 
 /// Encoded history and saved bot status from one database snapshot.
 struct PreparedHistory {
+    window: ResourceWindow,
     bot: Box<RawValue>,
     api: Box<RawValue>,
     combined_memory_peak: PairedMemoryPeak,
@@ -132,18 +134,13 @@ impl PreparedHistory {
             from_secs,
             to_secs,
             bucket_secs,
-            eligible_to_secs,
             ..
         } = *window;
         Ok(Self {
+            window: *window,
             bot: to_raw_value(&history_json(&records.bot, from_secs, to_secs, bucket_secs))?,
             api: to_raw_value(&history_json(&records.api, from_secs, to_secs, bucket_secs))?,
-            combined_memory_peak: combined_memory_peak(
-                &records.bot,
-                &records.api,
-                from_secs,
-                eligible_to_secs,
-            ),
+            combined_memory_peak: combined_memory_peak(&records.bot, &records.api, window),
             bot_status: records
                 .statuses
                 .into_iter()
@@ -249,11 +246,14 @@ async fn history(
     let (prepared, stale) = match prepared {
         Some(prepared) => (Some(prepared), false),
         None => {
-            let last = cache.remove(&range).filter(|entry| {
-                entry.window.to_secs == window.to_secs
-                    && entry.window.eligible_to_secs <= window.eligible_to_secs
-            });
-            (last.and_then(|entry| entry.prepared), true)
+            let last = cache
+                .remove(&range)
+                .and_then(|entry| entry.prepared)
+                .filter(|history| {
+                    history.window.to_secs == window.to_secs
+                        && history.window.eligible_to_secs <= window.eligible_to_secs
+                });
+            (last, true)
         }
     };
     let entry = cache.entry(range).insert_entry(CachedHistory {
@@ -269,7 +269,7 @@ async fn history(
 struct ResourcesOverview<'a> {
     bucket_secs: i64,
     cgroup_relation: Value,
-    combined_memory_peak: Option<Value>,
+    combined_memory_peak: Option<&'a PairedMemoryPeak>,
     from_secs: i64,
     generated_at_ms: i64,
     history_status: &'static str,
@@ -307,8 +307,8 @@ fn build_response(
         bucket_secs,
         from_secs,
         to_secs,
-        eligible_to_secs,
-    } = range.window(now_ms / 1000);
+        ..
+    } = prepared.map_or_else(|| range.window(now_ms / 1000), |history| history.window);
     let bot_status = prepared.and_then(|history| history.bot_status.as_ref());
     let (memory_relation, cpu_relation) =
         bot_status.map_or((CgroupRelation::Unknown, CgroupRelation::Unknown), |bot| {
@@ -329,14 +329,7 @@ fn build_response(
             "memory": estimate_relation(memory_relation),
             "cpu": estimate_relation(cpu_relation),
         }),
-        combined_memory_peak: prepared.map(|history| {
-            let peak = &history.combined_memory_peak;
-            json!({
-                "peak_bytes": peak.peak_bytes,
-                "periods": peak.periods,
-                "total_periods": (eligible_to_secs - from_secs) / span_secs,
-            })
-        }),
+        combined_memory_peak: prepared.map(|history| &history.combined_memory_peak),
         from_secs,
         generated_at_ms: now_ms,
         history_status,
@@ -388,9 +381,11 @@ fn current(status: Option<&ProcessStatus>, now_ms: i64) -> Value {
     })
 }
 
+#[derive(Serialize)]
 struct PairedMemoryPeak {
     peak_bytes: Option<u64>,
     periods: u64,
+    total_periods: i64,
 }
 
 /// The largest bot plus API memory peak over eligible periods that both
@@ -399,10 +394,11 @@ struct PairedMemoryPeak {
 fn combined_memory_peak(
     bot: &[Rollup],
     api: &[Rollup],
-    from_secs: i64,
-    to_secs: i64,
+    window: &ResourceWindow,
 ) -> PairedMemoryPeak {
-    let in_range = |row: &&Rollup| row.start_secs >= from_secs && row.start_secs < to_secs;
+    let in_range = |row: &&Rollup| {
+        row.start_secs >= window.from_secs && row.start_secs < window.eligible_to_secs
+    };
     let api: HashMap<i64, u64> = api
         .iter()
         .filter(in_range)
@@ -421,6 +417,7 @@ fn combined_memory_peak(
     PairedMemoryPeak {
         peak_bytes: peak,
         periods,
+        total_periods: (window.eligible_to_secs - window.from_secs) / window.span_secs,
     }
 }
 

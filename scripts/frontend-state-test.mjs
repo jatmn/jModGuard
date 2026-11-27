@@ -14444,6 +14444,24 @@ test('Bot Resources rounds the paired-period memory peak and shows its coverage'
   }
 });
 
+test('Bot Resources keeps complete paired coverage visible when history goes stale', async () => {
+  let snapshot = resourceSnapshot({
+    generated_at_ms: RESOURCE_NOW_MS + 150_000,
+    combined_memory_peak: { peak_bytes: 128 * 2 ** 20, periods: 1432, total_periods: 1432 },
+  });
+  const h = ownerHarness(async () => response(snapshot));
+  h.app.navigate('resources');
+  await settle();
+  assert.equal(h.nodes.get('#resources-status'), null);
+
+  snapshot = { ...snapshot, generated_at_ms: RESOURCE_NOW_MS + 180_000, history_status: 'stale' };
+  await fire(h.nodes.get('#refresh-resources'), 'click');
+  const panel = h.nodes.get('#content').querySelector('[aria-labelledby="resources-memory-billing"]');
+  assert.equal(resourceFact(panel, 'Paired memory coverage'), '1,432 of 1,432 minutes');
+  assert.doesNotMatch(textOf(panel), /can hide higher peaks/);
+  assert.match(h.nodes.get('#resources-status').textContent, /History could not be refreshed; trends are from the last successful read \(stale\)/);
+});
+
 test('Bot Resources displays sparse or empty paired coverage with an unpaired spike', async () => {
   const mib = 2 ** 20;
   const [pairedBucket, spikeBucket] = resourcePoints([100, 200]);

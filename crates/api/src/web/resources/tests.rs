@@ -397,6 +397,66 @@ async fn paired_minute_coverage_excludes_open_and_future_minutes() {
 }
 
 #[tokio::test]
+async fn failed_refresh_keeps_complete_paired_coverage_from_the_cached_snapshot() {
+    let f = fixture();
+    let range = ResourceRange::Day;
+    let now = 1_800_000_150;
+    let window = range.window(now);
+    let rows: Vec<_> = (window.from_secs..window.eligible_to_secs)
+        .step_by(60)
+        .map(|start| minute(start, 100, 0, 1))
+        .collect();
+    let records = ResourceRecords {
+        bot: rows.clone(),
+        api: rows,
+        ..ResourceRecords::default()
+    };
+    let snapshot = Arc::new(PreparedHistory::new(records, &window).unwrap());
+    assert_eq!(history(&f.app, range, now).await.1, "available");
+    f.app
+        .resource_cache
+        .entries
+        .lock()
+        .await
+        .get_mut(&range)
+        .unwrap()
+        .prepared = Some(snapshot.clone());
+    let complete = json!({"peak_bytes": 4200, "periods": 1432, "total_periods": 1432});
+    assert_eq!(paired_peak_at(&f, range, now).await, complete);
+
+    f.app
+        .db
+        .with_conn(|conn| {
+            conn.execute_batch_bounded(
+                "ALTER TABLE resource_rollups RENAME TO offline_rollups",
+                64 * 1024 * 1024,
+            )
+        })
+        .await
+        .unwrap();
+
+    // A request can arrive at the cache after a later eligibility cutoff
+    // was already attempted. Reuse depends on the successful snapshot.
+    for request_secs in [now + 30, now + 90, now + 30] {
+        let (prepared, status) = history(&f.app, range, request_secs).await;
+        let prepared = prepared.unwrap();
+        assert!(Arc::ptr_eq(&snapshot, &prepared));
+        let value = response_json(build_response(
+            range,
+            request_secs * 1000,
+            Some(&prepared),
+            status,
+            &ProcessStatus::default(),
+            &HostingEstimateConfig::default(),
+        ))
+        .await;
+        assert_eq!(value["history_status"], "stale");
+        assert_eq!(value["generated_at_ms"], request_secs * 1000);
+        assert_eq!(value["combined_memory_peak"], complete);
+    }
+}
+
+#[tokio::test]
 async fn paired_hour_coverage_includes_the_open_hour_after_its_first_minute() {
     let f = fixture();
     let now = 1_800_000_000;
