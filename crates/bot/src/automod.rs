@@ -1610,7 +1610,7 @@ async fn execute_live<'a>(
     open_case: bool,
 ) -> Option<(&'a str, CaseOutcome)> {
     let warning = if config_unknown {
-        Some("rule configuration unavailable; skipping kick or ban and fallback delete")
+        Some("kick, ban, and message deletion withheld because rule configuration is unavailable")
     } else if pending.mention_permission_unknown {
         Some(jmodguard::custom_rules::UNKNOWN_MENTION_PERMISSION_WARNING)
     } else {
@@ -6632,8 +6632,13 @@ mod tests {
                 "no ban handoff, ban, or kick: {seen:?}"
             );
             if !exemption_unconfirmed {
+                let expected_warning = if matches!(config_lookup, ConfigLookup::UnreadableBuiltin) {
+                    "kick, ban, and message deletion withheld because rule configuration is unavailable"
+                } else {
+                    "skipping kick or ban"
+                };
                 assert!(
-                    output.contains("WARN") && output.contains("skipping kick or ban"),
+                    output.contains("WARN") && output.contains(expected_warning),
                     "{output}"
                 );
             }
