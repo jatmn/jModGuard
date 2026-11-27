@@ -44,7 +44,7 @@ struct QueryReturnedNoRows;
 pub struct DatabaseOperationTimedOut {
     operation: &'static str,
     timeout: Duration,
-    replica_routable: bool,
+    remote_failure: Option<RemoteOperationFailed>,
 }
 
 #[derive(Clone, Copy)]
@@ -111,10 +111,7 @@ fn unavailable_operation(error: &anyhow::Error) -> Option<RemoteOperationFailed>
         .chain()
         .find_map(|cause| cause.downcast_ref::<DatabaseOperationTimedOut>())
     {
-        return (timeout.operation != "waiting for connection").then_some(RemoteOperationFailed {
-            operation: timeout.operation,
-            replica_routable: timeout.replica_routable,
-        });
+        return timeout.remote_failure;
     }
     error
         .chain()
@@ -237,6 +234,7 @@ pub fn test_database_commit_indeterminate_error() -> anyhow::Error {
     DatabaseCommitIndeterminate(anyhow::anyhow!("lost commit")).into()
 }
 
+/// A deadline detected locally before the next database operation starts.
 pub(crate) fn database_operation_timed_out(
     operation: &'static str,
     timeout: Duration,
@@ -244,7 +242,7 @@ pub(crate) fn database_operation_timed_out(
     DatabaseOperationTimedOut {
         operation,
         timeout,
-        replica_routable: false,
+        remote_failure: None,
     }
     .into()
 }
@@ -658,11 +656,7 @@ impl DbRuntime {
                     }
                 }
                 _ = abandoned => Err(database_caller_abandoned(operation)),
-                _ = deadline, if remote => Err(DatabaseOperationTimedOut {
-                    operation,
-                    timeout,
-                    replica_routable: self.replica_routable,
-                }.into()),
+                _ = deadline, if remote => Err(self.in_flight_timeout(operation, timeout)),
             }
         })
     }
@@ -679,6 +673,9 @@ impl DbRuntime {
             clock.enter_operation(operation);
         }
         let (timeout, deadline) = match wait {
+            Some(DatabaseWait::Timeout(timeout)) if timeout.is_zero() => {
+                return Err(database_operation_timed_out(operation, timeout));
+            }
             Some(DatabaseWait::Timeout(timeout)) => (timeout, Some(self.snapshot_now() + timeout)),
             Some(DatabaseWait::Deadline(deadline)) => {
                 (self.remaining_until(operation, deadline)?, Some(deadline))
@@ -825,11 +822,7 @@ impl DbRuntime {
             }
             match stop {
                 Stop::Abandoned => Err(database_caller_abandoned(operation)),
-                Stop::Deadline => Err(DatabaseOperationTimedOut {
-                    operation,
-                    timeout,
-                    replica_routable: self.replica_routable,
-                }.into()),
+                Stop::Deadline => Err(self.in_flight_timeout(operation, timeout)),
             }
         })
     }
@@ -856,14 +849,21 @@ impl DbRuntime {
     fn remaining_until(&self, operation: &'static str, deadline: Instant) -> Result<Duration> {
         let remaining = deadline.saturating_duration_since(self.snapshot_now());
         if remaining.is_zero() {
-            return Err(DatabaseOperationTimedOut {
-                operation,
-                timeout: remaining,
-                replica_routable: self.replica_routable,
-            }
-            .into());
+            return Err(database_operation_timed_out(operation, remaining));
         }
         Ok(remaining)
+    }
+
+    fn in_flight_timeout(&self, operation: &'static str, timeout: Duration) -> anyhow::Error {
+        DatabaseOperationTimedOut {
+            operation,
+            timeout,
+            remote_failure: self.is_remote().then_some(RemoteOperationFailed {
+                operation,
+                replica_routable: self.replica_routable,
+            }),
+        }
+        .into()
     }
 
     fn snapshot_now(&self) -> tokio::time::Instant {
@@ -1766,7 +1766,12 @@ impl Connection {
                     primary_begin_bucket(started.elapsed()),
                     1,
                 ),
-                Err(error) if is_database_operation_timeout(error) => {
+                Err(error)
+                    if error
+                        .downcast_ref::<DatabaseOperationTimedOut>()
+                        .is_some_and(|timeout| timeout.remote_failure.is_some())
+                        || error.is::<DatabaseCallerAbandoned>() =>
+                {
                     jmodguard_runtime::resources::count(PRIMARY_BEGIN_TIMEOUTS, 1);
                 }
                 Err(_) => {}
@@ -2966,7 +2971,7 @@ impl Transaction {
         );
         #[cfg(debug_assertions)]
         let result = if result.is_ok() && TEST_DROP_COMMIT_RESPONSE.swap(false, Ordering::SeqCst) {
-            Err(database_operation_timed_out(
+            Err(self.runtime.in_flight_timeout(
                 "commit transaction",
                 self.runtime
                     .operation_timeout
