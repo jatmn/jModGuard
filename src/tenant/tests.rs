@@ -288,6 +288,24 @@ async fn erasure_clears_owned_rows_without_backup_jobs() {
     assert_eq!(intents, 0);
 }
 
+async fn fence_guild_erasure(db: &Db, guild: i64) {
+    let dest = StoreId::new();
+    register_store(db, dest.clone(), StorePolicy::Dedicated { guild_id: guild })
+        .await
+        .unwrap();
+    db.with_conn(move |conn| {
+        conn.execute_bounded(
+            "INSERT INTO guild_write_fences(
+                guild_id,generation,phase,destination_store_id,destination_revision,created_at
+             ) VALUES(?1,?2,'freeze',?3,?2,unixepoch())",
+            db::params![guild, format!("{:032x}", 9u128), dest.as_str()],
+            64 * 1024 * 1024,
+        )
+    })
+    .await
+    .unwrap();
+}
+
 #[tokio::test]
 async fn fenced_erasure_waits_without_primary_polling_or_blocking_other_guilds() {
     let probe = Arc::new(db::StartupProbe::default());
@@ -298,25 +316,7 @@ async fn fenced_erasure_waits_without_primary_polling_or_blocking_other_guilds()
     enroll(&f, 10, 100).await;
     enroll(&f, 20, 100).await;
     db::retire_guild_enrollment(&f.db, 10, 100).await.unwrap();
-    let dest = StoreId::new();
-    db::guild_stores::register_store(
-        &f.db,
-        dest.clone(),
-        db::guild_stores::StorePolicy::Dedicated { guild_id: 10 },
-    )
-    .await
-    .unwrap();
-    f.db.with_conn(move |conn| {
-        conn.execute_bounded(
-            "INSERT INTO guild_write_fences(
-                guild_id,generation,phase,destination_store_id,destination_revision,created_at
-             ) VALUES(10,?1,'freeze',?2,?1,unixepoch())",
-            db::params![format!("{:032x}", 9u128), dest.as_str()],
-            64 * 1024 * 1024,
-        )
-    })
-    .await
-    .unwrap();
+    fence_guild_erasure(&f.db, 10).await;
 
     let queries = probe.queries();
     let transactions = probe.transactions();
@@ -350,6 +350,69 @@ async fn fenced_erasure_waits_without_primary_polling_or_blocking_other_guilds()
     .unwrap();
     assert!(f.tenant.drive_erasure().await.unwrap());
     assert!(!db::guild_erasure_queued(&f.db, 10).await.unwrap());
+}
+
+#[tokio::test]
+async fn fence_after_erasure_selection_defers_completion_until_retry() {
+    let f = Fixture::new();
+    let enrollment = enroll(&f, 10, 100).await;
+    let (store, scope) = f.tenant.live(enrollment.clone()).await.unwrap();
+    f.tenant
+        .record_selected_case(enrollment, case_data(9))
+        .await
+        .unwrap();
+    db::patch_settings(&f.db, 10, Some(Some("?".into())), None, None)
+        .await
+        .unwrap();
+    enroll(&f, 20, 100).await;
+    db::retire_guild_enrollment(&f.db, 10, 100).await.unwrap();
+    db::retire_guild_enrollment(&f.db, 20, 100).await.unwrap();
+
+    let lock = f.tenant.lock(10);
+    let guard = lock.lock().await;
+    let mut drive = std::pin::pin!(f.tenant.drive_erasure());
+    // Poll the worker first so it holds the cursor through selection. The
+    // guild lock then pauses it before the execution-time fence check.
+    tokio::select! {
+        biased;
+        result = &mut drive => panic!("erasure returned before taking the guild lock: {result:?}"),
+        cursor = f.tenant.inner.erasure_cursor.lock() => {
+            assert!(matches!(*cursor, ErasureCursor::After(10)));
+        }
+    }
+    fence_guild_erasure(&f.db, 10).await;
+    drop(guard);
+    drop(lock);
+
+    assert!(!drive.await.unwrap(), "a fenced attempt completed no job");
+    assert!(db::guild_erasure_queued(&f.db, 10).await.unwrap());
+    assert!(db::guild_erasure_queued(&f.db, 20).await.unwrap());
+    assert_eq!(
+        guild_placement(&f.db, 10).await.unwrap().as_ref(),
+        Some(scope.placement())
+    );
+    assert_eq!(store.case_count(scope, case_limits()).await.unwrap(), 1);
+    assert_eq!(db::get_settings(&f.db, 10).await.unwrap().prefix, "?");
+
+    assert!(f.tenant.drive_erasure().await.unwrap());
+    assert!(!db::guild_erasure_queued(&f.db, 20).await.unwrap());
+    assert!(!f.tenant.drive_erasure().await.unwrap());
+    assert!(db::guild_erasure_queued(&f.db, 10).await.unwrap());
+
+    f.db.with_conn(|conn| {
+        conn.execute_bounded(
+            "DELETE FROM guild_write_fences WHERE guild_id=10",
+            (),
+            64 * 1024 * 1024,
+        )
+    })
+    .await
+    .unwrap();
+    assert!(f.tenant.drive_erasure().await.unwrap());
+    assert!(!db::guild_erasure_queued(&f.db, 10).await.unwrap());
+    assert!(guild_placement(&f.db, 10).await.unwrap().is_none());
+    assert_eq!(db::get_settings(&f.db, 10).await.unwrap().prefix, "!");
+    assert!(!f.tenant.drive_erasure().await.unwrap());
 }
 
 #[tokio::test]
