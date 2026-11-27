@@ -445,7 +445,7 @@ pub async fn claim_bot_action(db: &Db, now: i64) -> Result<Option<BotAction>> {
 
 /// Revalidate a positive scheduler advisory on the primary.
 pub async fn claim_advised_bot_action(db: &Db, now: i64) -> Result<Option<BotAction>> {
-    if db.is_remote() && !db.is_read_only() {
+    let write_deadline = if db.is_remote() && !db.is_read_only() {
         let write_deadline = db.connections.runtime.capture_write_deadline();
         #[cfg(test)]
         let after_due_read = db.after_advised_due_read.lock().unwrap().take();
@@ -464,16 +464,18 @@ pub async fn claim_advised_bot_action(db: &Db, now: i64) -> Result<Option<BotAct
         match result {
             // A concurrent commit can invalidate a deferred transaction's
             // promotion. Recheck due work on a fresh primary snapshot.
-            Err(ref error) if crate::db_compat::is_database_busy(error) => {}
+            Err(ref error) if crate::db_compat::is_database_busy(error) => write_deadline,
             result => return result,
         }
-    }
+    } else {
+        None
+    };
     db.with_conn(move |conn| {
         claim_advised_bot_action_conn(
             conn,
             now,
             false,
-            None,
+            write_deadline,
             #[cfg(test)]
             None,
         )
@@ -491,7 +493,7 @@ fn claim_advised_bot_action_conn(
     let mut tx = if promote {
         conn.transaction_capture_before(write_deadline, false)?
     } else {
-        conn.transaction_primary_snapshot()?
+        conn.transaction_primary_snapshot_before(write_deadline)?
     };
     let due: bool = tx.query_row(&poll_due_sql(), params![now], |r| Ok(r.get(0)?))?;
     if !due {
@@ -508,7 +510,7 @@ fn claim_advised_bot_action_conn(
         tx
     } else {
         tx.finish_read()?;
-        conn.transaction_immediate()?
+        conn.transaction_immediate_before(write_deadline)?
     };
     claim_bot_action_tx(tx, now)
 }

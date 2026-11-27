@@ -1794,14 +1794,24 @@ impl Connection {
 
     #[track_caller]
     pub fn transaction_immediate(&self) -> Result<Transaction> {
+        self.transaction_immediate_before(None)
+    }
+
+    /// Starts and prepares an immediate write under an already captured deadline.
+    #[track_caller]
+    pub(crate) fn transaction_immediate_before(
+        &self,
+        write_deadline: Option<Instant>,
+    ) -> Result<Transaction> {
         self.refuse_writer_lock()?;
         let (inner, _, tally) = self.open_remote_transaction(
             "begin immediate transaction",
             libsql::TransactionBehavior::Immediate,
             None,
-            None,
+            write_deadline,
         )?;
         let mut transaction = self.wrap_transaction(inner, WriteState::Unprepared, None, tally);
+        transaction.write_deadline = write_deadline;
         transaction.ensure_mutation_receipt()?;
         Ok(transaction)
     }
@@ -1817,13 +1827,24 @@ impl Connection {
     /// replica. The snapshot cannot be upgraded into a write.
     #[track_caller]
     pub fn transaction_primary_snapshot(&self) -> Result<Transaction> {
+        self.transaction_primary_snapshot_before(None)
+    }
+
+    /// Starts a primary snapshot with its read budget capped by a write deadline.
+    #[track_caller]
+    pub(crate) fn transaction_primary_snapshot_before(
+        &self,
+        write_deadline: Option<Instant>,
+    ) -> Result<Transaction> {
         let (inner, deadline, tally) = self.open_remote_transaction(
             "begin primary snapshot",
             libsql::TransactionBehavior::Deferred,
             self.interactive_read_budget(),
-            None,
+            write_deadline,
         )?;
-        Ok(self.wrap_transaction(inner, WriteState::Snapshot, deadline, tally))
+        let mut transaction = self.wrap_transaction(inner, WriteState::Snapshot, deadline, tally);
+        transaction.write_deadline = write_deadline;
+        Ok(transaction)
     }
 
     /// Snapshot capture reads before acquiring the writer lock. A concurrent
