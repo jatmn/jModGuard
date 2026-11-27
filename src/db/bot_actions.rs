@@ -101,6 +101,8 @@ pub enum BotActionDispatch {
 const ACTIVE: &str =
     "EXISTS(SELECT 1 FROM guild_enrollments e WHERE e.guild_id=bot_actions.guild_id
     AND e.id=bot_actions.enrollment_id AND e.joined_at_ns=bot_actions.joined_at_ns AND e.active=1)";
+const UNFENCED: &str =
+    "NOT EXISTS(SELECT 1 FROM guild_write_fences f WHERE f.guild_id=bot_actions.guild_id)";
 const COLS: &str = "id,guild_id,actor_id,payload,state,outcome,created_at,expires_at,claim,enrollment_id,joined_at_ns";
 
 fn row_action(r: &Row) -> Result<BotAction> {
@@ -374,18 +376,19 @@ async fn recent_bot_actions_inner(db: &Db, scope: ActionScope) -> Result<Vec<Bot
 fn claim_next_sql() -> String {
     // Expiry searches use bot_actions_expiry; selecting one oldest job must
     // walk pending order so LIMIT can stop without sorting all live jobs.
-    format!("SELECT {COLS} FROM bot_actions INDEXED BY bot_actions_pending WHERE state='pending' AND expires_at>?1 AND {ACTIVE}
-                      AND NOT EXISTS(SELECT 1 FROM guild_write_fences f WHERE f.guild_id=bot_actions.guild_id)
+    format!("SELECT {COLS} FROM bot_actions INDEXED BY bot_actions_pending WHERE state='pending' AND expires_at>?1 AND {ACTIVE} AND {UNFENCED}
                       ORDER BY created_at,id LIMIT 1")
 }
 
 fn action_due_expression() -> String {
     // Separate the two searches so expiry uses (state,expires_at) and pending
-    // admission keeps its own indexed branch. Both retain active membership.
-    format!("EXISTS(SELECT 1 FROM bot_actions WHERE {ACTIVE}
-                AND state IN ('pending','claimed','running') AND expires_at<=?1)
-            OR EXISTS(SELECT 1 FROM bot_actions WHERE {ACTIVE} AND state='pending'
-                AND NOT EXISTS(SELECT 1 FROM guild_write_fences f WHERE f.guild_id=bot_actions.guild_id))")
+    // admission keeps its own indexed branch. Both require active membership
+    // in an unfenced guild.
+    format!(
+        "EXISTS(SELECT 1 FROM bot_actions WHERE {ACTIVE}
+                AND state IN ('pending','claimed','running') AND expires_at<=?1 AND {UNFENCED})
+            OR EXISTS(SELECT 1 FROM bot_actions WHERE {ACTIVE} AND state='pending' AND {UNFENCED})"
+    )
 }
 
 fn poll_due_sql() -> String {
@@ -427,8 +430,8 @@ pub async fn claim_bot_action(db: &Db, now: i64) -> Result<Option<BotAction>> {
     db.with_conn(move |conn| {
         // An advisory read avoids idle write transactions/receipts. Replica lag
         // can defer a poll but never authorizes dispatch: claim below is primary.
-        // Housekeeping (expiry/uncertain) is independent of write fences. Claim
-        // selection still excludes fenced guilds in the UPDATE/SELECT below.
+        // Only unfenced rows can trigger a poll. Once opened, the primary
+        // transaction can process overdue receipts across guilds.
         let due: bool =
             conn.query_row_advisory(&poll_due_sql(), params![now], |r| Ok(r.get(0)?))?;
         if !due {

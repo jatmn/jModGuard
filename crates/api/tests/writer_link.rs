@@ -1528,9 +1528,8 @@ impl tracing::Subscriber for LogLevels {
 #[tokio::test]
 async fn startup_release_check_waiting_is_info_but_failed_checks_warn() {
     let (bot, app, path, _enrollment) = linked_writer("check-log-level").await;
-    let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let target = closed.local_addr().unwrap().to_string();
-    drop(closed);
+    let (addr, _reservation) = jmodguard::control::test_support::reserve_refused_endpoint().await;
+    let target = addr.to_string();
     for waiting in [true, false] {
         let mut cfg = (*app.cfg).clone();
         if waiting {

@@ -104,8 +104,12 @@ The worker advances a bounded guild-ID cursor before each erasure attempt and wr
 at the end of the queue. A failed guild stays queued, while later ticks can erase
 other guilds with healthy storage. The cursor is process-local and restarts from the
 beginning; durable jobs, rather than cursor state, preserve cleanup obligations.
-An idle tick makes one advisory read and opens no primary snapshot when no job is
-queued; replica lag can only defer a job to a later tick.
+An idle tick makes one advisory read. If that read sees an empty queue or only
+jobs held by guild write fences, the tick ends without opening a primary
+snapshot. Fenced jobs stay queued until the fence clears while erasure can
+proceed for other guilds. The worker selects jobs on the primary and checks
+the fence again before erasure. Replica lag can delay an eligible job to a
+later tick.
 
 A later rejoin is a new enrollment on a fresh placement after erasure completes. Late
 events using the old enrollment cannot recreate erased facts. If a newer active

@@ -1383,7 +1383,7 @@ function PlatformAnalytics() {
 // ---------------------------------------------------------------------------
 
 const RESOURCES_HELP = [
-  "CPU and memory come from each process's own container limits (cgroup), never host totals.",
+  "CPU and memory readings and limits come from the cgroups sampled by the bot and API.",
   "The API is sampled every 5 seconds; the bot saves its status and both processes' history once a minute.",
   "1h and 24h use minute rollups kept 48 hours; 7d and 30d use hourly rollups kept 31 days.",
   "Counts are this application's own work. Database rows read and provider billing are not shown because they cannot be read safely.",
@@ -1534,13 +1534,27 @@ function MemoryBillingPanel({ snapshot, nowMs }) {
     ? cpuTenths.reduce((sum, value) => sum + value, 0) / 1000 * rates.cpu_usd_per_core_hour
     : null;
   const blockText = blocks && `${formatExact(blocks.count)} block${blocks.count === 1 ? "" : "s"} (${formatExact(blocks.capacity)} MiB) · ${blocks.headroom} headroom to the next block in this estimate`;
+  const peakBytes = snapshot.combined_memory_peak?.peak_bytes;
+  const pairedPeriods = snapshot.combined_memory_peak?.periods;
+  const totalPeriods = snapshot.combined_memory_peak?.total_periods;
+  const peakPeriod = snapshot.span_secs === 3600 ? "hour" : "minute";
+  const coverage = Number.isSafeInteger(pairedPeriods) && pairedPeriods >= 0
+    && Number.isSafeInteger(totalPeriods) && totalPeriods > 0 && pairedPeriods <= totalPeriods
+    ? `${formatExact(pairedPeriods)} of ${formatExact(totalPeriods)} ${peakPeriod}${totalPeriods === 1 ? "" : "s"}`
+    : null;
+  const peakBlocks = pairedPeriods > 0 && Number.isSafeInteger(peakBytes) && peakBytes >= 0 && blockMib > 0
+    ? memoryBlocks(peakBytes, blockMib) : null;
+  const peakText = pairedPeriods === 0 ? "No paired memory readings"
+    : peakBlocks && `${formatMemoryMiB(peakBytes)} · ${formatExact(peakBlocks.count)} block${peakBlocks.count === 1 ? "" : "s"} (${formatExact(peakBlocks.capacity)} MiB)`;
   const useApiMemory = apiBytes != null && (botBytes == null || readings[1].age_ms <= readings[0].age_ms);
   const memoryRows = combineMemory
     ? [
-      ["Combined memory", formatMemoryMiB(total)],
-      ["Bot memory", formatMemoryMiB(botBytes)],
-      ["API memory", formatMemoryMiB(apiBytes)],
+      ["Combined cgroup memory", formatMemoryMiB(total)],
+      ["Bot cgroup memory", formatMemoryMiB(botBytes)],
+      ["API cgroup memory", formatMemoryMiB(apiBytes)],
       ["Estimated blocks", blockText],
+      ["Paired-period peak estimate", peakText],
+      ["Paired memory coverage", coverage],
     ]
     : [[
       memoryRelation === "shared" ? "Shared cgroup memory" : useApiMemory ? "API cgroup memory" : botBytes != null ? "Bot cgroup memory" : "Cgroup memory",
@@ -1558,18 +1572,27 @@ function MemoryBillingPanel({ snapshot, nowMs }) {
   } else if (!combineMemory) {
     blockNote = `Combined memory and block estimates are unavailable because ${overlapReason(memoryRelation)}.`;
   } else if (total == null) {
-    blockNote = "Combined block estimate unavailable. Both processes need fresh, usable memory readings.";
+    blockNote = "Combined block estimate unavailable. Both cgroups need fresh, usable memory readings.";
   }
   const estimateRow = (label, hourly) => h("tr", null,
     h("th", { scope: "row" }, label),
     h("td", null, resourceValue(hostingCost(hourly, 1))),
     h("td", null, resourceValue(hostingCost(hourly, ESTIMATE_HOURS_30_DAYS))),
   );
-  return analyticsPanel("Memory block estimate", "resources-memory-billing", h("div", null,
+  return analyticsPanel("Local memory block estimate", "resources-memory-billing", h("div", null,
     h("dl", { className: "du-facts" },
       ...memoryRows.map(([label, value]) => h("div", { key: label }, h("dt", null, label), h("dd", null, resourceValue(value)))),
     ),
     h("p", { className: "an-note muted" }, blockNote),
+    combineMemory && peakBlocks && h("p", { className: "an-note muted" },
+      `This peak estimate covers only ${peakPeriod}s with readings for both cgroups. The sum of their separate maxima is an upper bound on sampled combined memory in each ${peakPeriod} because the cgroups can peak at different times.`,
+    ),
+    combineMemory && coverage && pairedPeriods > 0 && pairedPeriods < totalPeriods && h("p", { className: "an-note muted" },
+      "Periods without both readings can hide higher peaks.",
+    ),
+    combineMemory && (blocks || peakBlocks) && h("p", { className: "an-note muted" },
+      "These estimates exclude Bunny’s billed system overhead. Bunny’s pricing docs leave open whether hourly billing uses average or peak memory and whether blocks round per container or per pod.",
+    ),
     rates
       ? h("div", null,
         h("h4", { id: "resources-hosting-estimate", className: "du-metric-label" }, "Hosting cost estimate (USD)"),

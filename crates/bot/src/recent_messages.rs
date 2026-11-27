@@ -5,7 +5,7 @@ use crate::state::BotState;
 use parking_lot::Mutex;
 use serenity::http::Http;
 use std::collections::BTreeMap;
-use std::future::{Future, ready};
+use std::future::Future;
 use std::ops::RangeInclusive;
 use std::sync::Arc;
 use std::time::Duration;
@@ -129,7 +129,7 @@ impl RecentMessages {
 /// A successful ban supplies Discord's server-side deletion window. Sweep any
 /// remaining tracked messages for the same enrollment without fetching history.
 #[allow(clippy::too_many_arguments)]
-pub(crate) async fn sweep_after_ban(
+pub(crate) async fn sweep_after_ban<F: Future<Output = bool> + Send>(
     app: &std::sync::Arc<BotState>,
     http: &Http,
     enrollment: &GuildEnrollment,
@@ -137,7 +137,7 @@ pub(crate) async fn sweep_after_ban(
     seconds: u32,
     sweep_at_ms: i64,
     cleanup: Option<&crate::logging::Cleanup<'_>>,
-    still_admitted: impl Fn() -> bool,
+    still_admitted: impl Fn() -> F + Sync,
 ) -> usize {
     if seconds == 0 {
         return 0;
@@ -151,7 +151,7 @@ pub(crate) async fn sweep_after_ban(
         cutoff..=sweep_at_ms,
         TrackedDelete::BanPurge,
         cleanup,
-        || ready(still_admitted()),
+        still_admitted,
     )
     .await
 }
@@ -169,7 +169,7 @@ pub(crate) enum TrackedDelete<'a> {
 /// Delete only identities already observed through the Gateway. Admission can
 /// be refreshed before each request, within the same deadline as the sweep.
 #[allow(clippy::too_many_arguments)]
-pub(crate) async fn sweep_tracked_messages<F: Future<Output = bool>>(
+pub(crate) async fn sweep_tracked_messages<F: Future<Output = bool> + Send>(
     app: &std::sync::Arc<BotState>,
     http: &Http,
     enrollment: &GuildEnrollment,
@@ -177,7 +177,7 @@ pub(crate) async fn sweep_tracked_messages<F: Future<Output = bool>>(
     window_ms: RangeInclusive<i64>,
     delete: TrackedDelete<'_>,
     cleanup: Option<&crate::logging::Cleanup<'_>>,
-    still_admitted: impl Fn() -> F,
+    still_admitted: impl Fn() -> F + Sync,
 ) -> usize {
     let guild = enrollment.guild_id as u64;
     if !app.activation.may_record()
@@ -236,6 +236,11 @@ pub(crate) async fn sweep_tracked_messages<F: Future<Output = bool>>(
                     deadline,
                     audit_reason: "automod onboarding trap cleanup",
                     log_http,
+                    admit: &|| {
+                        app.recent_messages
+                            .still_tracked(guild, author, channel, message)
+                    },
+                    refresh: &|| Box::pin(still_admitted()),
                 }),
             )
             .await;

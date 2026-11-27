@@ -1659,7 +1659,7 @@ async fn sweep_10008_keeps_identity_for_a_later_gateway_delete_without_snapshot(
                 PURGE_WINDOW_SECS,
                 BAN_REQUESTED_AT_MS,
                 Some(&cleanup),
-                || true,
+                || std::future::ready(true),
             )
             .await,
             0

@@ -1,5 +1,10 @@
 //! Shared Discord REST helpers.
 
+mod guarded_delete;
+
+#[cfg(test)]
+pub(crate) use guarded_delete::with_delete_connect_hook;
+
 use anyhow::{Context as _, Result, anyhow};
 use parking_lot::Mutex;
 use serenity::model::channel::Channel;
@@ -85,22 +90,33 @@ pub(crate) enum DeleteDispatch {
     Uncertain,
 }
 
-/// Use Serenity's route buckets, with a separate deadline for an admitted
-/// DELETE's response. Only an explicit rate-limit rejection can be retried.
-pub(crate) async fn delete_before_dispatch_deadline(
+/// Use Serenity's route buckets and validate admission at the first socket
+/// write. Only an explicit rate-limit rejection may authorize another attempt.
+pub(crate) async fn delete_before_dispatch_deadline<F: Future<Output = bool> + Send>(
     app: &Arc<crate::state::BotState>,
     http: &serenity::http::Http,
-    route: serenity::http::Route<'_>,
+    route: serenity::http::Route<'static>,
     reason: &str,
     deadline: tokio::time::Instant,
-    mut admit: impl FnMut() -> bool,
+    admit: impl Fn() -> bool + Sync,
+    refresh: impl Fn() -> F + Sync,
 ) -> DeleteDispatch {
-    use serenity::http::{ErrorResponse, HttpError, LightMethod, RatelimitInfo, Request};
+    use hyper1::header::{AUTHORIZATION, CONNECTION, HOST, USER_AGENT};
+    use serenity::http::{LightMethod, RatelimitInfo, Request};
 
-    let mut headers = reqwest::header::HeaderMap::new();
-    headers.insert("X-Audit-Log-Reason", audit_reason_header(reason));
-    let request = Request::new(route, LightMethod::Delete).headers(Some(headers));
-    let client = deadline_delete_client();
+    let path = route.path();
+    let url = http.proxy.as_ref().map_or_else(
+        || path.to_string(),
+        |proxy| path.replacen("https://discord.com", proxy.trim_end_matches('/'), 1),
+    );
+    let Ok(uri) = url.parse::<hyper1::Uri>() else {
+        return DeleteDispatch::Unsent;
+    };
+    let (Some(host), Some(target)) = (uri.authority(), uri.path_and_query()) else {
+        return DeleteDispatch::Unsent;
+    };
+    let rate_request = Request::new(route, LightMethod::Delete);
+    let admit = || app.activation.may_record() && admit();
     let note_wait = |wait: crate::handlers::RateLimitWait| {
         note_rate_limit_wait_for_test();
         crate::resources::rate_limit_wait(
@@ -119,51 +135,57 @@ pub(crate) async fn delete_before_dispatch_deadline(
             global: wait.global,
         });
     };
-    let outbound = request
-        .clone()
-        .build(client, http.token(), http.proxy.as_deref())
-        .ok()
-        .and_then(|request| request.build().ok());
-    let Some(outbound) = outbound else {
-        return DeleteDispatch::Unsent;
-    };
-    loop {
+    let bucket = http
+        .ratelimiter
+        .as_ref()
+        .map(|ratelimiter| ratelimiter.routes());
+    let bucket = if let Some(routes) = bucket {
+        let key = route.ratelimiting_bucket();
         let Some(bucket) = before_dispatch_deadline(deadline, async {
-            let ratelimiter = http.ratelimiter.as_ref()?;
-            let routes = ratelimiter.routes();
-            let key = route.ratelimiting_bucket();
-            let bucket = Arc::clone(routes.write().await.entry(key).or_default());
-            bucket.lock().await.pre_hook(&request, &on_wait).await;
-            Some(bucket)
+            Arc::clone(routes.write().await.entry(key).or_default())
         })
         .await
         else {
             return DeleteDispatch::Unsent;
         };
-        if !admit() || tokio::time::Instant::now() >= deadline {
+        Some(bucket)
+    } else {
+        None
+    };
+    loop {
+        let outbound = hyper1::Request::builder()
+            .method(reqwest::Method::DELETE)
+            .uri(target.as_str())
+            .header(HOST, host.as_str())
+            .header(CONNECTION, "close")
+            .header(USER_AGENT, serenity::constants::USER_AGENT)
+            .header(AUTHORIZATION, http.token())
+            .header("X-Audit-Log-Reason", audit_reason_header(reason))
+            .body(http_body_util::Empty::new());
+        let Ok(outbound) = outbound else {
             return DeleteDispatch::Unsent;
-        }
-        let outbound = outbound.try_clone().expect("DELETE has no request body");
-        let response_deadline = tokio::time::Instant::now() + DISCORD_REST_TIMEOUT;
-        jmodguard::resources::count("discord_rest", 1);
-        let response = match tokio::time::timeout_at(response_deadline, client.execute(outbound))
-            .await
-        {
-            Ok(Ok(response)) => response,
-            Ok(Err(error)) => return DeleteDispatch::Finished(Err(HttpError::from(error).into())),
-            Err(_) => return DeleteDispatch::Uncertain,
         };
+        let quota = async {
+            let mut held = bucket.as_ref()?.lock().await;
+            held.pre_hook(&rate_request, &on_wait).await;
+            Some(held)
+        };
+        let receipt =
+            match guarded_delete::send(&uri, outbound, deadline, &admit, &refresh, quota).await {
+                Ok(receipt) => receipt,
+                Err(guarded_delete::SendFailure::Unsent) => return DeleteDispatch::Unsent,
+                Err(guarded_delete::SendFailure::Uncertain) => return DeleteDispatch::Uncertain,
+            };
 
-        let status = response.status();
-        if let Some(bucket) = bucket {
-            if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
-                let retry = if response.headers().contains_key("x-ratelimit-global") {
-                    if let Some(timeout) = discord_retry_after(&response) {
+        if let Some(bucket) = &bucket {
+            if receipt.headers.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
+                let retry = if receipt.headers.headers().contains_key("x-ratelimit-global") {
+                    if let Some(timeout) = discord_retry_after(&receipt.headers) {
                         note_wait(crate::handlers::RateLimitWait {
                             timeout,
                             limit: 50,
                             method: LightMethod::Delete,
-                            path: route.path().into_owned(),
+                            path: path.to_string(),
                             global: true,
                         });
                         before_dispatch_deadline(deadline, tokio::time::sleep(timeout))
@@ -178,7 +200,7 @@ pub(crate) async fn delete_before_dispatch_deadline(
                             bucket
                                 .lock()
                                 .await
-                                .post_hook(&response, &request, &on_wait, false)
+                                .post_hook(&receipt.headers, &rate_request, &on_wait, false)
                                 .await
                         })
                         .await,
@@ -188,40 +210,41 @@ pub(crate) async fn delete_before_dispatch_deadline(
                 if retry {
                     continue;
                 }
-            } else if let Ok(mut bucket) = bucket.try_lock() {
-                // A confirmed response is authoritative even if rate-limit
-                // bookkeeping is unavailable or its headers fail to parse.
-                let _ = bucket.post_hook(&response, &request, &on_wait, false).await;
+            } else {
+                settle_delete_quota(
+                    Arc::clone(bucket),
+                    rate_request.clone(),
+                    receipt.headers,
+                    receipt.response_deadline,
+                )
+                .await;
             }
         }
 
-        if status.is_success() {
-            return DeleteDispatch::Finished(Ok(()));
-        }
-        return match tokio::time::timeout_at(
-            response_deadline,
-            ErrorResponse::from_response(response, reqwest::Method::DELETE),
-        )
-        .await
-        {
-            Ok(error) => {
-                DeleteDispatch::Finished(Err(HttpError::UnsuccessfulRequest(error).into()))
-            }
-            Err(_) => DeleteDispatch::Uncertain,
-        };
+        return DeleteDispatch::Finished(receipt.result);
     }
 }
 
-fn deadline_delete_client() -> &'static reqwest::Client {
-    static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
-    CLIENT.get_or_init(|| {
-        reqwest::Client::builder()
-            .redirect(reqwest::redirect::Policy::none())
-            .retry(reqwest::retry::never())
-            .use_rustls_tls()
-            .build()
-            .expect("Discord DELETE client")
-    })
+async fn settle_delete_quota(
+    bucket: Arc<tokio::sync::Mutex<serenity::http::Ratelimit>>,
+    request: serenity::http::Request<'static>,
+    headers: reqwest::Response,
+    deadline: tokio::time::Instant,
+) {
+    // Queue the quota update before the next admission can miss this receipt.
+    // Keep that position even if the caller has to return the confirmed result
+    // before bookkeeping can finish. Non-429 post_hook never waits on a reset.
+    note_rate_limit_wait_for_test();
+    let mut update = Box::pin(async move {
+        let mut held = bucket.lock().await;
+        let _ = held.post_hook(&headers, &request, &|_| {}, false).await;
+    });
+    if tokio::time::timeout_at(deadline, update.as_mut())
+        .await
+        .is_err()
+    {
+        tokio::spawn(update);
+    }
 }
 
 fn discord_retry_after(response: &reqwest::Response) -> Option<Duration> {

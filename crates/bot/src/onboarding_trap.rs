@@ -16,13 +16,14 @@ use jmodguard::onboarding_trap::{
 use jmodguard::types::RuleDef;
 use parking_lot::Mutex;
 use serenity::all::{
-    Cache, GuildId, GuildMemberUpdateEvent, Http, Member, PartialGuild, Permissions, RoleId,
+    Cache, GuildId, GuildMemberUpdateEvent, Http, Member, PartialGuild, Permissions, Role, RoleId,
     Timestamp, User, UserId,
 };
 use serenity::http::Route;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::Future;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::time::{Duration, Instant};
 use tokio::sync::{Notify, Semaphore};
 
@@ -740,7 +741,8 @@ impl DispatchGuard<'_> {
                 },
                 reason,
                 evidence.expires_at,
-                || self.still_admitted(&evidence),
+                || self.removal_still_admitted(&evidence, id),
+                || self.refresh_at_handoff(enrollment, &evidence, Some(&removal_roles)),
             )
             .await;
             if matches!(result, DeleteDispatch::Finished(Ok(()))) {
@@ -756,7 +758,7 @@ impl DispatchGuard<'_> {
             evidence = current;
         }
 
-        let mut started_at_ms = 0;
+        let started_at_ms = AtomicI64::new(0);
         let remember = capture_kick_recovery(self.app, guild_id, user_id);
         let error = match delete_before_dispatch_deadline(
             self.app,
@@ -765,9 +767,10 @@ impl DispatchGuard<'_> {
             reason,
             evidence.expires_at,
             || {
-                started_at_ms = now().timestamp_millis();
+                started_at_ms.store(now().timestamp_millis(), Ordering::Relaxed);
                 self.still_admitted(&evidence)
             },
+            || self.refresh_at_handoff(enrollment, &evidence, None),
         )
         .await
         {
@@ -783,7 +786,7 @@ impl DispatchGuard<'_> {
             DeleteDispatch::Unsent => return Dispatch::KickSkipped(removals),
         };
         Dispatch::Kick {
-            started_at_ms,
+            started_at_ms: started_at_ms.into_inner(),
             error,
             role_exemptions: evidence.rule.whitelist_roles,
             removals,
@@ -861,6 +864,51 @@ impl DispatchGuard<'_> {
         self.member_admits(&evidence.guild, &evidence.member, &evidence.rule, false)
             && self.claim.dispatched_roles_admit(|roles| {
                 self.roles_admit(&evidence.guild, &evidence.rule, roles)
+            })
+    }
+
+    fn removal_still_admitted(&self, evidence: &DispatchEvidence, role: RoleId) -> bool {
+        self.still_admitted(evidence)
+            && self
+                .claim
+                .dispatched_roles_admit(|roles| roles.contains(&role))
+            && self.cache.guild(self.event.guild).is_none_or(|guild| {
+                let member = guild
+                    .members
+                    .get(&self.event.user.id)
+                    .unwrap_or(&evidence.member);
+                let Some(bot) = evidence.bot.as_ref() else {
+                    return false;
+                };
+                let bot = guild.members.get(&bot.user.id).unwrap_or(bot);
+                member.roles.contains(&role)
+                    && guild.roles.get(&role).is_some_and(|role| !role.managed)
+                    && guild
+                        .member_permissions(bot)
+                        .contains(Permissions::MANAGE_ROLES | Permissions::KICK_MEMBERS)
+                    && bot_roles_above(&guild.roles, bot, member)
+            })
+    }
+
+    async fn refresh_at_handoff(
+        &self,
+        enrollment: &db::GuildEnrollment,
+        evidence: &DispatchEvidence,
+        removal_roles: Option<&[u64]>,
+    ) -> bool {
+        let mut dry_run = false;
+        refresh_rule(self.app, enrollment, self.matched, &mut dry_run)
+            .await
+            .is_some_and(|current| {
+                !dry_run
+                    && current.whitelist_roles == evidence.rule.whitelist_roles
+                    && removal_roles.is_none_or(|roles| {
+                        removal_role_ids(self.event.guild.get(), &current).as_deref() == Some(roles)
+                    })
+                    && self.member_admits(&evidence.guild, &evidence.member, &current, false)
+                    && self.claim.dispatched_roles_admit(|roles| {
+                        self.roles_admit(&evidence.guild, &current, roles)
+                    })
             })
     }
 
@@ -945,17 +993,19 @@ fn bot_can_act(
     member: &Member,
     permissions: Permissions,
 ) -> bool {
-    if bot.user.id == member.user.id
-        || !guild.member_permissions(bot).contains(permissions)
-        || bot.roles.iter().any(|id| !guild.roles.contains_key(id))
-    {
+    guild.member_permissions(bot).contains(permissions)
+        && bot_roles_above(&guild.roles, bot, member)
+}
+
+fn bot_roles_above(roles: &HashMap<RoleId, Role>, bot: &Member, member: &Member) -> bool {
+    if bot.user.id == member.user.id || bot.roles.iter().any(|id| !roles.contains_key(id)) {
         return false;
     }
-    let top = bot.roles.iter().filter_map(|id| guild.roles.get(id)).max();
+    let top = bot.roles.iter().filter_map(|id| roles.get(id)).max();
     top.is_some_and(|top| {
         member
             .roles
             .iter()
-            .all(|id| guild.roles.get(id).is_some_and(|role| role < top))
+            .all(|id| roles.get(id).is_some_and(|role| role < top))
     })
 }

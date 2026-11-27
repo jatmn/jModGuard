@@ -434,19 +434,34 @@ uses that response until the page is reopened.
 **Bot Resources** is the system status view for the bot and API processes over a
 1-hour, 24-hour, 7-day or 30-day range (`GET` or `POST /api/owner/resources?range=`,
 owner only; others get 401 or 403). Each process has a card with CPU as a share of its
-cgroup quota (with the quota and schedulable CPUs), program memory in MiB against
+cgroup quota (with the quota and schedulable CPUs), cgroup memory in MiB against
 `memory.max` with its source and the range peak, disk (the temporary and file-log
 directories it writes; the container's root filesystem is not measured because its
 totals belong to the host; database size is on Database Usage), and process facts
 (version, commit, uptime, last restart, restarts in the range, pod, region, ready).
-The memory panel shows estimated capacity and headroom in local 64 MiB blocks
-for fresh, usable readings from disjoint cgroups. The panel explains when
-a combined figure is unavailable. For shared, overlapping, or unverified
-memory scopes, it shows one available reading. Private mounts can hide the
-ancestry needed to verify separation. Operators can independently verify
-separation and enable a default-off declaration, which the panel labels
-when used. Optional hourly and 30-day USD estimates use the scope comparison
-for each metric and exclude host overhead and egress.
+The memory panel estimates capacity and headroom from fresh, usable local readings
+in disjoint cgroups. Each reading covers the whole cgroup, including any other
+processes in it, and subtracts inactive file cache when available. The panel
+rounds up to 64 MiB blocks with a one-block minimum. The paired-period peak
+estimate uses only minutes (hours for 7-day and 30-day ranges) with memory
+readings for both cgroups. It takes the highest sum of their separate maxima
+in any paired period. Those maxima can occur at different times, so their sum
+bounds the sampled combined memory within that period. The panel counts paired
+readings against completed minutes or hours with at least one completed minute
+in the chart window. It reports when there are no paired readings. Gaps can hide
+higher peaks.
+
+The estimates exclude the variable system overhead that Bunny bills. Bunny's
+pricing docs leave open whether hourly billing uses average or peak memory and
+whether blocks round per container or per pod. See
+[Bunny Magic Containers pricing](https://bunny.net/docs/magic-containers/pricing#ram-usage).
+
+For shared, overlapping, or unverified memory scopes, the panel shows one
+available reading. Private mounts can hide the ancestry needed to verify
+separation. Operators can independently verify separation and enable a default-off
+declaration, which the panel labels when used. Optional hourly and 30-day USD
+estimates use the scope comparison for each metric and exclude host overhead and
+egress.
 See [hosting estimate configuration](CONFIGURATION.md#hosting-estimates).
 Below are bot activity (Gateway events per minute and by type, logical Discord REST requests,
 429s and rate-limit waits by bucket, shard latency, writer-lease generation and margin,

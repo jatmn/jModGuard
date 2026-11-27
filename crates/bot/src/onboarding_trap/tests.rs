@@ -430,6 +430,9 @@ async fn gateway_case(
     let cleanup_late = event_kind == "cleanup late delete";
     let role_removal_late = event_kind == "role removal late confirmation";
     let case_fenced = event_kind == "cleanup kick case fenced";
+    let handoff_change = event_kind.ends_with(" at handoff");
+    let selection_changed = event_kind == "role removal selection at handoff";
+    let removal_vetoed = selection_changed || event_kind == "role removal membership at handoff";
     let mut config = jmodguard::config::BotProcessConfig::default();
     if ungrouped {
         config.log.group_automod_cleanup_deletes = false;
@@ -1018,6 +1021,77 @@ async fn gateway_case(
             pause.1.notify_one();
         };
         tokio::join!(trigger, contradict);
+    } else if handoff_change {
+        use crate::discord::with_delete_connect_hook;
+        use std::sync::atomic::AtomicUsize;
+
+        let entered = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let connect_count = AtomicUsize::new(0);
+        let pause_at = usize::from(event_kind.starts_with("cleanup"));
+        let hook = {
+            let entered = Arc::clone(&entered);
+            let release = Arc::clone(&release);
+            Arc::new(move || {
+                let entered = Arc::clone(&entered);
+                let release = Arc::clone(&release);
+                let index = connect_count.fetch_add(1, Ordering::Relaxed);
+                Box::pin(async move {
+                    if index == pause_at {
+                        entered.notify_one();
+                        release.notified().await;
+                    }
+                }) as Pin<Box<dyn Future<Output = ()> + Send>>
+            })
+        };
+        let trigger = with_delete_connect_hook(
+            hook,
+            handler.guild_member_update(
+                ctx.clone(),
+                Some(old),
+                Some(member.clone()),
+                update(&member),
+            ),
+        );
+        let change = async {
+            tokio::time::timeout(Duration::from_secs(4), entered.notified())
+                .await
+                .expect("guarded DELETE must establish a connection");
+            match event_kind {
+                "kick fence at handoff" => fence().await,
+                "kick cutoff at handoff" => app.activation.note_lease_lost(),
+                "kick leave at handoff" => {
+                    app.automod
+                        .onboarding_matches
+                        .observe(member.guild_id, member.user.id, None)
+                }
+                "role removal membership at handoff" => app.automod.onboarding_matches.observe(
+                    member.guild_id,
+                    member.user.id,
+                    Some((member.joined_at.unwrap(), &[RoleId::new(TRAP_ROLE)])),
+                ),
+                "cleanup forget at handoff" => app.recent_messages.forget(GUILD, 77, 101),
+                "cleanup rule at handoff" | "role removal selection at handoff" => {
+                    if selection_changed {
+                        changed_rule.params["remove_role_ids"] = serde_json::json!(["24"]);
+                    } else {
+                        changed_rule.params["cleanup_window_minutes"] = serde_json::json!(0);
+                    }
+                    db::compare_and_set_onboarding_trap(
+                        &app.db,
+                        GUILD as i64,
+                        None,
+                        &rule,
+                        &changed_rule,
+                    )
+                    .await
+                    .unwrap();
+                }
+                _ => unreachable!(),
+            }
+            release.notify_one();
+        };
+        tokio::join!(trigger, change);
     } else if let Some(delayed) = &delayed_log {
         let trigger = handler.guild_member_update(
             ctx.clone(),
@@ -1194,19 +1268,20 @@ async fn gateway_case(
         assert!(effects[2].1.ends_with("/channels/71/messages"));
         assert!(effects[2].2.contains("tracked messages deleted (0)"));
     } else if expected_kick {
-        let effects = if remove_roles && event_kind != "role removal no permission" {
-            assert_eq!(effects[0].0, Method::DELETE);
-            assert!(effects[0].1.ends_with("/members/30/roles/25"));
-            if bot_lookup_failed {
-                &effects[1..]
+        let effects =
+            if remove_roles && event_kind != "role removal no permission" && !removal_vetoed {
+                assert_eq!(effects[0].0, Method::DELETE);
+                assert!(effects[0].1.ends_with("/members/30/roles/25"));
+                if bot_lookup_failed {
+                    &effects[1..]
+                } else {
+                    assert_eq!(effects[1].0, Method::DELETE);
+                    assert!(effects[1].1.ends_with("/members/30/roles/24"));
+                    &effects[2..]
+                }
             } else {
-                assert_eq!(effects[1].0, Method::DELETE);
-                assert!(effects[1].1.ends_with("/members/30/roles/24"));
-                &effects[2..]
-            }
-        } else {
-            effects
-        };
+                effects
+            };
         let deletes_recent = matches!(event_kind, "cleanup" | "role removal ordered")
             || kick_late
             || cleanup_late
@@ -1271,6 +1346,9 @@ async fn gateway_case(
         assert_eq!(case.reason.as_deref(), Some(REASON));
         assert!(effects[1].1.ends_with("/channels/70/messages"));
         assert!(effects[1].2.contains(cases[0].as_str()));
+        if handoff_change && event_kind.starts_with("cleanup") {
+            assert!(effects[2].2.contains("tracked messages deleted (0)"));
+        }
         if delayed_log.is_some() || cleanup_late {
             assert_eq!(effects[2].0, Method::DELETE);
             assert!(effects[2].1.ends_with("/channels/77/messages/110"));
@@ -1302,6 +1380,9 @@ async fn gateway_case(
         if remove_roles {
             let (confirmed, unconfirmed) = match event_kind {
                 "role removal no permission" => (0, 2),
+                "role removal selection at handoff" | "role removal membership at handoff" => {
+                    (0, 1)
+                }
                 "role removal partial"
                 | "role removal bot lookup timeout"
                 | "role removal bot lookup error" => (1, 1),
@@ -1344,6 +1425,10 @@ async fn gateway_case(
                     .2
                     .contains("kick cancelled after role removal attempt")
             );
+        } else if handoff_change && event_kind != "kick cutoff at handoff" {
+            assert_eq!(effects.len(), 1, "{effects:?}");
+            assert!(effects[0].1.ends_with("/channels/71/messages"));
+            assert!(effects[0].2.contains("kick cancelled before dispatch"));
         } else {
             assert!(effects.is_empty(), "{event_kind}: {effects:?}");
         }
@@ -1432,6 +1517,49 @@ async fn late_role_removal_confirmation_survives_evidence_expiry() {
 }
 
 #[tokio::test]
+async fn writer_fence_lease_cutoff_and_gateway_leave_veto_a_connected_kick() {
+    for event in [
+        "kick fence at handoff",
+        "kick cutoff at handoff",
+        "kick leave at handoff",
+    ] {
+        confirmed_kick_cleanup_case(event, false).await;
+    }
+}
+
+#[tokio::test]
+async fn role_selection_changed_during_connect_skips_the_old_removal() {
+    role_removal_kick_case("role removal selection at handoff").await;
+}
+
+#[tokio::test]
+async fn a_selected_role_lost_during_connect_skips_the_old_removal() {
+    let now = Timestamp::from_millis(FIXTURE_NOW_MS).unwrap();
+    let member = member(MEMBER, &[TRAP_ROLE, 25], now);
+    FIXTURE_NOW
+        .scope(
+            std::cell::Cell::new(now),
+            gateway_case(
+                member.clone(),
+                member,
+                guild(Permissions::empty()),
+                "role removal membership at handoff",
+                30,
+                false,
+                true,
+            ),
+        )
+        .await;
+}
+
+#[tokio::test]
+async fn cleanup_rechecks_the_rule_and_message_after_connect() {
+    for event in ["cleanup rule at handoff", "cleanup forget at handoff"] {
+        confirmed_kick_cleanup_case(event, true).await;
+    }
+}
+
+#[tokio::test]
 async fn join_window_expiring_during_the_target_lookup_prevents_dispatch() {
     let now = Timestamp::from_millis(FIXTURE_NOW_MS).unwrap();
     let joined = Timestamp::from_millis(FIXTURE_NOW_MS - 59_000).unwrap();
@@ -1466,6 +1594,7 @@ async fn rate_limit_waits_gate_dispatch_and_retries_without_hiding_confirmations
         crate::db::Db::open(&path, 2).unwrap(),
     )
     .unwrap();
+    app.activation.mark_lock_held(true);
     let server = Server::bind(&([127, 0, 0, 1], 0).into());
     let http = HttpBuilder::new("fixture")
         .proxy(format!("http://{}", server.local_addr()))
@@ -1500,7 +1629,12 @@ async fn rate_limit_waits_gate_dispatch_and_retries_without_hiding_confirmations
                         2 => {
                             received.notify_one();
                             release.notified().await;
-                            Response::builder().status(204).body(Body::empty())
+                            Response::builder()
+                                .status(204)
+                                .header("x-ratelimit-limit", "1")
+                                .header("x-ratelimit-remaining", "0")
+                                .header("x-ratelimit-reset-after", "60")
+                                .body(Body::empty())
                         }
                         _ => panic!("unexpected DELETE retry"),
                     };
@@ -1529,6 +1663,7 @@ async fn rate_limit_waits_gate_dispatch_and_retries_without_hiding_confirmations
             REASON,
             tokio::time::Instant::now() + window,
             || true,
+            || std::future::ready(true),
         )
     };
 
@@ -1564,21 +1699,118 @@ async fn rate_limit_waits_gate_dispatch_and_retries_without_hiding_confirmations
     ));
     assert_eq!(sent.load(Ordering::SeqCst), 1);
 
-    let kick = tokio::time::timeout(Duration::from_secs(4), dispatch(DISPATCH_EVIDENCE_WINDOW));
+    let quota_wait = Arc::new(Notify::new());
+    let quota_wait_hook = Arc::clone(&quota_wait);
+    let quota_wait_sends = Arc::clone(&sent);
+    let kick = with_rate_limit_wait_hook(
+        Arc::new(move || {
+            if quota_wait_sends.load(Ordering::SeqCst) == 3 {
+                quota_wait_hook.notify_one();
+            }
+        }),
+        dispatch(DISPATCH_EVIDENCE_WINDOW),
+    );
     let park_bookkeeping = async {
         tokio::time::timeout(Duration::from_secs(3), received.notified())
             .await
             .unwrap();
         let held = bucket.lock().await;
         release.notify_one();
-        held
+        tokio::time::timeout(Duration::from_secs(3), quota_wait.notified())
+            .await
+            .expect("successful response must queue its quota update");
+        advance_rest_clock(DISCORD_REST_TIMEOUT + Duration::from_secs(1)).await;
+        drop(held);
     };
-    let (result, held) = tokio::join!(kick, park_bookkeeping);
-    assert!(matches!(result.unwrap(), DeleteDispatch::Finished(Ok(()))));
+    let (result, ()) = tokio::join!(kick, park_bookkeeping);
+    assert!(matches!(result, DeleteDispatch::Finished(Ok(()))));
     assert_eq!(sent.load(Ordering::SeqCst), 3);
-    drop(held);
+
+    let reset_wait = Arc::new(Notify::new());
+    let reset_wait_hook = Arc::clone(&reset_wait);
+    let (next, ()) = tokio::join!(
+        with_rate_limit_wait_hook(
+            Arc::new(move || reset_wait_hook.notify_one()),
+            dispatch(DISPATCH_EVIDENCE_WINDOW),
+        ),
+        async {
+            tokio::time::timeout(Duration::from_secs(3), reset_wait.notified())
+                .await
+                .expect("the next DELETE must honor the exhausted bucket");
+            advance_rest_clock(DISPATCH_EVIDENCE_WINDOW + Duration::from_secs(1)).await;
+        },
+    );
+    assert!(matches!(next, DeleteDispatch::Unsent));
+    assert_eq!(sent.load(Ordering::SeqCst), 3);
     server.abort();
     let _ = server.await;
+    drop(app);
+    crate::tenant::remove_sidecars(&path);
+    std::fs::remove_file(path).unwrap();
+}
+
+#[tokio::test(start_paused = true)]
+async fn guarded_delete_never_sends_when_tls_setup_outlasts_evidence() {
+    use tokio::io::AsyncReadExt;
+
+    let path =
+        std::env::temp_dir().join(format!("onboarding_tls_{:032x}.db", rand::random::<u128>()));
+    let app = BotState::new(
+        jmodguard::config::BotProcessConfig::default(),
+        crate::db::Db::open(&path, 2).unwrap(),
+    )
+    .unwrap();
+    app.activation.mark_lock_held(true);
+    let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+        .await
+        .unwrap();
+    let http = HttpBuilder::new("fixture")
+        .proxy(format!("https://{}", listener.local_addr().unwrap()))
+        .ratelimiter_disabled(true)
+        .build();
+    let deadline = tokio::time::Instant::now() + DISPATCH_EVIDENCE_WINDOW;
+    tokio::time::resume();
+    let dispatch = delete_before_dispatch_deadline(
+        &app,
+        &http,
+        Route::GuildMember {
+            guild_id: GUILD.into(),
+            user_id: MEMBER.into(),
+        },
+        REASON,
+        deadline,
+        || true,
+        || std::future::ready(true),
+    );
+    let peer = async {
+        let (mut socket, _) = tokio::time::timeout(Duration::from_secs(3), listener.accept())
+            .await
+            .unwrap()
+            .unwrap();
+        let mut header = [0; 5];
+        socket.read_exact(&mut header).await.unwrap();
+        assert_eq!(header[0], 22, "the connection must be waiting on TLS");
+        let mut hello = vec![0; usize::from(u16::from_be_bytes([header[3], header[4]]))];
+        socket.read_exact(&mut hello).await.unwrap();
+        assert_eq!(hello[0], 1, "expected TLS ClientHello");
+        advance_rest_clock(DISPATCH_EVIDENCE_WINDOW + Duration::from_secs(1)).await;
+        let mut after_hello = [0; 1];
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(2), socket.read(&mut after_hello))
+                .await
+                .unwrap()
+                .unwrap(),
+            0,
+            "expired handshake must close before sending or retrying a DELETE",
+        );
+    };
+    let (result, ()) = tokio::join!(dispatch, peer);
+    assert!(matches!(result, DeleteDispatch::Unsent));
+    assert!(
+        tokio::time::timeout(Duration::ZERO, listener.accept())
+            .await
+            .is_err()
+    );
     drop(app);
     crate::tenant::remove_sidecars(&path);
     std::fs::remove_file(path).unwrap();

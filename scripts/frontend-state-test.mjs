@@ -14404,12 +14404,111 @@ test('Bot Resources rounds combined memory up from bytes, including zero and blo
     assert.ok(textOf(panel).includes(`${blocks.toLocaleString('en-US')} block${blocks === 1 ? '' : 's'} (${capacity} MiB)`));
     assert.ok(textOf(panel).includes(`${headroom} MiB headroom to the next block in this estimate`));
     if (botBytes === 50 * mib) {
-      assert.match(textOf(panel), /Combined memory110 MiB/);
-      assert.match(textOf(panel), /Bot memory50 MiB/);
-      assert.match(textOf(panel), /API memory60 MiB/);
+      assert.equal(panel.querySelector('h3').textContent, 'Local memory block estimate');
+      assert.match(textOf(panel), /These estimates exclude Bunny’s billed system overhead/);
+      assert.match(textOf(panel), /whether hourly billing uses average or peak memory/);
+      assert.match(textOf(panel), /whether blocks round per container or per pod/);
+      assert.match(textOf(panel), /Combined cgroup memory110 MiB/);
+      assert.match(textOf(panel), /Bot cgroup memory50 MiB/);
+      assert.match(textOf(panel), /API cgroup memory60 MiB/);
       const [bot, api] = resourceCards(h);
       assert.equal(resourceMetricValue(bot, 'Memory'), '50 MiB');
       assert.equal(resourceMetricValue(api, 'Memory'), '60 MiB');
+    }
+  }
+});
+
+test('Bot Resources rounds the paired-period memory peak and shows its coverage', async () => {
+  const mib = 2 ** 20;
+  const responseTime = RESOURCE_NOW_MS + 150_000;
+  for (const [range, span, windowHours, peak, expected, coverage, hasGap = false] of [
+    ['24h', 60, 24, { peak_bytes: 128 * mib, periods: 1432, total_periods: 1432 }, '128 MiB · 2 blocks (128 MiB)', '1,432 of 1,432 minutes'],
+    ['24h', 60, 24, { peak_bytes: 128 * mib + 1, periods: 1431, total_periods: 1432 }, '128 MiB · 3 blocks (192 MiB)', '1,431 of 1,432 minutes', true],
+    ['7d', 3600, 168, { peak_bytes: 0, periods: 168, total_periods: 168 }, '0 MiB · 1 block (64 MiB)', '168 of 168 hours'],
+    ['24h', 60, 24, { peak_bytes: 128 * mib, periods: 1432 }, '128 MiB · 2 blocks (128 MiB)', 'Unavailable'],
+    ['24h', 60, 24, undefined, 'Unavailable', 'Unavailable'],
+  ]) {
+    const bucket = span === 3600 ? 3600 : 600;
+    const to = Math.floor(responseTime / 1000 / bucket) * bucket + bucket;
+    const snapshot = resourceSnapshot({
+      range,
+      generated_at_ms: responseTime,
+      combined_memory_peak: peak,
+      span_secs: span,
+      from_secs: to - windowHours * 3600,
+      to_secs: to,
+      bucket_secs: bucket,
+      bot: { current: resourceCurrent({ memory: { program_bytes: 50 * mib } }) },
+      api: { current: resourceCurrent({ memory: { program_bytes: 60 * mib } }) },
+    });
+    const h = ownerHarness(async () => response(snapshot));
+    h.app.navigate('resources');
+    await settle();
+    if (range === '7d') {
+      await fire(h.nodes.get('[aria-label="Last 7 days"]'), 'click');
+      await settle();
+    }
+    const panel = h.nodes.get('#content').querySelector('[aria-labelledby="resources-memory-billing"]');
+    assert.equal(resourceFact(panel, 'Paired-period peak estimate'), expected);
+    assert.equal(resourceFact(panel, 'Paired memory coverage'), coverage);
+    assert.equal(textOf(panel).includes('can hide higher peaks'), hasGap);
+  }
+});
+
+test('Bot Resources keeps complete paired coverage visible when history goes stale', async () => {
+  let snapshot = resourceSnapshot({
+    generated_at_ms: RESOURCE_NOW_MS + 150_000,
+    combined_memory_peak: { peak_bytes: 128 * 2 ** 20, periods: 1432, total_periods: 1432 },
+  });
+  const h = ownerHarness(async () => response(snapshot));
+  h.app.navigate('resources');
+  await settle();
+  assert.equal(h.nodes.get('#resources-status'), null);
+
+  snapshot = { ...snapshot, generated_at_ms: RESOURCE_NOW_MS + 180_000, history_status: 'stale' };
+  await fire(h.nodes.get('#refresh-resources'), 'click');
+  const panel = h.nodes.get('#content').querySelector('[aria-labelledby="resources-memory-billing"]');
+  assert.equal(resourceFact(panel, 'Paired memory coverage'), '1,432 of 1,432 minutes');
+  assert.doesNotMatch(textOf(panel), /can hide higher peaks/);
+  assert.match(h.nodes.get('#resources-status').textContent, /History could not be refreshed; trends are from the last successful read \(stale\)/);
+});
+
+test('Bot Resources displays sparse or empty paired coverage with an unpaired spike', async () => {
+  const mib = 2 ** 20;
+  const [pairedBucket, spikeBucket] = resourcePoints([100, 200]);
+  for (const periods of [1, 0]) {
+    const snapshot = resourceSnapshot({
+      generated_at_ms: RESOURCE_NOW_MS + 150_000,
+      combined_memory_peak: { peak_bytes: periods ? 110 * mib : null, periods, total_periods: 1432 },
+      bot: {
+        current: resourceCurrent({ memory: { program_bytes: 40 * mib } }),
+        history: resourceHistory({
+          points: [{ ...pairedBucket, minutes: 1, memory_max_bytes: 50 * mib }, { ...spikeBucket, minutes: 1, memory_max_bytes: 160 * mib }],
+          memory_peak_bytes: 160 * mib,
+        }),
+      },
+      api: {
+        current: resourceCurrent({ memory: { program_bytes: 20 * mib } }),
+        history: resourceHistory({
+          points: periods ? [{ ...pairedBucket, minutes: 1, memory_max_bytes: 60 * mib }] : [{ t: pairedBucket.t, minutes: 0 }],
+          memory_peak_bytes: periods ? 60 * mib : null,
+        }),
+      },
+    });
+    const h = ownerHarness(async () => response(snapshot));
+    h.app.navigate('resources');
+    await settle();
+    const panel = h.nodes.get('#content').querySelector('[aria-labelledby="resources-memory-billing"]');
+    const [bot] = resourceCards(h);
+    assert.match(textOf(bot), /peak 160 MiB in last 24 hours/);
+    assert.equal(resourceFact(panel, 'Paired-period peak estimate'), periods ? '110 MiB · 2 blocks (128 MiB)' : 'No paired memory readings');
+    assert.equal(resourceFact(panel, 'Paired memory coverage'), `${periods} of 1,432 minutes`);
+    assert.equal(resourceFact(panel, 'Peak combined memory in 24h'), undefined);
+    assert.match(resourceFact(panel, 'Estimated blocks'), /^1 block \(64 MiB\)/);
+    if (periods) {
+      assert.match(textOf(panel), /covers only minutes with readings for both cgroups/);
+      assert.match(textOf(panel), /sum of their separate maxima is an upper bound on sampled combined memory in each minute because the cgroups can peak at different times/);
+      assert.match(textOf(panel), /Periods without both readings can hide higher peaks/);
     }
   }
 });
@@ -14440,9 +14539,9 @@ test('Bot Resources estimates memory and CPU run rates from fresh samples at con
   await check(['$0.001', '$0.72'], ['$0', '$0.00']);
   snapshot.processes.bot.current.stale = true;
   const stale = await check(['Unavailable', 'Unavailable'], ['Unavailable', 'Unavailable']);
-  assert.match(stale, /Combined memoryUnavailable/);
+  assert.match(stale, /Combined cgroup memoryUnavailable/);
   assert.match(stale, /Estimated blocksUnavailable/);
-  assert.match(stale, /Both processes need fresh, usable memory readings/);
+  assert.match(stale, /Both cgroups need fresh, usable memory readings/);
   assert.doesNotMatch(stale, roundingNote);
   snapshot.processes.bot.current.stale = false;
   snapshot.processes.bot.current.cpu_tenths = null;
@@ -14492,7 +14591,7 @@ test('Bot Resources shows estimated blocks and costs with an operator separation
   h.app.navigate('resources');
   await settle();
   const panel = h.nodes.get('#content').querySelector('[aria-labelledby="resources-memory-billing"]');
-  assert.match(textOf(panel), /Combined memory110 MiB/);
+  assert.match(textOf(panel), /Combined cgroup memory110 MiB/);
   assert.match(textOf(panel), /2 blocks \(128 MiB\).*18 MiB headroom/);
   assert.match(textOf(panel), /operator’s cgroup separation declaration for memory and CPU/);
   assert.deepEqual([...panel.querySelectorAll('tbody td')].map(textOf), ['$0.000625', '$0.45', '$0.01', '$7.20']);
@@ -14511,7 +14610,7 @@ test('Bot Resources measures disjoint CPU and memory cgroups independently', asy
     await settle();
     const panel = h.nodes.get('#content').querySelector('[aria-labelledby="resources-memory-billing"]');
     assert.deepEqual([...panel.querySelectorAll('tbody th')].map(textOf), [label]);
-    assert.equal(Boolean(panel.querySelector('dt')?.textContent === 'Combined memory'), label === 'Memory blocks');
+    assert.equal(Boolean(panel.querySelector('dt')?.textContent === 'Combined cgroup memory'), label === 'Memory blocks');
   }
 });
 
