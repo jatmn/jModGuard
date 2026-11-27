@@ -289,6 +289,70 @@ async fn erasure_clears_owned_rows_without_backup_jobs() {
 }
 
 #[tokio::test]
+async fn fenced_erasure_waits_without_primary_polling_or_blocking_other_guilds() {
+    let probe = Arc::new(db::StartupProbe::default());
+    let f = {
+        let _probe = db::enter_startup_probe(Some(probe.clone()));
+        Fixture::new()
+    };
+    enroll(&f, 10, 100).await;
+    enroll(&f, 20, 100).await;
+    db::retire_guild_enrollment(&f.db, 10, 100).await.unwrap();
+    let dest = StoreId::new();
+    db::guild_stores::register_store(
+        &f.db,
+        dest.clone(),
+        db::guild_stores::StorePolicy::Dedicated { guild_id: 10 },
+    )
+    .await
+    .unwrap();
+    f.db.with_conn(move |conn| {
+        conn.execute_bounded(
+            "INSERT INTO guild_write_fences(
+                guild_id,generation,phase,destination_store_id,destination_revision,created_at
+             ) VALUES(10,?1,'freeze',?2,?1,unixepoch())",
+            db::params![format!("{:032x}", 9u128), dest.as_str()],
+            64 * 1024 * 1024,
+        )
+    })
+    .await
+    .unwrap();
+
+    let queries = probe.queries();
+    let transactions = probe.transactions();
+    let first = f.tenant.drive_erasure().await.unwrap();
+    let second = f.tenant.drive_erasure().await.unwrap();
+    assert_eq!(
+        probe.transactions() - transactions,
+        0,
+        "fenced-only polls must avoid the primary"
+    );
+    assert_eq!(probe.queries() - queries, 2, "one advisory per poll");
+    assert!(
+        !first && !second,
+        "fenced jobs must not keep the drain running"
+    );
+
+    db::retire_guild_enrollment(&f.db, 20, 100).await.unwrap();
+    assert!(f.tenant.drive_erasure().await.unwrap());
+    assert!(!db::guild_erasure_queued(&f.db, 20).await.unwrap());
+    assert!(db::guild_erasure_queued(&f.db, 10).await.unwrap());
+    assert!(!f.tenant.drive_erasure().await.unwrap());
+
+    f.db.with_conn(|conn| {
+        conn.execute_bounded(
+            "DELETE FROM guild_write_fences WHERE guild_id=10",
+            (),
+            64 * 1024 * 1024,
+        )
+    })
+    .await
+    .unwrap();
+    assert!(f.tenant.drive_erasure().await.unwrap());
+    assert!(!db::guild_erasure_queued(&f.db, 10).await.unwrap());
+}
+
+#[tokio::test]
 async fn stale_erasure_does_not_wipe_a_rejoined_guilds_directory_data() {
     let f = Fixture::new();
     let departed = enroll(&f, 10, 100).await;
