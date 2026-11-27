@@ -40,6 +40,32 @@ pub enum MatchPolicy {
     Text(jmodguard::text_spam::Policy),
 }
 
+#[derive(Default)]
+struct OwnDeletes {
+    image: Vec<crate::image_spam::OwnDelete>,
+    text: Vec<crate::text_spam::OwnDelete>,
+}
+
+enum OwnDelete {
+    Image(crate::image_spam::OwnDelete),
+    Text(crate::text_spam::OwnDelete),
+}
+
+impl OwnDeletes {
+    fn finish(&mut self, delete: OwnDelete, succeeded: bool) {
+        match delete {
+            OwnDelete::Image(mut delete) => {
+                delete.finish(succeeded);
+                self.image.push(delete);
+            }
+            OwnDelete::Text(mut delete) => {
+                delete.finish(succeeded);
+                self.text.push(delete);
+            }
+        }
+    }
+}
+
 impl MatchPolicy {
     fn parse(kind: Kind, rule: &crate::types::RuleDef) -> Option<Self> {
         match kind {
@@ -60,7 +86,7 @@ impl MatchPolicy {
     }
 
     fn still_proving(&self, app: &BotState, found: &Match, now: Instant) -> bool {
-        self.still_proving_with_deletes(app, found, now, &[])
+        self.still_proving_with_deletes(app, found, now, &OwnDeletes::default())
     }
 
     fn still_proving_with_deletes(
@@ -68,7 +94,7 @@ impl MatchPolicy {
         app: &BotState,
         found: &Match,
         now: Instant,
-        own_deletes: &[crate::image_spam::OwnDelete],
+        own_deletes: &OwnDeletes,
     ) -> bool {
         match self {
             Self::Image(policy) | Self::ImageMetadata { policy, .. } => {
@@ -84,10 +110,10 @@ impl MatchPolicy {
                         found.guild,
                         found.author,
                         proof,
-                        own_deletes,
+                        &own_deletes.image,
                         *serials,
                     )
-                } else if own_deletes.is_empty() {
+                } else if own_deletes.image.is_empty() {
                     app.image_spam
                         .match_still_proving(found.guild, found.author, proof)
                 } else {
@@ -95,17 +121,17 @@ impl MatchPolicy {
                         found.guild,
                         found.author,
                         proof,
-                        own_deletes,
+                        &own_deletes.image,
                     )
                 }
             }
             Self::Text(policy) => app.text_spam.match_still_proving(
-                found.guild,
-                found.author,
+                (found.guild, found.author),
                 found.token,
                 &found.messages,
                 policy,
                 now,
+                &own_deletes.text,
             ),
         }
     }
@@ -374,23 +400,22 @@ pub(crate) async fn enforce(
 }
 
 // Member lookup, earlier deletes, and ban preparation can all outlive the
-// admitted configuration or image window.
+// admitted configuration or match window.
 async fn proven_match_is_current(
     app: &BotState,
     found: &Match,
     rule: &str,
     rule_def: &jmodguard::types::RuleDef,
-    own_deletes: &[crate::image_spam::OwnDelete],
+    own_deletes: &OwnDeletes,
 ) -> bool {
     if found.kind == Kind::Image && app.poll_config_version().await.is_err() {
         return false;
     }
     crate::automod::recheck_live_rule(app, found.guild, rule, rule_def, |cfg| {
-        found.kind != Kind::Image
-            || ((cfg.version, cfg.durable_version) == found.token
-                && found
-                    .policy
-                    .still_proving_with_deletes(app, found, Instant::now(), own_deletes))
+        (found.kind != Kind::Image || (cfg.version, cfg.durable_version) == found.token)
+            && found
+                .policy
+                .still_proving_with_deletes(app, found, Instant::now(), own_deletes)
     })
     .await
 }
@@ -552,7 +577,7 @@ async fn punish_proven_match(
     let now = Instant::now();
     let mut deleted_count = 0;
     let mut delete_notes = Vec::new();
-    let mut own_deletes = Vec::new();
+    let mut own_deletes = OwnDeletes::default();
     let mut proof_stale = false;
     let sweep_rule_is_current = || {
         crate::automod::recheck_live_rule(app, found.guild, rule, rule_def, |cfg| {
@@ -582,28 +607,21 @@ async fn punish_proven_match(
         }
         // Register before awaiting HTTP: Gateway may deliver the echo before
         // REST completes. Only a successful response makes this proof usable.
-        let own_delete = if found.kind == Kind::Image {
-            let Some(deleted) = app.image_spam.begin_delete(
-                found.guild,
-                found.author,
-                found.token,
-                *channel,
-                *message,
-            ) else {
-                app.spam_gate.finish_delete(
-                    found.guild,
-                    found.author,
-                    *channel,
-                    *message,
-                    now,
-                    false,
-                );
-                proof_stale = true;
-                break;
-            };
-            Some(deleted)
-        } else {
-            None
+        let own_delete = match found.kind {
+            Kind::Image => app
+                .image_spam
+                .begin_delete(found.guild, found.author, found.token, *channel, *message)
+                .map(OwnDelete::Image),
+            Kind::Text => app
+                .text_spam
+                .begin_delete(found.guild, found.author, found.token, *channel, *message)
+                .map(OwnDelete::Text),
+        };
+        let Some(own_delete) = own_delete else {
+            app.spam_gate
+                .finish_delete(found.guild, found.author, *channel, *message, now, false);
+            proof_stale = true;
+            break;
         };
         let prepared = app.automod_delete_marks.prepare_delete(
             found.guild,
@@ -626,15 +644,12 @@ async fn punish_proven_match(
             ),
         )
         .await;
-        if let Some(mut deleted) = own_delete {
-            // An already-gone 404 is idempotent for reporting, but does not
-            // prove this enforcement performed the deletion.
-            deleted.finish(matches!(
-                &result,
-                Ok(crate::discord::DiscordCall::Finished(Ok(())))
-            ));
-            own_deletes.push(deleted);
-        }
+        // An already-gone 404 is idempotent for reporting, but does not
+        // prove this enforcement performed the deletion.
+        own_deletes.finish(
+            own_delete,
+            matches!(&result, Ok(crate::discord::DiscordCall::Finished(Ok(())))),
+        );
         let outcome = match result {
             Ok(crate::discord::DiscordCall::Finished(Ok(()))) => {
                 deleted_count += 1;
@@ -1777,12 +1792,16 @@ pub(crate) mod tests {
             Remove,
             Unrelated,
             PurgeWindow,
+            InvalidateEvidence,
+            EchoOwnDeletes,
+            UnconfirmedOwnDelete,
         }
-        use ConfigEdit::{Disable, PurgeWindow, Remove, Unrelated};
+        use ConfigEdit::*;
 
         let ban = ("PUT", "/api/v10/guilds/10/bans/99");
         let ban_lookup = ("GET", "/api/v10/guilds/10/bans/99");
         let member = ("GET", "/api/v10/guilds/10/members/99");
+        let first_match_delete = ("DELETE", "");
         let first_sweep = ("DELETE", "/api/v10/channels/16/messages/46");
         let second_sweep = ("DELETE", "/api/v10/channels/15/messages/45");
         for (purge, dry, mut edit_on, expected, swept, matched) in [
@@ -1798,7 +1817,39 @@ pub(crate) mod tests {
             (true, false, Some((ban, PurgeWindow)), 3600, 0, 3),
             (false, false, Some((ban_lookup, Disable)), 0, 0, 3),
             (false, false, Some((ban_lookup, Remove)), 0, 0, 3),
-            (true, false, None, 3600, 0, 1),
+            (true, false, Some((first_match_delete, Disable)), 3600, 0, 1),
+            (
+                true,
+                false,
+                Some((first_match_delete, InvalidateEvidence)),
+                3600,
+                0,
+                1,
+            ),
+            (
+                false,
+                false,
+                Some((ban_lookup, InvalidateEvidence)),
+                0,
+                0,
+                3,
+            ),
+            (
+                true,
+                false,
+                Some((first_match_delete, EchoOwnDeletes)),
+                3600,
+                2,
+                3,
+            ),
+            (
+                false,
+                false,
+                Some((first_match_delete, UnconfirmedOwnDelete)),
+                0,
+                0,
+                1,
+            ),
             (true, true, None, 3600, 0, 0),
         ] {
             let path = std::env::temp_dir()
@@ -1863,9 +1914,27 @@ pub(crate) mod tests {
                 "/api/v10/channels/{}/messages/{}",
                 messages[0].0, messages[0].1
             );
-            if matched == 1 {
-                edit_on = Some((("DELETE", first_match.as_str()), Disable));
+            if let Some((route, edit)) = edit_on
+                && route == first_match_delete
+            {
+                edit_on = Some((("DELETE", first_match.as_str()), edit));
             }
+            let (stale_channel, stale_message) = messages[1];
+            let echo_own_deletes = edit_on.and_then(|(_, edit)| match edit {
+                EchoOwnDeletes => Some(true),
+                UnconfirmedOwnDelete => Some(false),
+                _ => None,
+            });
+            let delete_routes: Vec<_> = messages
+                .iter()
+                .map(|(channel, message)| {
+                    (
+                        format!("/api/v10/channels/{channel}/messages/{message}"),
+                        *channel,
+                        *message,
+                    )
+                })
+                .collect();
             let found = Match {
                 kind: Kind::Text,
                 guild: 10,
@@ -1887,7 +1956,7 @@ pub(crate) mod tests {
             let server_stop = Arc::clone(&stop);
             let writer = Arc::clone(&app);
             let runtime = tokio::runtime::Handle::current();
-            let mut edit_route = edit_on.map(|((method, path), edit)| {
+            let mut edit_route = edit_on.and_then(|((method, path), edit)| {
                 let upsert = |id: &str, rule| crate::db::ControlOp::UpsertRule {
                     request: scope.clone(),
                     target: scope.clone(),
@@ -1899,24 +1968,26 @@ pub(crate) mod tests {
                 let op = match edit {
                     Disable => {
                         rule.enabled = false;
-                        upsert("repeat_text", rule)
+                        Some(upsert("repeat_text", rule))
                     }
-                    Remove => crate::db::ControlOp::DeleteRule {
+                    Remove => Some(crate::db::ControlOp::DeleteRule {
                         request: scope.clone(),
                         target: scope.clone(),
                         id: "repeat_text".into(),
-                    },
+                    }),
                     Unrelated => {
                         rule = cfg.rules["velocity"].clone();
                         rule.log_automod = !rule.log_automod;
-                        upsert("velocity", rule)
+                        Some(upsert("velocity", rule))
                     }
                     PurgeWindow => {
                         rule.actions[1].purge_last_hour = false;
-                        upsert("repeat_text", rule)
+                        Some(upsert("repeat_text", rule))
                     }
+                    InvalidateEvidence => None,
+                    EchoOwnDeletes | UnconfirmedOwnDelete => return None,
                 };
-                (method, path.to_owned(), op)
+                Some((method, path.to_owned(), op))
             });
             let server = std::thread::spawn(move || {
                 serve_discord_stub(
@@ -1929,15 +2000,31 @@ pub(crate) mod tests {
                             && p == path
                         {
                             let (_, _, edit) = edit_route.take().unwrap();
-                            let saved = runtime
-                                .block_on(crate::db::apply_control(
-                                    &writer.db,
-                                    Some(&writer.tenant),
-                                    edit,
-                                    Some(writer.activation.instance()),
-                                ))
-                                .unwrap();
-                            assert!(matches!(saved, crate::db::ControlReply::Saved { .. }));
+                            if let Some(edit) = edit {
+                                let saved = runtime
+                                    .block_on(crate::db::apply_control(
+                                        &writer.db,
+                                        Some(&writer.tenant),
+                                        edit,
+                                        Some(writer.activation.instance()),
+                                    ))
+                                    .unwrap();
+                                assert!(matches!(saved, crate::db::ControlReply::Saved { .. }));
+                            } else {
+                                writer
+                                    .text_spam
+                                    .invalidate(10, stale_channel, stale_message);
+                            }
+                        }
+                        if let Some(succeeds) = echo_own_deletes
+                            && method == "DELETE"
+                            && let Some((_, channel, message)) =
+                                delete_routes.iter().find(|(route, _, _)| route == path)
+                        {
+                            writer.text_spam.deleted(10, *channel, *message);
+                            if !succeeds {
+                                return Some("404 Not Found");
+                            }
                         }
                         None
                     },
@@ -2005,7 +2092,7 @@ pub(crate) mod tests {
                 );
                 assert!(
                     seen.iter().all(|line| !line.starts_with("PUT ")),
-                    "the changed rule must stop a ban even with zero purge: {seen:?}"
+                    "a changed rule or stale proof must stop a ban even with zero purge: {seen:?}"
                 );
             } else {
                 let bans: Vec<_> = seen
