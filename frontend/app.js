@@ -1386,7 +1386,7 @@ const RESOURCES_HELP = [
   "CPU and memory readings and limits come from the cgroups sampled by the bot and API.",
   "The API is sampled every 5 seconds; the bot saves its status and both processes' history once a minute.",
   "1h and 24h use minute rollups kept 48 hours; 7d and 30d use hourly rollups kept 31 days.",
-  "Counts are this application's own work. Database rows read and provider billing are not shown because they cannot be read safely.",
+  "Activity counts cover this application. The database client does not report rows read.",
 ];
 
 const RESOURCE_PROCESSES = [
@@ -1765,6 +1765,91 @@ function gaugeChart(points, title, name, from, to, format) {
   });
 }
 
+const BUNNY_COST_SERVICES = [
+  ["magic_containers", "Magic Containers", "accent"],
+  ["database", "Database", "ok"],
+  ["storage", "Storage", "warn"],
+  ["cdn", "CDN"],
+];
+
+function bunnyUsd(amount) {
+  if (!Number.isFinite(amount) || amount < 0) return "Not available";
+  if (amount > 0 && amount < 0.01) return "<$0.01";
+  return `$${amount.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+}
+
+function BunnyCostHistory({ history }) {
+  const services = BUNNY_COST_SERVICES.filter(([, , tone]) => tone);
+  const max = Math.max(0, ...history.map((month) =>
+    services.reduce((total, [key]) => total + (month[key]?.usd ?? 0), 0)));
+  return h("div", null,
+    h("h4", { id: "resources-bunny-history", className: "du-metric-label" }, "Past months (UTC)"),
+    history.length === 0
+      ? h("p", { className: "an-note muted" }, "No saved months yet.")
+      : h("div", { className: "table-scroll rounded-box", tabIndex: 0, role: "region", "aria-labelledby": "resources-bunny-history" },
+        h("table", { className: "table table-sm" },
+          h("thead", null, h("tr", null,
+            ...["Month", "Recorded costs", ...services.map(([, label]) => label)].map((label) =>
+              h("th", { key: label, scope: "col" }, label)),
+          )),
+          h("tbody", null, ...history.map((month) => {
+            const parts = services.map(([key, label, tone]) => ({ key, label, tone, value: month[key]?.usd }));
+            return h("tr", { key: month.month },
+              h("th", { scope: "row" }, month.month),
+              h("td", null, h(ShareBar, {
+                parts, total: max || 1,
+                summary: parts.map((part) => `${part.label} ${bunnyUsd(part.value)}`).join(", "),
+              })),
+              ...parts.map((part) => h("td", { key: part.key },
+                bunnyUsd(part.value), month[part.key]?.partial ? " (partial)" : "",
+              )),
+            );
+          })),
+        ),
+      ),
+  );
+}
+
+function BunnyCostPanel({ provider }) {
+  const breakdown = provider.magic_breakdown;
+  return analyticsPanel("Bunny cost estimates", "resources-bunny-costs", h("div", null,
+    h("p", { className: "an-note muted" },
+      `${provider.month} (UTC). The Magic Containers projection comes from Bunny and includes overhead and traffic. Usage estimates use list prices and may have gaps.`,
+    ),
+    h("div", { className: "table-scroll rounded-box", tabIndex: 0, role: "region", "aria-label": "Current Bunny costs" },
+      h("table", { className: "table table-sm" },
+        h("thead", null, h("tr", null,
+          ...["Service", "Month to date (USD)", "Projected month (USD)", "Last updated"].map((label) =>
+            h("th", { key: label, scope: "col" }, label)),
+        )),
+        h("tbody", null, ...BUNNY_COST_SERVICES.map(([key, label]) => {
+          const service = provider[key];
+          const status = key === "cdn" ? "Not available with scoped Bunny keys"
+            : service?.status !== "available" && service?.last_updated_secs
+            ? "Not available · last successful figures shown" : null;
+          return h("tr", { key },
+            h("th", { scope: "row" }, label,
+              key === "database" && service?.configured_resources === 1 ? " (1 database)" : "",
+            ),
+            h("td", null, bunnyUsd(service?.month_to_date_usd), service?.partial ? " (partial)" : ""),
+            h("td", null, bunnyUsd(service?.projected_usd)),
+            h("td", null, service?.last_updated_secs ? formatInstant(service.last_updated_secs * 1000) : "—",
+              status && h("div", { className: "muted" }, status),
+            ),
+          );
+        })),
+      ),
+    ),
+    breakdown && h("dl", { className: "du-facts", "aria-label": "Magic Containers month-to-date components" },
+      ...[["CPU", "cpu"], ["RAM", "ram"], ["Egress", "egress"], ["Volumes", "volume"]].map(([label, key]) =>
+        h("div", { key }, h("dt", null, label), h("dd", null, bunnyUsd(breakdown[key]))),
+      ),
+    ),
+    h("p", { className: "an-note muted" }, "Database uses Bunny’s free public-preview rate. Storage assumes one Standard region. Magic Containers egress uses the North America and Europe rate. Estimates exclude Bunny’s $1 monthly account minimum."),
+    h(BunnyCostHistory, { history: provider.history ?? [] }),
+  ));
+}
+
 function TabBotResources() {
   return isBotOwner() ? h(BotResources) : ownerAccessRequired();
 }
@@ -1828,6 +1913,7 @@ function BotResources() {
     note,
     !snapshot && !result.error && h("p", { className: "muted", role: "status", "aria-busy": "true" }, "Loading Bot Resources…"),
     snapshot && h(MemoryBillingPanel, { snapshot, nowMs }),
+    snapshot?.provider?.status === "configured" && h(BunnyCostPanel, { provider: snapshot.provider }),
     snapshot &&
       h(
         "div",

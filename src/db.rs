@@ -74,6 +74,7 @@ mod updates;
 pub use updates::*;
 mod update_control;
 pub use update_control::*;
+pub mod bunny_costs;
 mod resources;
 pub mod usage;
 pub use resources::*;
@@ -105,6 +106,10 @@ const MIGRATIONS: &[(i64, &str)] = &[
         include_str!("../migrations/0029_cleanup_delete_journal.sql"),
     ),
     (30, include_str!("../migrations/0030_audit_log_date.sql")),
+    (
+        31,
+        include_str!("../migrations/0031_bunny_cost_snapshots.sql"),
+    ),
 ];
 
 /// Completed core schema required by service startup and release observations.

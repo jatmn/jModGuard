@@ -14372,6 +14372,35 @@ test('Bot Resources says Unavailable for unread values and never shows them as z
   assert.ok([...h.nodes.get('#content').querySelectorAll('.br-chart-empty')].length >= 4, 'empty charts say so');
 });
 
+test('Bot Resources hides Bunny costs without config and renders partial provider history', async () => {
+  let snapshot = resourceSnapshot();
+  const h = ownerHarness(async () => response(snapshot));
+  h.app.navigate('resources');
+  await settle();
+  const section = () => h.nodes.get('#content').querySelector('[aria-labelledby="resources-bunny-costs"]');
+  assert.equal(section(), null);
+
+  snapshot = resourceSnapshot({ provider: {
+    status: 'configured', month: '2026-11',
+    magic_containers: { status: 'available', month_to_date_usd: 2.25, projected_usd: 4.75, last_updated_secs: RESOURCE_NOW_MS / 1000 },
+    magic_breakdown: { cpu: 1.20, ram: 0.30, egress: 0.75, volume: 0 },
+    database: { status: 'unavailable', configured_resources: 1 },
+    storage: { status: 'unavailable', month_to_date_usd: 0.005, projected_usd: 0.01, last_updated_secs: RESOURCE_NOW_MS / 1000, partial: true },
+    cdn: { status: 'unavailable' },
+    history: [{ month: '2026-10', magic_containers: { usd: 3.25, partial: true }, database: { usd: 0 }, storage: null }],
+  } });
+  await fire(h.nodes.get('#refresh-resources'), 'click');
+  const panel = section();
+  assert.ok(panel);
+  assert.match(textOf(panel), /2026-11 \(UTC\)/);
+  assert.match(textOf(panel), /Magic Containers\$2.25\$4.75/);
+  assert.match(textOf(panel), /Database \(1 database\)Not available/);
+  assert.match(textOf(panel), /Storage<\$0.01 \(partial\)\$0.01.*last successful figures shown/);
+  assert.match(textOf(panel), /CDN.*Not available with scoped Bunny keys/);
+  assert.match(textOf(panel), /2026-10\$3.25 \(partial\)\$0.00Not available/);
+  assert.ok(h.nodes.get('#content').querySelector('[aria-labelledby="resources-memory-billing"]'));
+});
+
 test('Bot Resources rounds combined memory up from bytes, including zero and block boundaries', async () => {
   const mib = 2 ** 20;
   for (const [botBytes, apiBytes, blocks, capacity, headroom] of [

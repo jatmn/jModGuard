@@ -66,6 +66,48 @@ current usage continues for 720 hours. Both cost estimates exclude host
 overhead and egress. They use local readings and make no calls to billing providers.
 See [Bot Resources](WEBUI.md#tabs).
 
+### Bunny provider cost estimates
+
+Set these optional variables in the **API process** environment. Use stats-only
+keys restricted to the listed resources. Example values are placeholders.
+
+| Variable | Placeholder | Purpose |
+|---|---|---|
+| `JMODGUARD_BUNNY_MC_STATS_KEY` | `<mc-stats-key>` | Key with `MagicContainers.Statistics` |
+| `JMODGUARD_BUNNY_MC_APP_ID` | `<mc-app-id>` | Magic Containers app ID, with its original case |
+| `JMODGUARD_BUNNY_DATA_STATS_KEY` | `<data-stats-key>` | Key with `Database.Statistics`, `StorageZone.Statistics`, or both |
+| `JMODGUARD_BUNNY_DB_CORE_ID` | `<CORE-DB-ID>` | Core database ID, as issued by Bunny |
+| `JMODGUARD_BUNNY_DB_GUILD_ID` | `<GUILD-DB-ID>` | Guild database ID, as issued by Bunny |
+| `JMODGUARD_BUNNY_STORAGE_ZONE_ID` | `<storage-zone-id>` | Storage zone ID |
+
+Set a matching key and ID for each service you want to see. Either database
+ID can be used by itself. Copy uppercase database IDs as issued. The API
+does not trim or change ID case. An entirely unset configuration hides the
+Bunny panel. Scoped keys cannot read CDN statistics.
+
+All figures are estimates in USD on a UTC calendar month. Magic Containers uses
+Bunny's projected `monthlyCost` and estimates accrued costs from charted
+CPU, RAM, traffic, and allocated volume capacity. I/O chart values for traffic,
+memory and volumes are interpreted as bytes, and CPU as cores. The estimate
+applies 64 MiB RAM blocks to each pod's charted usage and uses daily averages
+for older buckets. Bunny's billed overhead and other charges can differ.
+See [Magic Containers pricing](https://bunny.net/docs/magic-containers/pricing)
+and [monitoring](https://bunny.net/docs/magic-containers/monitoring).
+
+As of 2026-11-26, Storage is modeled at the single-region Standard rate,
+Magic Containers traffic at the North America and Europe rate, and Database
+at the public-preview rate. Estimates exclude the $1 monthly account minimum,
+taxes and credits. Storage projections extrapolate based on the fraction of the month
+elapsed. See [Storage pricing](https://bunny.net/docs/storage/pricing)
+and [Database pricing](https://bunny.net/database/#pricing).
+
+Successful figures refresh about every six hours. API failures keep the last
+successful same-month figures with their timestamp and trigger bounded retries.
+History uses daily estimates grouped into monthly core snapshots. Backfill uses
+up to 365 days for Magic Containers and Storage and 180 days for Database.
+The authenticated bot writer link must be configured to save snapshots. The
+backup for the core database includes this history.
+
 ### Public legal details
 
 Operators must fill in `[legal]` in the API's configuration before publishing

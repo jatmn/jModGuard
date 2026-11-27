@@ -202,6 +202,52 @@ async fn api_paths_open_no_write_connection_and_save_through_the_bot() {
     assert_eq!(probe.immediate(), 0);
     cfg.bot.control_target = bound.to_string();
     let app = ApiState::new(cfg, db).unwrap();
+    // The API's cost collector can persist through the normal process-only
+    // writer operation while the API's own SQLite connection stays read-only.
+    use db::bunny_costs::{BunnyCostSnapshot, BunnyMonthData, BunnyService, bunny_cost_snapshots};
+    let month = chrono::NaiveDate::from_ymd_opt(2026, 10, 1).unwrap();
+    let observed = month.and_hms_opt(12, 0, 0).unwrap().and_utc().timestamp();
+    let snapshot = BunnyCostSnapshot {
+        month,
+        fetched_at: observed,
+        data: BunnyMonthData {
+            days: Default::default(),
+            month_to_date: Some(0.25),
+            projection: Some(0.5),
+            closed: false,
+            partial: false,
+        },
+    };
+    let digest = [3; 32];
+    for (fetched_at, month_to_date) in [
+        (observed, Some(0.25)),
+        (observed - 1, Some(0.1)),
+        (observed, Some(0.25)),
+    ] {
+        let mut snapshot = snapshot.clone();
+        snapshot.fetched_at = fetched_at;
+        snapshot.data.month_to_date = month_to_date;
+        assert!(matches!(
+            app.commit(db::ControlOp::StoreBunnyCostSnapshot {
+                service: BunnyService::Storage,
+                source_digest: digest,
+                snapshot,
+            })
+            .await
+            .unwrap(),
+            db::ControlReply::Saved { .. },
+        ));
+    }
+    let costs = bunny_cost_snapshots(&app.db, BunnyService::Storage, digest, month, month)
+        .await
+        .unwrap();
+    assert_eq!(costs.len(), 1);
+    assert_eq!(costs[0].data.month_to_date, Some(0.25));
+    let other_source = bunny_cost_snapshots(&app.db, BunnyService::Storage, [4; 32], month, month)
+        .await
+        .unwrap();
+    assert!(other_source.is_empty());
+
     let rejected = app
         .commit_actor(
             9,

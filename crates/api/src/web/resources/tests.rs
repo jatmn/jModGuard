@@ -271,6 +271,7 @@ async fn resources_compare_stored_and_live_scopes_without_exposing_identity() {
                 history_status,
                 &status(scopes),
                 &estimate,
+                None,
             ))
             .await;
             assert_eq!(
@@ -359,6 +360,7 @@ async fn paired_peak_at(f: &Fixture, range: ResourceRange, now_secs: i64) -> Val
         status,
         &ProcessStatus::default(),
         &HostingEstimateConfig::default(),
+        None,
     ))
     .await["combined_memory_peak"]
         .clone()
@@ -448,6 +450,7 @@ async fn failed_refresh_keeps_complete_paired_coverage_from_the_cached_snapshot(
             status,
             &ProcessStatus::default(),
             &HostingEstimateConfig::default(),
+            None,
         ))
         .await;
         assert_eq!(value["history_status"], "stale");
@@ -579,6 +582,7 @@ async fn unavailable_history_still_returns_live_api_values() {
         "unavailable",
         &api,
         &HostingEstimateConfig::default(),
+        None,
     ))
     .await;
     assert_eq!(value["history_status"], "unavailable");
@@ -590,6 +594,34 @@ async fn unavailable_history_still_returns_live_api_values() {
     );
     assert_eq!(value["rows_read"]["status"], "unavailable");
     assert_eq!(value["provider"]["status"], "not_configured");
+}
+
+#[tokio::test]
+async fn owner_response_never_contains_bunny_credentials_or_resource_ids() {
+    let f = fixture();
+    let key = "placeholder-api-only-key";
+    let id = "Placeholder-Mixed-App";
+    f.app.bunny_costs.configure_for_test(|name| match name {
+        "JMODGUARD_BUNNY_MC_STATS_KEY" => Some(key.into()),
+        "JMODGUARD_BUNNY_MC_APP_ID" => Some(id.into()),
+        _ => None,
+    });
+    let owner = signed_in(&f.app, 99).await;
+    let body = response_json(
+        overview(State(f.app.clone()), owner, origin(&f.app), range("1h"))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(body["provider"]["status"], "configured");
+    assert_eq!(
+        body["provider"]["magic_containers"]["configured_resources"],
+        1
+    );
+    assert_eq!(body["provider"]["storage"]["configured_resources"], 0);
+    assert_eq!(body["provider"]["cdn"]["status"], "unavailable");
+    assert!(!body.to_string().contains(key));
+    assert!(!body.to_string().contains(id));
 }
 
 #[tokio::test]
@@ -626,6 +658,7 @@ async fn cached_history_reuses_payload_and_refreshes_on_expiry_or_bucket_change(
             status,
             &api,
             &HostingEstimateConfig::default(),
+            None,
         ))
         .await;
         assert_eq!(value["history_status"], "available");

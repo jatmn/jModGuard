@@ -2,6 +2,7 @@
 
 pub mod access_roles;
 pub mod api;
+pub mod bunny_costs;
 pub mod cases;
 mod directory;
 mod discord_retry;

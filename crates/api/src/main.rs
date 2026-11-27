@@ -109,6 +109,7 @@ async fn main() -> Result<()> {
                     .then(|| app.cfg.log.directory.clone());
                 let poll_start = tokio::time::Instant::now();
                 tokio::spawn(web::resources::run_rollups(log_dir, poll_start));
+                web::bunny_costs::spawn(&app);
                 let poll_secs = app.cfg.bot.config_poll_secs.max(1);
                 let update_app = Arc::clone(&app);
                 let release_check = tokio::spawn(async move {
