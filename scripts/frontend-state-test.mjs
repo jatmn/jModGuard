@@ -8104,6 +8104,61 @@ test('delegated settings can edit cleanup while onboarding role removal stays lo
   }
 });
 
+for (const [label, inactive] of [['Enabled', false], ['Dry-run (log only)', true]]) {
+  test(`delegated settings can restore a saved live onboarding removal policy after changing ${label}`, async () => {
+    const id = 'onboarding_bot_trap';
+    const effective = {
+      enabled: true, dry_run: false, skip_moderators: true, log_automod: true, open_case: true,
+      params: { role_id: '22', join_window_minutes: 30, remove_role_ids: ['23'] },
+      actions: [{ at: 1, action: 'kick', reason: 'Fixture kick' }],
+    };
+    const record = { rule_id: id, name: 'Onboarding bot trap', effective };
+    const writes = [];
+    const h = harness(async (url, options) => {
+      if (url.endsWith('/server-names')) return response({
+        roles: [{ id: '22', name: 'Anti-bot' }, { id: '24', name: 'Other trap' }],
+        channels: [],
+      });
+      assert.equal(options.method, 'PUT');
+      assert.ok(url.endsWith(`/rules/${id}`));
+      const body = JSON.parse(options.body);
+      writes.push(body);
+      return response({ config_patch: { kind: 'rule', id, scope: 'guild', value: body.data } });
+    });
+    h.app.state.guilds[0].access = 'settings';
+    h.app.state.config = { enrollment_id: 'membership', rules: [record] };
+    const modal = await h.app.editRule(record);
+    const toggle = () => pickerLabelled(modal, label);
+    const joinWindow = () => pickerLabelled(modal, 'Join window (minutes)');
+    const trapRole = () => labelled(modal, 'Trap role');
+    await typeValue(pickerLabelled(modal, 'Recent-message cleanup (minutes)'), '12');
+    assert.equal(joinWindow().disabled, true);
+    assert.equal(trapRole(), undefined);
+    await fire(toggle(), 'change', { target: { checked: inactive } });
+    assert.equal(toggle().checked, inactive);
+    assert.equal(toggle().disabled, false, 'the saved live policy can be restored');
+
+    await typeValue(joinWindow(), '45');
+    assert.equal(toggle().disabled, true, 'a changed join window requires Manage Server');
+    await typeValue(joinWindow(), '30');
+    assert.equal(toggle().disabled, false);
+    await chooseOption(trapRole(), '@Other trap');
+    assert.equal(toggle().disabled, true, 'a changed trap role requires Manage Server');
+    await chooseOption(trapRole(), '@Anti-bot');
+    assert.equal(toggle().disabled, false);
+
+    await fire(toggle(), 'change', { target: { checked: !inactive } });
+    assert.equal(toggle().checked, !inactive);
+    assert.equal(joinWindow().disabled, true);
+    assert.equal(trapRole(), undefined);
+    assert.equal(pickerLabelled(modal, 'Recent-message cleanup (minutes)').value, '12');
+    await fire(findNode(modal, n => n.localName === 'button' && textOf(n) === 'Save'), 'click');
+    assert.equal(writes.length, 1);
+    assert.deepEqual(writes[0].expected, effective);
+    assert.deepEqual(writes[0].data, { ...effective, params: { ...effective.params, cleanup_window_minutes: 12 } });
+  });
+}
+
 test('custom pattern draft save uses dry_run and custom id', () => {
   const h = harness();
   const draft = h.app.buildCustomRuleSaveBody(

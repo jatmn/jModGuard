@@ -5192,6 +5192,11 @@ function OnboardingTrapEditor({ record }) {
   const managedRemoval = !canManageRemoval && Array.isArray(rule.params?.remove_role_ids)
     && rule.params.remove_role_ids.length > 0;
   const liveRemoval = managedRemoval && rule.enabled && !rule.dry_run;
+  const matchesSavedLiveRemoval = expected.enabled && !expected.dry_run
+    && roleIds[0] === String(expected.params?.role_id ?? "")
+    && /^\d+$/.test(windowMinutes)
+    && Number(windowMinutes) === (expected.params?.join_window_minutes ?? 30);
+  const lockLiveRemoval = managedRemoval && !matchesSavedLiveRemoval;
   return h(
     DialogPanel,
     { className: "modal-box rule-editor", onInput: trackDraft },
@@ -5201,8 +5206,8 @@ function OnboardingTrapEditor({ record }) {
       enabled: rule.enabled && hasRole,
       dryRun: rule.dry_run,
       disabled: !hasRole,
-      enabledDisabled: managedRemoval && !rule.enabled && !rule.dry_run,
-      dryRunDisabled: managedRemoval && rule.enabled && rule.dry_run,
+      enabledDisabled: lockLiveRemoval && !rule.enabled && !rule.dry_run,
+      dryRunDisabled: lockLiveRemoval && rule.enabled && rule.dry_run,
       onEnabled: (on) => { rule.enabled = on; refresh(); },
       onDryRun: (on) => { rule.dry_run = on; refresh(); },
     }),
