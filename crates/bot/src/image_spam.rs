@@ -4059,6 +4059,7 @@ mod tests {
         None,
         PurgeLastHour,
         UnrelatedRuleDuringBan,
+        AddHashDuringSweep,
         DryRunPurge,
         EditRule,
         RemoveRule,
@@ -4066,7 +4067,9 @@ mod tests {
         Invalidate,
         Expire,
         OwnDeleteEcho,
+        OwnBulkDeleteEcho,
         ExternalDeleteDuringRequest,
+        UnknownMessageWithoutEcho,
         OwnEchoAndExternalDelete,
         OwnEchoAndExternalBulkDelete,
         OwnEchoAndRemoveHash,
@@ -4228,6 +4231,7 @@ mod tests {
             change,
             DispatchChange::PurgeLastHour
                 | DispatchChange::UnrelatedRuleDuringBan
+                | DispatchChange::AddHashDuringSweep
                 | DispatchChange::DryRunPurge
         ) {
             rule.actions[1].purge_last_hour = true;
@@ -4261,8 +4265,13 @@ mod tests {
             .unwrap();
         let purge = matches!(
             change,
-            DispatchChange::PurgeLastHour | DispatchChange::UnrelatedRuleDuringBan
+            DispatchChange::PurgeLastHour
+                | DispatchChange::UnrelatedRuleDuringBan
+                | DispatchChange::AddHashDuringSweep
         );
+        let add_hash_during_sweep = matches!(change, DispatchChange::AddHashDuringSweep);
+        // A separate writer does not update the bot's in-process configuration floor.
+        let sweep_writer = add_hash_during_sweep.then(|| crate::db::Db::open(&path, 2).unwrap());
         if !log_post_delay.is_zero() || purge {
             crate::db::upsert_log_channel(&app.db, 1, "automod_delete", 998)
                 .await
@@ -4344,6 +4353,10 @@ mod tests {
             }
             .message(ctx.clone(), message.clone())
             .await;
+            if add_hash_during_sweep {
+                app.recent_messages
+                    .remember(1, 99, 198, 989, message.timestamp.timestamp_millis());
+            }
             message.id = 991.into();
             crate::handlers::Handler {
                 app: Arc::clone(&app),
@@ -4396,9 +4409,20 @@ mod tests {
                                     .push(serde_json::from_str::<serde_json::Value>(body).unwrap());
                             }
                         }
-                        let status = (method == "DELETE"
-                            && matches!(change, DispatchChange::ExternalDeleteDuringRequest))
-                        .then_some(("404 Not Found", ""));
+                        let status = match change {
+                            DispatchChange::ExternalDeleteDuringRequest if method == "DELETE" => {
+                                Some(("404 Not Found", ""))
+                            }
+                            DispatchChange::UnknownMessageWithoutEcho
+                                if method == trigger.0 && path.ends_with(&trigger.1) =>
+                            {
+                                Some((
+                                    "404 Not Found",
+                                    r#"{"code":10008,"message":"Unknown Message"}"#,
+                                ))
+                            }
+                            _ => None,
+                        };
                         use serenity::client::EventHandler;
                         use serenity::model::id::{ChannelId, MessageId};
                         let handler = crate::handlers::Handler {
@@ -4408,6 +4432,7 @@ mod tests {
                             && matches!(
                                 change,
                                 DispatchChange::OwnDeleteEcho
+                                    | DispatchChange::OwnBulkDeleteEcho
                                     | DispatchChange::ExternalDeleteDuringRequest
                                     | DispatchChange::OwnEchoAndExternalDelete
                                     | DispatchChange::OwnEchoAndExternalBulkDelete
@@ -4419,12 +4444,21 @@ mod tests {
                             let parts: Vec<_> = path.split('/').collect();
                             let message = parts.last().unwrap().parse::<u64>().unwrap();
                             let channel = parts[parts.len() - 3].parse::<u64>().unwrap();
-                            runtime.block_on(handler.message_delete(
-                                server_ctx.clone(),
-                                ChannelId::new(channel),
-                                MessageId::new(message),
-                                Some(GuildId::new(1)),
-                            ));
+                            if matches!(change, DispatchChange::OwnBulkDeleteEcho) {
+                                runtime.block_on(handler.message_delete_bulk(
+                                    server_ctx.clone(),
+                                    ChannelId::new(channel),
+                                    vec![MessageId::new(message), MessageId::new(80)],
+                                    Some(GuildId::new(1)),
+                                ));
+                            } else {
+                                runtime.block_on(handler.message_delete(
+                                    server_ctx.clone(),
+                                    ChannelId::new(channel),
+                                    MessageId::new(message),
+                                    Some(GuildId::new(1)),
+                                ));
+                            }
                             assert_eq!(
                                 server_app.image_spam.author_of(1, channel, message),
                                 None,
@@ -4450,6 +4484,8 @@ mod tests {
                             | DispatchChange::PurgeLastHour
                             | DispatchChange::DryRunPurge
                             | DispatchChange::OwnDeleteEcho
+                            | DispatchChange::OwnBulkDeleteEcho
+                            | DispatchChange::UnknownMessageWithoutEcho
                             | DispatchChange::ExternalDeleteDuringRequest => {}
                             DispatchChange::EditRule => {
                                 rule.whitelist_users.push(99);
@@ -4480,6 +4516,21 @@ mod tests {
                                         &unrelated_rule,
                                     ))
                                     .unwrap();
+                            }
+                            DispatchChange::AddHashDuringSweep => {
+                                let saved = runtime
+                                    .block_on(crate::db::apply_control(
+                                        sweep_writer.as_ref().unwrap(),
+                                        None,
+                                        crate::db::ControlOp::AddKnownBadImage {
+                                            scope: scope.clone(),
+                                            hash: "03".repeat(32),
+                                            note: None,
+                                        },
+                                        None,
+                                    ))
+                                    .unwrap();
+                                assert!(matches!(saved, crate::db::ControlReply::Saved { .. }));
                             }
                             DispatchChange::OwnEchoAndWhitelistRole => {
                                 let event = serde_json::from_value(serde_json::json!({
@@ -4631,7 +4682,25 @@ mod tests {
         if matches!(change, DispatchChange::DryRunPurge) {
             assert!(seen.is_empty(), "{seen:?}");
         }
+        if matches!(change, DispatchChange::UnknownMessageWithoutEcho) {
+            let missing = expected_deletes as u64 - 1;
+            assert_eq!(
+                app.image_spam.author_of(1, 100 + missing, 10 + missing),
+                None
+            );
+            if !known_bad {
+                assert_eq!(app.image_spam.author_of(1, 102, 12), Some(99));
+            }
+            assert!(seen.iter().all(|line| !line.contains("/bans/")), "{seen:?}");
+        }
 
+        if add_hash_during_sweep {
+            assert!(
+                seen.iter()
+                    .all(|line| line != "DELETE /api/v10/channels/198/messages/989"),
+                "the next sweep delete must stop after the hash list changes: {seen:?}"
+            );
+        }
         if purge {
             assert!(
                 seen.iter()
@@ -4662,6 +4731,7 @@ mod tests {
             if matches!(
                 change,
                 DispatchChange::OwnDeleteEcho
+                    | DispatchChange::OwnBulkDeleteEcho
                     | DispatchChange::ExternalDeleteDuringRequest
                     | DispatchChange::OwnEchoAndExternalDelete
                     | DispatchChange::OwnEchoAndExternalBulkDelete
@@ -4767,6 +4837,19 @@ mod tests {
             DispatchChange::UnrelatedRuleDuringBan,
             "PUT",
             "/bans/99",
+            3,
+            1,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn image_ban_purge_stops_after_another_writer_edits_hashes() {
+        image_dispatch_race(
+            false,
+            DispatchChange::AddHashDuringSweep,
+            "DELETE",
+            "/messages/990",
             3,
             1,
         )
@@ -4883,10 +4966,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn image_unknown_message_without_echo_invalidates_proof_and_stops() {
+        for (known_bad, route, attempted_deletes) in [
+            (false, "/messages/10", 1),
+            (true, "/messages/10", 1),
+            (false, "/messages/11", 2),
+        ] {
+            image_dispatch_race(
+                known_bad,
+                DispatchChange::UnknownMessageWithoutEcho,
+                "DELETE",
+                route,
+                attempted_deletes,
+                0,
+            )
+            .await;
+        }
+    }
+
+    #[tokio::test]
     async fn repeated_image_own_delete_echoes_preserve_remaining_deletes_and_ban() {
         image_dispatch_race(
             false,
             DispatchChange::OwnDeleteEcho,
+            "DELETE",
+            "/messages/10",
+            3,
+            1,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn repeated_image_own_bulk_delete_echoes_preserve_remaining_deletes_and_ban() {
+        image_dispatch_race(
+            false,
+            DispatchChange::OwnBulkDeleteEcho,
             "DELETE",
             "/messages/10",
             3,

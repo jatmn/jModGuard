@@ -579,16 +579,20 @@ async fn punish_proven_match(
     let mut delete_notes = Vec::new();
     let mut own_deletes = OwnDeletes::default();
     let mut proof_stale = false;
-    let sweep_rule_is_current = || {
-        crate::automod::recheck_live_rule(app, found.guild, rule, rule_def, |cfg| {
-            // The image hash list can change independently of the rule row.
-            match &found.policy {
-                MatchPolicy::Image(policy) | MatchPolicy::ImageMetadata { policy, .. } => {
-                    cfg.known_bad_hashes == policy.known_bad_hashes
-                }
-                MatchPolicy::Text(_) => true,
-            }
-        })
+    // Image hashes are configured separately from the rule; text has no extra inputs.
+    let known_bad_hashes = match &found.policy {
+        MatchPolicy::Image(policy) | MatchPolicy::ImageMetadata { policy, .. } => {
+            Some(&policy.known_bad_hashes)
+        }
+        MatchPolicy::Text(_) => None,
+    };
+    let sweep_rule_is_current = || async {
+        // A save by another process may leave the cached rule looking current.
+        app.poll_config_version().await.is_ok()
+            && crate::automod::recheck_live_rule(app, found.guild, rule, rule_def, |cfg| {
+                known_bad_hashes.is_none_or(|hashes| hashes == &cfg.known_bad_hashes)
+            })
+            .await
     };
     for (channel, message) in &found.messages {
         if proof_stale || !app.activation.may_record() {
@@ -681,9 +685,12 @@ async fn punish_proven_match(
             Ok(crate::discord::DiscordCall::Finished(Err(error))) => {
                 let unknown_message = crate::discord::http_error_response(&error)
                     .is_some_and(|(_, code)| code == 10008);
-                if unknown_message && found.kind == Kind::Text {
+                if unknown_message {
                     // REST confirmed the post is gone even if Gateway never echoes it.
-                    app.text_spam.invalidate(found.guild, *channel, *message);
+                    match found.kind {
+                        Kind::Image => app.image_spam.invalidate(found.guild, *channel, *message),
+                        Kind::Text => app.text_spam.invalidate(found.guild, *channel, *message),
+                    }
                     proof_stale = true;
                 }
                 if let Some(cleanup) = &cleanup {
@@ -1790,6 +1797,7 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn ban_purge_repeated_text_uses_saved_selection_and_keeps_matched_deletes() {
+        use serenity::client::EventHandler;
         use std::sync::atomic::{AtomicBool, Ordering};
         #[derive(Clone, Copy, Debug)]
         enum ConfigEdit {
@@ -1799,6 +1807,7 @@ pub(crate) mod tests {
             PurgeWindow,
             InvalidateEvidence,
             EchoOwnDeletes,
+            BulkEchoOwnDeletes,
             UnconfirmedOwnDelete,
             UnknownMessageWithoutEcho,
             RestoreAuthorAfterEchoes,
@@ -1815,6 +1824,7 @@ pub(crate) mod tests {
             (false, false, None, 0, 0, 3),
             (true, false, None, 3600, 2, 3),
             (true, false, Some((ban, Disable)), 3600, 0, 3),
+            (true, false, Some((ban, Remove)), 3600, 0, 3),
             (true, false, Some((first_sweep, Disable)), 3600, 1, 3),
             (true, false, Some((member, Disable)), 3600, 0, 0),
             (true, false, Some((member, Remove)), 3600, 0, 0),
@@ -1822,6 +1832,7 @@ pub(crate) mod tests {
             (true, false, Some((ban, Unrelated)), 3600, 2, 3),
             (true, false, Some((first_sweep, Unrelated)), 3600, 2, 3),
             (true, false, Some((ban, PurgeWindow)), 3600, 0, 3),
+            (true, false, Some((first_sweep, PurgeWindow)), 3600, 1, 3),
             (false, false, Some((ban_lookup, Disable)), 0, 0, 3),
             (false, false, Some((ban_lookup, Remove)), 0, 0, 3),
             (true, false, Some((first_match_delete, Disable)), 3600, 0, 1),
@@ -1845,6 +1856,14 @@ pub(crate) mod tests {
                 true,
                 false,
                 Some((first_match_delete, EchoOwnDeletes)),
+                3600,
+                2,
+                3,
+            ),
+            (
+                true,
+                false,
+                Some((first_match_delete, BulkEchoOwnDeletes)),
                 3600,
                 2,
                 3,
@@ -1916,6 +1935,10 @@ pub(crate) mod tests {
                 .unwrap();
             app.recent_messages.remember(10, 99, 15, 45, now_ms);
             app.recent_messages.remember(10, 99, 16, 46, now_ms);
+            // A separate opener models a save with no in-process version floor update.
+            let sweep_writer = edit_on
+                .filter(|(route, _)| *route == ban || *route == first_sweep)
+                .map(|_| crate::db::Db::open(&path, 2).unwrap());
             app.poll_config_version().await.unwrap();
             let cfg = app.configs.get(&app.db, 10).await.unwrap();
             let policy =
@@ -1946,8 +1969,9 @@ pub(crate) mod tests {
                 edit_on.is_some_and(|(_, edit)| matches!(edit, UnknownMessageWithoutEcho));
             let restore_author =
                 edit_on.is_some_and(|(_, edit)| matches!(edit, RestoreAuthorAfterEchoes));
+            let bulk_echo = edit_on.is_some_and(|(_, edit)| matches!(edit, BulkEchoOwnDeletes));
             let echo_own_deletes = edit_on.and_then(|(_, edit)| match edit {
-                EchoOwnDeletes | RestoreAuthorAfterEchoes => Some(true),
+                EchoOwnDeletes | BulkEchoOwnDeletes | RestoreAuthorAfterEchoes => Some(true),
                 UnconfirmedOwnDelete => Some(false),
                 _ => None,
             });
@@ -1977,6 +2001,24 @@ pub(crate) mod tests {
             let lines = Arc::new(Mutex::new(Vec::new()));
             let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
             let addr = listener.local_addr().unwrap();
+            let http = Arc::new(
+                serenity::http::HttpBuilder::new("token")
+                    .proxy(format!("http://{addr}"))
+                    .ratelimiter_disabled(true)
+                    .build(),
+            );
+            let ctx = if echo_own_deletes.is_some() {
+                app.activation.note_discord_connected();
+                Some(
+                    crate::commands::mod_reason_dm::fixture_context_for_dm_order_test(
+                        Arc::clone(&http),
+                        Arc::new(serenity::cache::Cache::new()),
+                    )
+                    .await,
+                )
+            } else {
+                None
+            };
             let stop = Arc::new(AtomicBool::new(false));
             let server_lines = Arc::clone(&lines);
             let server_stop = Arc::clone(&stop);
@@ -2012,6 +2054,7 @@ pub(crate) mod tests {
                     }
                     InvalidateEvidence => None,
                     EchoOwnDeletes
+                    | BulkEchoOwnDeletes
                     | UnconfirmedOwnDelete
                     | UnknownMessageWithoutEcho
                     | RestoreAuthorAfterEchoes => return None,
@@ -2033,7 +2076,7 @@ pub(crate) mod tests {
                             if let Some(edit) = edit {
                                 let saved = runtime
                                     .block_on(crate::db::apply_control(
-                                        &writer.db,
+                                        sweep_writer.as_ref().unwrap_or(&writer.db),
                                         Some(&writer.tenant),
                                         edit,
                                         Some(writer.activation.instance()),
@@ -2046,12 +2089,29 @@ pub(crate) mod tests {
                                     .invalidate(10, stale_channel, stale_message);
                             }
                         }
-                        if let Some(succeeds) = echo_own_deletes
+                        if let Some((succeeds, ctx)) = echo_own_deletes.zip(ctx.as_ref())
                             && method == "DELETE"
                             && let Some((_, channel, message)) =
                                 delete_routes.iter().find(|(route, _, _)| route == path)
                         {
-                            writer.text_spam.deleted(10, *channel, *message);
+                            let handler = crate::handlers::Handler {
+                                app: Arc::clone(&writer),
+                            };
+                            if bulk_echo {
+                                runtime.block_on(handler.message_delete_bulk(
+                                    ctx.clone(),
+                                    ChannelId::new(*channel),
+                                    vec![MessageId::new(*message), MessageId::new(80)],
+                                    Some(GuildId::new(10)),
+                                ));
+                            } else {
+                                runtime.block_on(handler.message_delete(
+                                    ctx.clone(),
+                                    ChannelId::new(*channel),
+                                    MessageId::new(*message),
+                                    Some(GuildId::new(10)),
+                                ));
+                            }
                             assert_eq!(writer.text_spam.author_of(10, *channel, *message), None);
                             if !succeeds {
                                 return Some(("404 Not Found", ""));
@@ -2086,12 +2146,6 @@ pub(crate) mod tests {
                     },
                 )
             });
-            let http = Arc::new(
-                serenity::http::HttpBuilder::new("token")
-                    .proxy(format!("http://{addr}"))
-                    .ratelimiter_disabled(true)
-                    .build(),
-            );
             let disposition = enforce(
                 &app,
                 http,
