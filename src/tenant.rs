@@ -967,6 +967,7 @@ impl TenantRuntime {
         Ok(())
     }
 
+    /// Returns true when a job completes. A write fence defers erasure to a later tick.
     pub async fn drive_erasure(&self) -> Result<bool> {
         let job = {
             let mut cursor = self.inner.erasure_cursor.lock().await;
@@ -981,11 +982,15 @@ impl TenantRuntime {
             return Ok(false);
         };
         let guild_id = job.guild_id;
-        {
+        let completed = {
             let lock = self.lock(guild_id);
             let _guard = lock.lock().await;
-            self.erase_job(&job).await?;
-        }
+            match self.erase_job(&job).await {
+                Ok(()) => true,
+                Err(error) if error.is::<GuildWriteFenced>() => false,
+                Err(error) => return Err(error),
+            }
+        };
         let mut locks = self.inner.locks.lock();
         if locks
             .get(&guild_id)
@@ -993,12 +998,12 @@ impl TenantRuntime {
         {
             locks.remove(&guild_id);
         }
-        Ok(true)
+        Ok(completed)
     }
 
     async fn erase_job(&self, job: &GuildErasureJob) -> Result<()> {
         if guild_is_write_fenced(&self.core, job.guild_id).await? {
-            return Ok(());
+            return Err(GuildWriteFenced.into());
         }
         let handle = self.handle(job.placement.store_id()).await?;
         let scope = GuildDataScope::new(job.placement.clone(), job.enrollment.clone())?;
