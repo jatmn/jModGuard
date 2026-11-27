@@ -464,13 +464,19 @@ pub async fn claim_advised_bot_action(db: &Db, now: i64) -> Result<Option<BotAct
         match result {
             // A concurrent commit can invalidate a deferred transaction's
             // promotion. Recheck due work on a fresh primary snapshot.
-            Err(ref error) if crate::db_compat::is_database_busy(error) => write_deadline,
+            Err(ref error) if crate::db_compat::is_database_busy(error) => {
+                #[cfg(test)]
+                if let Some(hook) = db.after_advised_busy.lock().unwrap().take() {
+                    hook();
+                }
+                write_deadline
+            }
             result => return result,
         }
     } else {
         None
     };
-    db.with_conn(move |conn| {
+    db.with_conn_before(write_deadline, move |conn| {
         claim_advised_bot_action_conn(
             conn,
             now,
@@ -488,7 +494,7 @@ fn claim_advised_bot_action_conn(
     now: i64,
     promote: bool,
     write_deadline: Option<tokio::time::Instant>,
-    #[cfg(test)] after_due_read: Option<super::AfterAdvisedDueRead>,
+    #[cfg(test)] after_due_read: Option<super::AdvisedClaimHook>,
 ) -> Result<Option<BotAction>> {
     let mut tx = if promote {
         conn.transaction_capture_before(write_deadline, false)?

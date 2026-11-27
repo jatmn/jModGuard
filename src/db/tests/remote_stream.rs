@@ -603,6 +603,8 @@ impl HranaFixture {
             during_leased_guild_commit: Arc::new(Mutex::new(None)),
             #[cfg(test)]
             after_advised_due_read: Arc::new(Mutex::new(None)),
+            #[cfg(test)]
+            after_advised_busy: Arc::new(Mutex::new(None)),
             #[cfg(debug_assertions)]
             test_config_snapshot: Arc::new(Mutex::new(None)),
         }
@@ -1546,6 +1548,121 @@ async fn assert_advised_action_pending(local: &Db, action: &BotAction) {
     let stored = bot_action(local, 10, &action.id).await.unwrap().unwrap();
     assert_eq!(stored.state, "pending");
     assert_eq!(stored.claim, None);
+}
+
+fn hold_advised_fallback_permits(
+    remote: &Db,
+    clock: &Arc<crate::db_compat::ManualClock>,
+    spent: Duration,
+) -> tokio::sync::oneshot::Receiver<tokio::sync::OwnedSemaphorePermit> {
+    let permits = Arc::clone(&remote.permits);
+    let clock = Arc::clone(clock);
+    let (send, receive) = tokio::sync::oneshot::channel();
+    *remote.after_advised_busy.lock().unwrap() = Some(Box::new(move || {
+        let held = permits.try_acquire_many_owned(2).unwrap();
+        clock.advance(spent);
+        send.send(held).unwrap();
+    }));
+    receive
+}
+
+async fn assert_advised_fallback_checkout_timeout(
+    error: anyhow::Error,
+    local: &Db,
+    fixture: &HranaFixture,
+    remote: &Db,
+    action: &BotAction,
+) {
+    assert!(is_database_operation_timeout(&error), "{error:#}");
+    assert!(
+        error.to_string().contains("waiting for connection"),
+        "{error:#}"
+    );
+    assert_eq!(crate::db_compat::remote_unavailable_operation(&error), None);
+    assert_eq!(remote.connections.outage.failure_count(), 0);
+    assert_eq!(
+        fixture.read_begins(),
+        1,
+        "only the promotion snapshot began"
+    );
+    assert_eq!(fixture.immediate_begins(), 0);
+    fixture.assert_committed_within_lifetime(0);
+    assert_advised_action_pending(local, action).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn advised_claim_expired_busy_fallback_skips_permit_wait() {
+    let path = super::tmp_db_path("remote_action_claim_expired_before_checkout");
+    let (local, fixture, remote, action) = advised_claim_fallback_fixture(&path).await;
+    invalidate_advised_claim_snapshot(&fixture, &path, &action.id);
+    let clock = install_clock(&remote);
+    let write_limit = remote.connections.runtime.operation_limit().unwrap();
+    let held = hold_advised_fallback_permits(&remote, &clock, write_limit);
+
+    let error = tokio::time::timeout(
+        Duration::from_secs(2),
+        claim_advised_bot_action(&remote, 100),
+    )
+    .await
+    .expect("expired fallback waited for a pool permit")
+    .expect_err("expired fallback claimed work");
+    let held = held.await.unwrap();
+    assert_eq!(remote.permits.available_permits(), 0);
+    assert_advised_fallback_checkout_timeout(error, &local, &fixture, &remote, &action).await;
+    drop(held);
+    read_primary_fixture(&remote).await.unwrap();
+
+    drop(remote);
+    drop(fixture);
+    drop(local);
+    super::cleanup_db(&path);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn advised_claim_busy_fallback_permit_wait_uses_remaining_budget() {
+    let path = super::tmp_db_path("remote_action_claim_checkout_deadline");
+    let (local, fixture, remote, action) = advised_claim_fallback_fixture(&path).await;
+    invalidate_advised_claim_snapshot(&fixture, &path, &action.id);
+    let clock = install_clock(&remote);
+    let write_limit = remote.connections.runtime.operation_limit().unwrap();
+    let remaining = Duration::from_secs(1);
+    let held = hold_advised_fallback_permits(&remote, &clock, write_limit - remaining);
+
+    {
+        let claim = claim_advised_bot_action(&remote, 100);
+        tokio::pin!(claim);
+        // The busy hook runs while polling the claim, so it proceeds to poll
+        // checkout before the receiver below observes the held permits.
+        let held = tokio::time::timeout(Duration::from_secs(2), async {
+            tokio::select! {
+                biased;
+                result = &mut claim => panic!("claim returned before checkout queued: {result:?}"),
+                held = held => held.unwrap(),
+            }
+        })
+        .await
+        .expect("promotion did not reach the busy fallback");
+        clock.advance(remaining - Duration::from_millis(1));
+        tokio::select! {
+            biased;
+            result = &mut claim => panic!("checkout returned before the deadline: {result:?}"),
+            () = std::future::ready(()) => {}
+        }
+        clock.advance(Duration::from_millis(1));
+
+        let error = tokio::time::timeout(Duration::from_secs(2), claim)
+            .await
+            .expect("queued fallback outlived the remaining write budget")
+            .expect_err("fallback claimed work at the deadline");
+        assert_advised_fallback_checkout_timeout(error, &local, &fixture, &remote, &action).await;
+        drop(held);
+    }
+    read_primary_fixture(&remote).await.unwrap();
+
+    drop(remote);
+    drop(fixture);
+    drop(local);
+    super::cleanup_db(&path);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

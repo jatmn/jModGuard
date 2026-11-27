@@ -840,13 +840,35 @@ impl DbRuntime {
             .map(|limit| self.snapshot_now() + limit)
     }
 
+    /// Time a local wait against an existing deadline without blaming the primary.
+    pub(crate) async fn wait_locally_before<F: Future>(
+        &self,
+        operation: &'static str,
+        deadline: Instant,
+        max_wait: Option<Duration>,
+        future: F,
+    ) -> Result<F::Output> {
+        let deadline = max_wait.map_or(deadline, |limit| deadline.min(self.snapshot_now() + limit));
+        let (timeout, expired) =
+            self.operation_timer(operation, Some(DatabaseWait::Deadline(deadline)))?;
+        tokio::select! {
+            biased;
+            _ = expired => Err(database_operation_timed_out(operation, timeout)),
+            result = future => Ok(result),
+        }
+    }
+
     fn remaining_read_budget(&self, deadline: Instant) -> Duration {
         let remaining = deadline.saturating_duration_since(self.snapshot_now());
         self.operation_limit()
             .map_or(remaining, |limit| remaining.min(limit))
     }
 
-    fn remaining_until(&self, operation: &'static str, deadline: Instant) -> Result<Duration> {
+    pub(crate) fn remaining_until(
+        &self,
+        operation: &'static str,
+        deadline: Instant,
+    ) -> Result<Duration> {
         let remaining = deadline.saturating_duration_since(self.snapshot_now());
         if remaining.is_zero() {
             return Err(database_operation_timed_out(operation, remaining));

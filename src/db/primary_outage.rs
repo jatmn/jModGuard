@@ -48,6 +48,11 @@ struct Failures {
 }
 
 impl PrimaryOutageGate {
+    #[cfg(test)]
+    pub(super) fn failure_count(&self) -> u64 {
+        self.0.lock().failures.as_ref().map_or(0, |f| f.count)
+    }
+
     pub(super) fn admit(&self) -> Result<Admission<'_>> {
         let mut state = self.0.lock();
         match state.retry_at {
