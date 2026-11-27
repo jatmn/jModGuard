@@ -465,7 +465,7 @@ fn claim_advised_bot_action_conn(
     now: i64,
     promote: bool,
 ) -> Result<Option<BotAction>> {
-    let tx = if promote {
+    let mut tx = if promote {
         conn.transaction_capture()?
     } else {
         conn.transaction_primary_snapshot()?
@@ -477,7 +477,8 @@ fn claim_advised_bot_action_conn(
     }
     let tx = if promote {
         // The positive check and the write share one primary transaction.
-        tx.prepare_capture_write()?
+        tx.prepare_capture_write()?;
+        tx
     } else {
         tx.finish_read()?;
         conn.transaction_immediate()?

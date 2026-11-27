@@ -354,6 +354,11 @@ async fn provider_response(
                     .lock()
                     .unwrap()
                     .push(model.now() - *start);
+                if std::mem::take(&mut state.lock().unwrap().drop_next_commit_response) {
+                    let (sender, response) = Body::channel();
+                    sender.abort();
+                    return body(StatusCode::OK, response);
+                }
             }
         }
         if path == "/v3/cursor" {
@@ -510,7 +515,32 @@ impl HranaFixture {
         self.db_with_operation_timeout(Duration::from_secs(3))
     }
 
-    fn db_with_operation_timeout(&self, timeout: Duration) -> Db {
+    pub(in crate::db) fn delay_client_requests(
+        &self,
+        db: &Db,
+        requests: Vec<(&'static str, Duration)>,
+    ) {
+        self.state.lock().unwrap().client_delays = Some(ClientDelays {
+            clock: install_clock(db),
+            requests,
+        });
+    }
+
+    pub(in crate::db) fn assert_client_delays_used(&self) {
+        let guard = self.state.lock().unwrap();
+        let pending = &guard.client_delays.as_ref().unwrap().requests;
+        assert!(pending.is_empty(), "unused client delays: {pending:?}");
+    }
+
+    pub(in crate::db) fn before_next_receipt(&self, write: impl FnOnce() + Send + 'static) {
+        self.state.lock().unwrap().before_next_receipt = Some(Box::new(write));
+    }
+
+    pub(in crate::db) fn drop_next_commit_response(&self) {
+        self.state.lock().unwrap().drop_next_commit_response = true;
+    }
+
+    pub(in crate::db) fn db_with_operation_timeout(&self, timeout: Duration) -> Db {
         let runtime = DbRuntime::with_operation_timeout(Some(timeout)).unwrap();
         let lease_runtime =
             DbRuntime::with_operation_timeout(Some(crate::db_compat::INTERACTIVE_READ_BUDGET))
@@ -1478,10 +1508,9 @@ async fn slow_advised_due_check_leaves_time_to_prepare_the_claim() {
     )
     .await;
     let remote = fixture.db_with_operation_timeout(Duration::from_secs(10));
-    let clock = install_clock(&remote);
-    fixture.state.lock().unwrap().client_delays = Some(ClientDelays {
-        clock,
-        requests: vec![
+    fixture.delay_client_requests(
+        &remote,
+        vec![
             (
                 "SELECT EXISTS(SELECT 1 FROM BOT_ACTIONS",
                 Duration::from_millis(3700),
@@ -1491,7 +1520,7 @@ async fn slow_advised_due_check_leaves_time_to_prepare_the_claim() {
                 Duration::from_millis(600),
             ),
         ],
-    });
+    );
 
     let claim = claim_advised_bot_action(&remote, 100)
         .await
@@ -1501,22 +1530,46 @@ async fn slow_advised_due_check_leaves_time_to_prepare_the_claim() {
     assert_eq!(fixture.read_begins(), 1);
     assert_eq!(fixture.immediate_begins(), 0);
     fixture.assert_committed_within_lifetime(1);
-    assert!(
-        fixture
-            .state
-            .lock()
-            .unwrap()
-            .client_delays
-            .as_ref()
-            .unwrap()
-            .requests
-            .is_empty()
-    );
+    fixture.assert_client_delays_used();
 
     drop(remote);
     drop(fixture);
     drop(local);
     super::cleanup_db(&path);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn expired_capture_cannot_prepare_growth_or_reclaim_receipts() {
+    let fixture = HranaFixture::start().await;
+    let remote = fixture.db_with_operation_timeout(Duration::from_secs(5));
+    let clock = install_clock(&remote);
+    for reclaim in [false, true] {
+        let clock = Arc::clone(&clock);
+        let deadline = remote.runtime.capture_write_deadline();
+        let error = remote
+            .with_conn(move |conn| {
+                let mut tx = conn.transaction_capture_before(deadline, false)?;
+                let _: i64 = tx.query_row("SELECT 1", (), |row| Ok(row.get(0)?))?;
+                // Preflight returned successfully, then the budget expired
+                // before the first required write.
+                clock.advance(Duration::from_secs(5));
+                if reclaim {
+                    tx.prepare_capture_reclaim()
+                } else {
+                    tx.prepare_capture_write()
+                }
+            })
+            .await
+            .unwrap_err();
+        assert!(is_database_operation_timeout(&error), "{error:#}");
+        assert!(
+            error.to_string().contains("promote capture transaction"),
+            "{error:#}"
+        );
+    }
+    assert_eq!(fixture.read_begins(), 2);
+    assert_eq!(fixture.immediate_begins(), 0);
+    assert_eq!(fixture.rollback_requests(), 2);
 }
 
 fn read_one(conn: &mut Connection) -> Result<i64> {
