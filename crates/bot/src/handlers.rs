@@ -351,6 +351,86 @@ fn gateway_ban_row_to_attribute(write: db::GatewayBanWrite) -> Option<i64> {
     }
 }
 
+// Apply display attribution after the gateway's durable write settles.
+pub(crate) async fn finish_gateway_ban(
+    app: &Arc<BotState>,
+    sink: &impl logging::LogDelivery,
+    guild_id: GuildId,
+    banned_user: &User,
+    observed: chrono::DateTime<chrono::Utc>,
+    observation: Option<logging::MemberAuditObservation>,
+    write: Option<(db::GuildEnrollment, db::GatewayBanWrite)>,
+) {
+    let ban_row = write.and_then(|(enrollment, write)| {
+        gateway_ban_row_to_attribute(write).map(|row_id| (enrollment, row_id))
+    });
+    // Even without a writable row or report, a successful claim can disambiguate
+    // the next ban. Skip eager reads only when the inherited cutoff excludes
+    // every candidate, leaving this observation unresolved for later bans.
+    let audit = if let Some(observation) = observation.as_ref()
+        && !app.member_audits.window_is_fenced(observation)
+        && let Ok(_permit) = app.log_delivery_slots.try_acquire()
+    {
+        logging::lookup_member_audit(app, sink, guild_id, observation).await
+    } else {
+        None
+    };
+    if let (Some((enrollment, row_id)), Some(context)) = (ban_row.as_ref(), audit.as_ref()) {
+        let moderator_id = context
+            .get("actor_id")
+            .and_then(|id| id.parse::<i64>().ok());
+        if let Some(moderator_id) = moderator_id {
+            let _ = db::attribute_enrolled_ban(
+                &app.db,
+                Some(enrollment.clone()),
+                *row_id,
+                banned_user.id.get() as i64,
+                moderator_id,
+                context.get("actor_name").map(String::as_str),
+                context
+                    .get("reason")
+                    .map(String::as_str)
+                    .unwrap_or("No reason provided"),
+            )
+            .await;
+        }
+    }
+    let mut extra = audit.unwrap_or_default();
+    extra.insert("time".into(), observed.to_rfc3339());
+    let (_, late_audit) = logging::emit_member_event_to(
+        app,
+        sink,
+        guild_id,
+        "member_ban",
+        banned_user,
+        extra,
+        observation,
+    )
+    .await;
+    // If the audit entry appeared during the report's bounded retry, keep
+    // the displayed ban row consistent with the report that used it.
+    if let (Some((enrollment, row_id)), Some(context)) = (ban_row, late_audit) {
+        let moderator_id = context
+            .get("actor_id")
+            .and_then(|id| id.parse::<i64>().ok());
+        if let Some(moderator_id) = moderator_id {
+            let _ = db::attribute_enrolled_ban(
+                &app.db,
+                Some(enrollment),
+                row_id,
+                banned_user.id.get() as i64,
+                moderator_id,
+                context.get("actor_name").map(String::as_str),
+                context
+                    .get("reason")
+                    .map(String::as_str)
+                    .unwrap_or("No reason provided"),
+            )
+            .await;
+        }
+    }
+}
+
 pub(crate) async fn persist_gateway_ban_observation(
     app: &BotState,
     enrollment: Option<db::GuildEnrollment>,
@@ -1025,7 +1105,6 @@ impl EventHandler for Handler {
             .cache
             .guild(guild_id)
             .and_then(|guild| guild.joined_at.timestamp_nanos_opt());
-        let observed_at = observed.to_rfc3339();
         // The detached owner receives the actual payload before any SQL await.
         // It retries storage; the durable inbox completes partial work on restart.
         let persistence = crate::gateway_ban_persistence::receive_ban(
@@ -1036,83 +1115,27 @@ impl EventHandler for Handler {
             echo,
             joined,
         );
-        let (enrollment, ban_row_id) = match persistence.await {
-            Ok(Ok((enrollment, write))) => (
-                Some(enrollment),
-                write.and_then(gateway_ban_row_to_attribute),
-            ),
+        let write = match persistence.await {
+            Ok(Ok((enrollment, write))) => write.map(|write| (enrollment, write)),
             Ok(Err(error)) => {
                 tracing::warn!("gateway ban persistence deferred or membership retired: {error:#}");
-                (None, None)
+                None
             }
             Err(error) => {
                 tracing::error!("gateway ban persistence owner failed: {error:#}");
-                (None, None)
+                None
             }
         };
-        // Resolve the audit context even when no dedicated ban log channel is
-        // configured, so the WebUI can retain the known moderator and reason.
-        let audit = if let (Some(observation), Ok(_permit)) =
-            (observation.as_ref(), app.log_delivery_slots.try_acquire())
-        {
-            logging::lookup_member_audit(&app, ctx.http.as_ref(), guild_id, observation).await
-        } else {
-            None
-        };
-        if let (Some(row_id), Some(context)) = (ban_row_id, audit.as_ref()) {
-            let moderator_id = context
-                .get("actor_id")
-                .and_then(|id| id.parse::<i64>().ok());
-            if let Some(moderator_id) = moderator_id {
-                let _ = db::attribute_enrolled_ban(
-                    &app.db,
-                    enrollment.clone(),
-                    row_id,
-                    banned_user.id.get() as i64,
-                    moderator_id,
-                    context.get("actor_name").map(String::as_str),
-                    context
-                        .get("reason")
-                        .map(String::as_str)
-                        .unwrap_or("No reason provided"),
-                )
-                .await;
-            }
-        }
-        let mut extra = audit.unwrap_or_default();
-        extra.insert("time".into(), observed_at);
-        let (_, late_audit) = logging::emit_member_event(
+        finish_gateway_ban(
             &app,
-            &ctx,
+            ctx.http.as_ref(),
             guild_id,
-            "member_ban",
             &banned_user,
-            extra,
+            observed,
             observation,
+            write,
         )
         .await;
-        // If the audit entry appeared during the report's bounded retry, keep
-        // the displayed ban row consistent with the report that used it.
-        if let (Some(row_id), Some(context)) = (ban_row_id, late_audit) {
-            let moderator_id = context
-                .get("actor_id")
-                .and_then(|id| id.parse::<i64>().ok());
-            if let Some(moderator_id) = moderator_id {
-                let _ = db::attribute_enrolled_ban(
-                    &app.db,
-                    enrollment,
-                    row_id,
-                    banned_user.id.get() as i64,
-                    moderator_id,
-                    context.get("actor_name").map(String::as_str),
-                    context
-                        .get("reason")
-                        .map(String::as_str)
-                        .unwrap_or("No reason provided"),
-                )
-                .await;
-            }
-        }
     }
 
     async fn guild_ban_removal(&self, ctx: Context, guild_id: GuildId, unbanned_user: User) {

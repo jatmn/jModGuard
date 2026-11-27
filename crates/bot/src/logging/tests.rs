@@ -2483,6 +2483,215 @@ async fn member_reports_render_audit_context_and_apply_actor_filters() {
 }
 
 #[tokio::test]
+async fn gateway_ban_skips_eager_reads_when_ambiguity_covers_the_whole_window() {
+    for reports in [false, true] {
+        check_gateway_ban_audit_sequence(reports, false, 0).await;
+    }
+}
+
+#[tokio::test]
+async fn gateway_ban_keeps_claims_and_both_retry_windows_for_eligible_entries() {
+    for (reports, owned_by_bot, first_match) in [
+        (false, false, 3),
+        (false, true, 3),
+        (true, false, 3),
+        (true, true, 6),
+    ] {
+        check_gateway_ban_audit_sequence(reports, owned_by_bot, first_match).await;
+    }
+}
+
+async fn check_gateway_ban_audit_sequence(reports: bool, owned_by_bot: bool, first_match: usize) {
+    use crate::handlers::finish_gateway_ban;
+    use serenity::model::id::UserId;
+    use serenity::model::user::User;
+
+    let fully_fenced = first_match == 0;
+    let f = Fixture::with_timeout(4);
+    let guild = GuildId::new(789);
+    let mut user = User::default();
+    user.id = UserId::new(123);
+    user.name = "member".into();
+    let enrollment = db::enroll_guild(&f.app.db, 789, 100)
+        .await
+        .unwrap()
+        .unwrap();
+    if reports {
+        db::upsert_log_channel(&f.app.db, 789, "member_ban", 456)
+            .await
+            .unwrap();
+    }
+    // A warm configuration lets the mock Discord retries use Tokio virtual time.
+    f.app.configs.get(&f.app.db, guild.get()).await.unwrap();
+    let observed_ms = 1_790_086_832_000;
+    let at = |ms| chrono::DateTime::from_timestamp_millis(ms).unwrap();
+    let action = member_audit_action("member_ban").unwrap();
+    let claims = &f.app.member_audits;
+    let record = |ms, bot, already_banned| {
+        let enrollment = enrollment.clone();
+        let db = &f.app.db;
+        async move {
+            db::record_gateway_ban(
+                db,
+                Some(enrollment),
+                123,
+                Some("member"),
+                None,
+                Some(&at(ms).to_rfc3339()),
+                bot,
+                None,
+                already_banned,
+            )
+            .await
+        }
+    };
+    if !owned_by_bot {
+        let original = record(observed_ms, false, false).await.unwrap();
+        assert!(matches!(original, db::GatewayBanWrite::Recorded { .. }));
+    }
+    if fully_fenced {
+        // This unresolved same-millisecond delivery fences the inclusive
+        // upper edge of the next delivery's audit window.
+        claims.observe(guild.get(), action, 123, observed_ms);
+    }
+    let first = claims.observe(guild.get(), action, 123, observed_ms);
+    let first_write = record(observed_ms, owned_by_bot, true).await.unwrap();
+    assert!(matches!(
+        (owned_by_bot, first_write),
+        (true, db::GatewayBanWrite::OwnedByBot { .. })
+            | (false, db::GatewayBanWrite::Existing { .. })
+    ));
+    let old_ms = if fully_fenced {
+        observed_ms + 3_000
+    } else {
+        observed_ms
+    };
+    let old_page = || audit_fixture(action, 123, old_ms, Some("earlier ban"));
+    let first_pages = if fully_fenced {
+        (0..6).map(|_| old_page()).collect()
+    } else {
+        let mut pages = std::collections::VecDeque::new();
+        for _ in 1..first_match {
+            let mut empty = old_page();
+            empty.entries.clear();
+            pages.push_back(empty);
+        }
+        pages.push_back(old_page());
+        pages
+    };
+    let expected_reads = if fully_fenced {
+        3 * usize::from(reports)
+    } else {
+        first_match
+    };
+    let first_sink = RepeatedAuditSink {
+        sink: Sink::default(),
+        responses: Mutex::new(first_pages),
+        reads: Default::default(),
+        fail_first_send: false,
+        sends: Default::default(),
+    };
+    tokio::time::pause();
+    finish_gateway_ban(
+        &f.app,
+        &first_sink,
+        guild,
+        &user,
+        at(observed_ms),
+        Some(first),
+        Some((enrollment.clone(), first_write)),
+    )
+    .await;
+    tokio::time::resume();
+    assert_eq!(
+        first_sink.reads.load(std::sync::atomic::Ordering::Relaxed),
+        expected_reads
+    );
+    let (actor, reason) = if fully_fenced {
+        ("unavailable", "unavailable")
+    } else {
+        ("moderator (<@777>)", "earlier ban")
+    };
+    assert_ban_reports(&first_sink, reports, actor, reason);
+
+    let before = db::list_enrolled_bans(&f.app.db, enrollment.clone(), 10)
+        .await
+        .unwrap();
+    assert_eq!(before.len(), 1);
+    assert_eq!(before[0].moderator_id, None);
+    db::mark_enrolled_unbanned(&f.app.db, Some(enrollment.clone()), 123)
+        .await
+        .unwrap();
+    claims.observe_event(guild.get(), 123, "member_unban", observed_ms);
+    let rebanned_ms = observed_ms + 1;
+    let rebanned = claims.observe(guild.get(), action, 123, rebanned_ms);
+    let reban_write = record(rebanned_ms, false, false).await.unwrap();
+    assert!(matches!(reban_write, db::GatewayBanWrite::Recorded { .. }));
+
+    // The old entry is still in the recent page. Processing it alone must
+    // leave the new ban unresolved, then the correct entry becomes visible.
+    let new_ms = if fully_fenced {
+        old_ms + 1
+    } else {
+        rebanned_ms
+    };
+    let mut new = audit_fixture(action, 123, new_ms, Some("new ban"));
+    new.entries[0].user_id = UserId::new(888);
+    new.entries.extend(old_page().entries);
+    let reban_match = if first_match == 6 { 6 } else { 2 };
+    let reban_pages = (1..reban_match)
+        .map(|_| old_page())
+        .chain(std::iter::once(new))
+        .collect();
+    let reban_sink = RepeatedAuditSink {
+        sink: Sink::default(),
+        responses: Mutex::new(reban_pages),
+        reads: Default::default(),
+        fail_first_send: false,
+        sends: Default::default(),
+    };
+    tokio::time::pause();
+    finish_gateway_ban(
+        &f.app,
+        &reban_sink,
+        guild,
+        &user,
+        at(rebanned_ms),
+        Some(rebanned),
+        Some((enrollment.clone(), reban_write)),
+    )
+    .await;
+    tokio::time::resume();
+    assert_eq!(
+        reban_sink.reads.load(std::sync::atomic::Ordering::Relaxed),
+        reban_match
+    );
+    assert_ban_reports(&reban_sink, reports, "<@888>", "new ban");
+
+    let rows = db::list_enrolled_bans(&f.app.db, enrollment, 10)
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 2);
+    let active = rows.iter().find(|row| row.active).unwrap();
+    assert_eq!(active.moderator_id, Some(888));
+    assert_eq!(active.reason.as_deref(), Some("new ban"));
+    let inactive = rows.iter().find(|row| !row.active).unwrap();
+    assert_eq!(inactive.id, before[0].id);
+    assert_eq!(inactive.moderator_id, before[0].moderator_id);
+    assert_eq!(inactive.reason, before[0].reason);
+}
+
+fn assert_ban_reports(sink: &RepeatedAuditSink, reports: bool, actor: &str, reason: &str) {
+    let messages = sink.sink.messages.lock().unwrap();
+    assert_eq!(messages.len(), usize::from(reports));
+    if let Some((_, message)) = messages.first() {
+        let text = log_text(message);
+        assert!(text.contains(&format!("**Moderator:** {actor}")), "{text}");
+        assert!(text.contains(&format!("**Reason:** {reason}")), "{text}");
+    }
+}
+
+#[tokio::test]
 async fn gateway_ban_reuses_claimed_audit_for_report() {
     let f = Fixture::new();
     db::upsert_log_channel(&f.app.db, 789, "member_ban", 456)
@@ -2838,6 +3047,7 @@ fn unclaimed_audit_vars(
 }
 
 struct RepeatedAuditSink {
+    reads: std::sync::atomic::AtomicUsize,
     sink: Sink,
     responses: Mutex<std::collections::VecDeque<AuditLogs>>,
     fail_first_send: bool,
@@ -2857,6 +3067,8 @@ impl LogDelivery for RepeatedAuditSink {
         self.sink.send(channel, message).await
     }
     async fn member_audit(&self, _: GuildId, _: Action) -> anyhow::Result<AuditLogs> {
+        self.reads
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.responses
             .lock()
             .unwrap()
@@ -2895,6 +3107,7 @@ async fn repeated_actions_never_reuse_audit_after_sent_filtered_or_failed_report
             current.entries[0].user_id = serenity::model::id::UserId::new(888);
             current.entries.push(old.entries[0].clone());
             let sink = RepeatedAuditSink {
+                reads: Default::default(),
                 sink: Sink::default(),
                 responses: Mutex::new([old, old_again, current].into()),
                 fail_first_send: previous == Delivery::Failed,
@@ -3073,6 +3286,7 @@ async fn delayed_audit_after_unknown_or_skipped_report_cannot_explain_repeat_act
             current.entries[0].user_id = serenity::model::id::UserId::new(888);
             current.entries.push(old.entries[0].clone());
             let sink = RepeatedAuditSink {
+                reads: Default::default(),
                 sink: Sink::default(),
                 responses: Mutex::new([old, current].into()),
                 fail_first_send: false,
