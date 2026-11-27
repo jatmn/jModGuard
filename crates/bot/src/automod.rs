@@ -726,6 +726,10 @@ pub(crate) async fn automod_try_delete_message(
     cleanup: Option<&logging::Cleanup<'_>>,
     sweep_dispatch: Option<SweepDeleteDispatch<'_>>,
 ) -> Option<CaseOutcome> {
+    use crate::discord::{
+        DeleteDispatch, DiscordCall, delete_before_dispatch_deadline, race_discord_call,
+    };
+
     let target = automod_delete_target(guild_id, channel);
     if app
         .remembered_discord_targets
@@ -759,24 +763,44 @@ pub(crate) async fn automod_try_delete_message(
             false
         }
     };
-    let raced = if forced_cancel {
-        Ok(crate::discord::DiscordCall::Cancelled)
-    } else {
-        let (deadline, audit_reason) = sweep_dispatch.as_ref().map_or_else(
-            || (AutomodInstant::now() + Duration::from_secs(10), None),
-            |sweep| (sweep.deadline, Some(sweep.audit_reason)),
-        );
-        tokio::time::timeout_at(
-            deadline,
-            crate::discord::race_discord_call(
-                &app.activation,
-                http.delete_message(channel.into(), message.into(), audit_reason),
+    let dispatched = if forced_cancel {
+        DeleteDispatch::Uncertain
+    } else if let Some(sweep) = &sweep_dispatch {
+        match race_discord_call(
+            &app.activation,
+            delete_before_dispatch_deadline(
+                app,
+                http,
+                serenity::http::Route::ChannelMessage {
+                    channel_id: channel.into(),
+                    message_id: message.into(),
+                },
+                sweep.audit_reason,
+                sweep.deadline,
+                || app.activation.may_record(),
             ),
         )
         .await
+        {
+            DiscordCall::Finished(dispatched) => dispatched,
+            DiscordCall::Cancelled => DeleteDispatch::Uncertain,
+        }
+    } else {
+        match tokio::time::timeout(
+            Duration::from_secs(10),
+            race_discord_call(
+                &app.activation,
+                http.delete_message(channel.into(), message.into(), None),
+            ),
+        )
+        .await
+        {
+            Ok(DiscordCall::Finished(result)) => DeleteDispatch::Finished(result),
+            Ok(DiscordCall::Cancelled) | Err(_) => DeleteDispatch::Uncertain,
+        }
     };
-    match raced {
-        Ok(crate::discord::DiscordCall::Finished(Ok(_))) => {
+    match dispatched {
+        DeleteDispatch::Finished(Ok(())) => {
             app.recent_messages.forget(guild_id, channel, message);
             let grouped = match cleanup {
                 Some(cleanup) => {
@@ -810,12 +834,17 @@ pub(crate) async fn automod_try_delete_message(
             }
             Some(CaseOutcome::Succeeded)
         }
-        Ok(crate::discord::DiscordCall::Finished(Err(error))) => {
-            if let Some(cleanup) = cleanup
-                && !crate::discord::http_error_response(&error)
+        DeleteDispatch::Unsent | DeleteDispatch::Finished(Err(_)) => {
+            let error = if let DeleteDispatch::Finished(Err(error)) = &dispatched {
+                Some(error)
+            } else {
+                None
+            };
+            if let (Some(cleanup), Some(error)) = (cleanup, error)
+                && !crate::discord::http_error_response(error)
                     .is_some_and(|(_, code)| code == 10008)
             {
-                cleanup.failed(channel, message, logging::cleanup_delete_failure(&error));
+                cleanup.failed(channel, message, logging::cleanup_delete_failure(error));
             }
             let removal = app.automod_delete_marks.remove_unconfirmed(
                 guild_id,
@@ -851,15 +880,17 @@ pub(crate) async fn automod_try_delete_message(
                 )
                 .await;
             }
-            app.remembered_discord_targets.remember_rest_rejection(
-                recovery,
-                &error,
-                target,
-                Instant::now(),
-            );
-            Some(crate::cases::classify_discord(Some(&error)))
+            error.map(|error| {
+                app.remembered_discord_targets.remember_rest_rejection(
+                    recovery,
+                    error,
+                    target,
+                    Instant::now(),
+                );
+                crate::cases::classify_discord(Some(error))
+            })
         }
-        Ok(crate::discord::DiscordCall::Cancelled) | Err(_) => {
+        DeleteDispatch::Uncertain => {
             if let Some(cleanup) = cleanup {
                 cleanup.failed(channel, message, "delete outcome unknown");
             }
@@ -959,22 +990,35 @@ fn automod_remember_member_failure(
     }
 }
 
-pub(crate) async fn kick_with_recovery(
+pub(crate) fn capture_kick_recovery(
+    app: &BotState,
+    guild_id: GuildId,
+    user_id: serenity::all::UserId,
+) -> impl FnOnce(&serenity::Error) + '_ {
+    let guild = guild_id.get();
+    let user = user_id.get();
+    let recovery = automod_member_target(guild, user, "kick").map(|target| {
+        app.remembered_discord_targets
+            .capture_recovery_epoch(target)
+    });
+    move |error| {
+        if let Some(recovery) = recovery {
+            automod_remember_member_failure(app, recovery, guild, user, "kick", error);
+        }
+    }
+}
+
+async fn kick_with_recovery(
     app: &BotState,
     http: &serenity::http::Http,
     guild_id: GuildId,
     member: &Member,
     reason: &str,
 ) -> Option<serenity::Error> {
-    let guild = guild_id.get();
-    let user = member.user.id.get();
-    let recovery = automod_member_target(guild, user, "kick").map(|target| {
-        app.remembered_discord_targets
-            .capture_recovery_epoch(target)
-    });
+    let remember = capture_kick_recovery(app, guild_id, member.user.id);
     let result = member.kick_with_reason(http, reason).await;
-    if let (Some(recovery), Err(error)) = (recovery, &result) {
-        automod_remember_member_failure(app, recovery, guild, user, "kick", error);
+    if let Err(error) = &result {
+        remember(error);
     }
     result.err()
 }

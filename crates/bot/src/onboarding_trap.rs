@@ -2,9 +2,12 @@
 #[cfg(test)]
 mod tests;
 
-use crate::automod::{action_vars, automod_member_blocked, kick_with_recovery};
+use crate::automod::{action_vars, automod_member_blocked, capture_kick_recovery};
 use crate::commands::{PermLevel, permission_level};
-use crate::discord::{DISCORD_REST_TIMEOUT, DiscordCall, race_discord_call};
+use crate::discord::{
+    DISCORD_REST_TIMEOUT, DeleteDispatch, DiscordCall, before_dispatch_deadline,
+    delete_before_dispatch_deadline, race_discord_call,
+};
 use crate::state::BotState;
 use crate::{cases, db, logging};
 use jmodguard::onboarding_trap::{
@@ -16,6 +19,7 @@ use serenity::all::{
     Cache, GuildId, GuildMemberUpdateEvent, Http, Member, PartialGuild, Permissions, RoleId,
     Timestamp, User, UserId,
 };
+use serenity::http::Route;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::Future;
 use std::sync::Arc;
@@ -28,12 +32,12 @@ const DISPATCH_EVIDENCE_WINDOW: Duration = Duration::from_secs(5);
 
 #[cfg(test)]
 tokio::task_local! {
-    static FIXTURE_NOW: Timestamp;
+    static FIXTURE_NOW: std::cell::Cell<Timestamp>;
 }
 
 fn now() -> Timestamp {
     #[cfg(test)]
-    if let Ok(now) = FIXTURE_NOW.try_with(|now| *now) {
+    if let Ok(now) = FIXTURE_NOW.try_with(std::cell::Cell::get) {
         return now;
     }
     Timestamp::now()
@@ -487,14 +491,14 @@ async fn check_event(app: &Arc<BotState>, http: &Arc<Http>, cache: &Cache, event
             .await;
             match outcome {
                 db::guild_data::CaseOutcome::Succeeded => {
-                    if let Some(case_id) = case_id {
-                        let mut case_vars = vars.clone();
-                        case_vars.insert(
-                            "actor".into(),
-                            format!("Automod · case `{}`", case_id.as_str()),
-                        );
-                        logging::emit_to(app, http, event.guild, "member_kick", case_vars).await;
-                    }
+                    let mut case_vars = vars.clone();
+                    let actor = case_id.map_or_else(
+                        || "Automod".to_owned(),
+                        |case_id| format!("Automod · case `{}`", case_id.as_str()),
+                    );
+                    case_vars.insert("actor".into(), actor);
+                    case_vars.insert("actor_id".into(), cache.current_user().id.to_string());
+                    logging::emit_to(app, http, event.guild, "member_kick", case_vars).await;
                     if let Some(minutes) = cleanup_window {
                         let cleanup = logging::begin_cleanup(
                             app,
@@ -643,7 +647,7 @@ async fn refresh_rule(
 }
 
 struct DispatchGuard<'a> {
-    app: &'a BotState,
+    app: &'a Arc<BotState>,
     http: &'a Http,
     cache: &'a Cache,
     event: &'a RoleEvent<'a>,
@@ -664,17 +668,6 @@ struct DispatchEvidence {
     dry_run: bool,
     bot: Option<Member>,
     expires_at: tokio::time::Instant,
-}
-
-async fn before_evidence_expires<T>(
-    expires_at: tokio::time::Instant,
-    work: impl Future<Output = T>,
-) -> Option<T> {
-    tokio::select! {
-        biased;
-        _ = tokio::time::sleep_until(expires_at) => None,
-        result = work => Some(result),
-    }
 }
 
 impl DispatchGuard<'_> {
@@ -737,13 +730,20 @@ impl DispatchGuard<'_> {
                 removals.unconfirmed += 1;
                 continue;
             }
-            let result = before_evidence_expires(
+            let result = delete_before_dispatch_deadline(
+                self.app,
+                self.http,
+                Route::GuildMemberRole {
+                    guild_id,
+                    user_id,
+                    role_id: id,
+                },
+                reason,
                 evidence.expires_at,
-                self.http
-                    .remove_member_role(guild_id, user_id, id, Some(reason)),
+                || self.still_admitted(&evidence),
             )
             .await;
-            if matches!(result, Some(Ok(()))) {
+            if matches!(result, DeleteDispatch::Finished(Ok(()))) {
                 removals.confirmed += 1;
             } else {
                 removals.unconfirmed += 1;
@@ -756,17 +756,31 @@ impl DispatchGuard<'_> {
             evidence = current;
         }
 
-        let started_at_ms = now().timestamp_millis();
-        let mut attempted = false;
-        let error = match before_evidence_expires(evidence.expires_at, async {
-            attempted = true;
-            kick_with_recovery(self.app, self.http, guild_id, &evidence.member, reason).await
-        })
+        let mut started_at_ms = 0;
+        let remember = capture_kick_recovery(self.app, guild_id, user_id);
+        let error = match delete_before_dispatch_deadline(
+            self.app,
+            self.http,
+            Route::GuildMember { guild_id, user_id },
+            reason,
+            evidence.expires_at,
+            || {
+                started_at_ms = now().timestamp_millis();
+                self.still_admitted(&evidence)
+            },
+        )
         .await
         {
-            Some(error) => error,
-            None if attempted => Some(serenity::Error::Other("onboarding kick deadline elapsed")),
-            None => return Dispatch::KickSkipped(removals),
+            DeleteDispatch::Finished(result) => {
+                if let Err(error) = &result {
+                    remember(error);
+                }
+                result.err()
+            }
+            DeleteDispatch::Uncertain => {
+                Some(serenity::Error::Other("onboarding kick response timeout"))
+            }
+            DeleteDispatch::Unsent => return Dispatch::KickSkipped(removals),
         };
         Dispatch::Kick {
             started_at_ms,
@@ -796,10 +810,10 @@ impl DispatchGuard<'_> {
     ) -> Option<DispatchEvidence> {
         // Read the target after both the optional bot lookup and the guild
         // lookup. The final primary check can still veto a config change made
-        // during REST reads. Bound that handoff and the ensuing REST call.
+        // during REST reads. Bound how long that evidence can authorize a send.
         let expires_at = tokio::time::Instant::now() + DISPATCH_EVIDENCE_WINDOW;
         let guild_id = self.event.guild;
-        before_evidence_expires(expires_at, async {
+        before_dispatch_deadline(expires_at, async {
             let guild = self.http.get_guild(guild_id).await.ok()?;
             if guild.owner_id == self.event.user.id {
                 return None;
@@ -841,6 +855,13 @@ impl DispatchGuard<'_> {
                 self.roles_admit(&evidence.guild, &evidence.rule, roles)
             }))
         .then_some(evidence)
+    }
+
+    fn still_admitted(&self, evidence: &DispatchEvidence) -> bool {
+        self.member_admits(&evidence.guild, &evidence.member, &evidence.rule, false)
+            && self.claim.dispatched_roles_admit(|roles| {
+                self.roles_admit(&evidence.guild, &evidence.rule, roles)
+            })
     }
 
     fn roles_admit(&self, guild: &PartialGuild, rule: &RuleDef, assigned: &[RoleId]) -> bool {
@@ -890,6 +911,8 @@ impl DispatchGuard<'_> {
         guild.owner_id != user_id
             && member.user.id == user_id
             && member.joined_at == Some(joined_at)
+            && join_window_minutes(rule)
+                .is_some_and(|minutes| matches_role(self.event, self.role, minutes, now()))
             && self.roles_admit(guild, rule, self.event.roles)
             && self.roles_admit(guild, rule, &member.roles)
             && !cached_contradicts

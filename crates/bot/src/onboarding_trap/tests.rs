@@ -329,6 +329,13 @@ struct Call {
     audit_reason: String,
 }
 
+async fn advance_rest_clock(duration: Duration) {
+    // Advance only after the loopback server receives a request.
+    tokio::time::pause();
+    tokio::time::advance(duration).await;
+    tokio::time::resume();
+}
+
 #[derive(Default)]
 struct DelayedCleanupLog {
     first_delete: Notify,
@@ -416,6 +423,13 @@ async fn gateway_case(
     let bot_lookup_timeout = event_kind == "role removal bot lookup timeout";
     let bot_lookup_error = event_kind == "role removal bot lookup error";
     let bot_lookup_failed = bot_lookup_timeout || bot_lookup_error;
+    let kick_timeout = event_kind == "cleanup kick timeout";
+    let kick_server_error = event_kind == "cleanup kick server error";
+    let kick_unconfirmed = kick_server_error || kick_timeout;
+    let kick_late = event_kind == "cleanup late kick";
+    let cleanup_late = event_kind == "cleanup late delete";
+    let role_removal_late = event_kind == "role removal late confirmation";
+    let case_fenced = event_kind == "cleanup kick case fenced";
     let mut config = jmodguard::config::BotProcessConfig::default();
     if ungrouped {
         config.log.group_automod_cleanup_deletes = false;
@@ -480,7 +494,7 @@ async fn gateway_case(
                     .remember(GUILD, MEMBER, channel, id, now_ms - 1_000);
             }
         }
-        if delayed_log.is_some() {
+        if delayed_log.is_some() || cleanup_late {
             app.recent_messages
                 .remember(GUILD, MEMBER, 77, 110, now_ms - 1_000);
         }
@@ -501,7 +515,7 @@ async fn gateway_case(
     app.invalidate_configs();
 
     let fenced = event_kind == "retry after fence";
-    if fenced {
+    let fence = || async {
         use crate::db::SqlExecutor as _;
         let destination = scope.placement().store_id().as_str().to_owned();
         app.db
@@ -517,6 +531,9 @@ async fn gateway_case(
             })
             .await
             .unwrap();
+    };
+    if fenced {
+        fence().await;
     }
     let staff_veto = Arc::new(AtomicBool::new(event_kind == "retry after staff veto"));
     let server_staff_veto = staff_veto.clone();
@@ -580,7 +597,10 @@ async fn gateway_case(
     let server_new_role_granted = Arc::clone(&new_role_granted);
     let change_cleanup_on_kick = matches!(
         event_kind,
-        "cleanup disabled during kick" | "cleanup user exemption" | "cleanup role exemption"
+        "cleanup disabled during kick"
+            | "cleanup user exemption"
+            | "cleanup role exemption"
+            | "cleanup kick case fenced"
     );
     let pause = (event_kind.starts_with("during dispatch")
         || change_cleanup_on_kick
@@ -653,6 +673,8 @@ async fn gateway_case(
                             delayed.next_delete.notify_one();
                         }
                     }
+                    let is_kick = call.method == Method::DELETE
+                        && call.path.ends_with(&format!("/members/{MEMBER}"));
                     let (status, body) = match call.method {
                         Method::GET if call.path.ends_with(&bot_path) => {
                             let after_removal = first_role_removal_attempted(&captured);
@@ -684,6 +706,9 @@ async fn gateway_case(
                                 change.changed.load(Ordering::Relaxed)
                             }) => (404, r#"{"code":10007,"message":"Unknown Member"}"#.into()),
                         Method::GET if call.path.contains("/members/") => {
+                            if kick_late {
+                                advance_rest_clock(DISPATCH_EVIDENCE_WINDOW - Duration::from_secs(1)).await;
+                            }
                             let body = if let Some(change) = &rest_change {
                                 if change.changed.load(Ordering::Relaxed) {
                                     change.target_json.clone()
@@ -727,6 +752,9 @@ async fn gateway_case(
                         Method::DELETE if rejections && call.path.ends_with("/channels/77/messages/107") => (
                             404, r#"{"code":10008,"message":"Unknown Message"}"#.into(),
                         ),
+                        Method::DELETE if is_kick && kick_server_error => (
+                            500, r#"{"code":0,"message":"Internal Server Error"}"#.into(),
+                        ),
                         Method::DELETE => (204, String::new()),
                         Method::POST => (200, serde_json::json!({
                             "id": "91", "channel_id": "70",
@@ -738,7 +766,30 @@ async fn gateway_case(
                         _ => (500, String::new()),
                     };
                     let park_log = call.method == Method::POST && call.path.ends_with("/channels/72/messages");
+                    let late_role_removal = role_removal_late && call.method == Method::DELETE
+                        && call.path.ends_with("/roles/25");
+                    let cleanup_delay = if cleanup_late && call.method == Method::DELETE {
+                        if call.path.ends_with("/channels/77/messages/110") {
+                            Duration::from_secs(28)
+                        } else if call.path.ends_with("/channels/77/messages/101") {
+                            Duration::from_secs(3)
+                        } else {
+                            Duration::ZERO
+                        }
+                    } else {
+                        Duration::ZERO
+                    };
                     captured.lock().push(call);
+                    if is_kick && kick_timeout {
+                        advance_rest_clock(DISCORD_REST_TIMEOUT + Duration::from_secs(1)).await;
+                        std::future::pending::<()>().await;
+                    }
+                    if (kick_late && is_kick) || late_role_removal {
+                        advance_rest_clock(DISPATCH_EVIDENCE_WINDOW + Duration::from_secs(1)).await;
+                    }
+                    if !cleanup_delay.is_zero() {
+                        advance_rest_clock(cleanup_delay).await;
+                    }
                     if let Some(delayed) = &delayed_log && park_log {
                         delayed.log_post.notify_one();
                         delayed.release_log.notified().await;
@@ -830,6 +881,13 @@ async fn gateway_case(
                 "during dispatch: role removed" | "during dispatch: regrant" => {
                     latest.roles.clear()
                 }
+                "during dispatch: join window expired" => {
+                    let expires_at_ms =
+                        member.joined_at.unwrap().timestamp_millis() + i64::from(minutes) * 60_000;
+                    FIXTURE_NOW.with(|now| {
+                        now.set(Timestamp::from_millis(expires_at_ms + 1).unwrap());
+                    });
+                }
                 "during dispatch: rejoined" => {
                     latest.joined_at = Some(Timestamp::now());
                     latest.roles.clear();
@@ -896,6 +954,7 @@ async fn gateway_case(
                     .await
                     .unwrap();
                 }
+                "cleanup kick case fenced" => fence().await,
                 _ => unreachable!(),
             }
             if removed_before_claim {
@@ -1051,7 +1110,7 @@ async fn gateway_case(
             )
             .await;
     }
-    if expected_kick || dry || removal_cancelled {
+    if expected_kick || dry || removal_cancelled || kick_unconfirmed {
         // Both events can replay an uncached old state. The server deliberately
         // still reports the same member so we exercise the process replay guard.
         let replay = if new_role_granted.load(Ordering::Relaxed) {
@@ -1112,7 +1171,29 @@ async fn gateway_case(
     } else {
         &effects[..]
     };
-    if expected_kick {
+    if kick_unconfirmed {
+        assert_eq!(effects.len(), 2, "{event_kind}: {effects:?}");
+        assert_eq!(effects[0].0, Method::DELETE);
+        assert!(effects[0].1.ends_with("/members/30"));
+        assert!(effects[1].1.ends_with("/channels/71/messages"));
+        assert!(effects[1].2.contains("kick outcome uncertain"));
+        assert_eq!(cases.len(), 1);
+        let case = store
+            .case(scope, cases[0].clone(), crate::tenant::case_limits())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(case.outcome, CaseOutcome::Uncertain);
+    } else if case_fenced {
+        assert!(cases.is_empty());
+        assert_eq!(effects.len(), 3, "{event_kind}: {effects:?}");
+        assert_eq!(effects[0].0, Method::DELETE);
+        assert!(effects[0].1.ends_with("/members/30"));
+        assert!(effects[1].1.ends_with("/channels/70/messages"));
+        assert!(effects[1].2.contains("Automod"));
+        assert!(effects[2].1.ends_with("/channels/71/messages"));
+        assert!(effects[2].2.contains("tracked messages deleted (0)"));
+    } else if expected_kick {
         let effects = if remove_roles && event_kind != "role removal no permission" {
             assert_eq!(effects[0].0, Method::DELETE);
             assert!(effects[0].1.ends_with("/members/30/roles/25"));
@@ -1126,10 +1207,13 @@ async fn gateway_case(
         } else {
             effects
         };
-        let deletes_recent = matches!(event_kind, "cleanup" | "role removal ordered") || ungrouped;
+        let deletes_recent = matches!(event_kind, "cleanup" | "role removal ordered")
+            || kick_late
+            || cleanup_late
+            || ungrouped;
         let delete_count = if rejections {
             3
-        } else if delayed_log.is_some() {
+        } else if delayed_log.is_some() || cleanup_late {
             2
         } else {
             usize::from(deletes_recent)
@@ -1187,7 +1271,7 @@ async fn gateway_case(
         assert_eq!(case.reason.as_deref(), Some(REASON));
         assert!(effects[1].1.ends_with("/channels/70/messages"));
         assert!(effects[1].2.contains(cases[0].as_str()));
-        if delayed_log.is_some() {
+        if delayed_log.is_some() || cleanup_late {
             assert_eq!(effects[2].0, Method::DELETE);
             assert!(effects[2].1.ends_with("/channels/77/messages/110"));
             assert_eq!(effects[3].0, Method::DELETE);
@@ -1298,6 +1382,206 @@ async fn trap_cleans_only_tracked_messages_in_the_stay_after_a_confirmed_kick() 
         )
         .await;
     }
+}
+
+async fn confirmed_kick_cleanup_case(event_kind: &str, confirmed: bool) {
+    let now = Timestamp::from_millis(FIXTURE_NOW_MS).unwrap();
+    let joined = Timestamp::from_millis(FIXTURE_NOW_MS - 60_000).unwrap();
+    let member = member(MEMBER, &[TRAP_ROLE], joined);
+    FIXTURE_NOW
+        .scope(
+            std::cell::Cell::new(now),
+            gateway_case(
+                member.clone(),
+                member,
+                guild(Permissions::empty()),
+                event_kind,
+                30,
+                false,
+                confirmed,
+            ),
+        )
+        .await;
+}
+
+#[tokio::test]
+async fn late_discord_kick_confirmation_still_records_logs_and_cleans() {
+    confirmed_kick_cleanup_case("cleanup late kick", true).await;
+}
+
+#[tokio::test]
+async fn indeterminate_kick_error_and_response_timeout_stay_uncertain() {
+    for event in ["cleanup kick server error", "cleanup kick timeout"] {
+        confirmed_kick_cleanup_case(event, false).await;
+    }
+}
+
+#[tokio::test]
+async fn late_cleanup_confirmation_still_counts_the_delete() {
+    confirmed_kick_cleanup_case("cleanup late delete", true).await;
+}
+
+#[tokio::test]
+async fn missing_case_id_does_not_suppress_the_confirmed_kick_log() {
+    confirmed_kick_cleanup_case("cleanup kick case fenced", true).await;
+}
+
+#[tokio::test]
+async fn late_role_removal_confirmation_survives_evidence_expiry() {
+    role_removal_kick_case("role removal late confirmation").await;
+}
+
+#[tokio::test]
+async fn join_window_expiring_during_the_target_lookup_prevents_dispatch() {
+    let now = Timestamp::from_millis(FIXTURE_NOW_MS).unwrap();
+    let joined = Timestamp::from_millis(FIXTURE_NOW_MS - 59_000).unwrap();
+    let member = member(MEMBER, &[TRAP_ROLE], joined);
+    FIXTURE_NOW
+        .scope(
+            std::cell::Cell::new(now),
+            gateway_case(
+                member.clone(),
+                member,
+                guild(Permissions::empty()),
+                "during dispatch: join window expired",
+                1,
+                false,
+                false,
+            ),
+        )
+        .await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn rate_limit_waits_gate_dispatch_and_retries_without_hiding_confirmations() {
+    use crate::discord::{http_error_response, with_rate_limit_wait_hook};
+    use std::sync::atomic::AtomicUsize;
+
+    let path = std::env::temp_dir().join(format!(
+        "onboarding_rest_{:032x}.db",
+        rand::random::<u128>()
+    ));
+    let app = BotState::new(
+        jmodguard::config::BotProcessConfig::default(),
+        crate::db::Db::open(&path, 2).unwrap(),
+    )
+    .unwrap();
+    let server = Server::bind(&([127, 0, 0, 1], 0).into());
+    let http = HttpBuilder::new("fixture")
+        .proxy(format!("http://{}", server.local_addr()))
+        .build();
+    let sent = Arc::new(AtomicUsize::new(0));
+    let server_sent = Arc::clone(&sent);
+    let received = Arc::new(Notify::new());
+    let server_received = Arc::clone(&received);
+    let release = Arc::new(Notify::new());
+    let server_release = Arc::clone(&release);
+    let server = tokio::spawn(server.serve(make_service_fn(move |_| {
+        let sent = Arc::clone(&server_sent);
+        let received = Arc::clone(&server_received);
+        let release = Arc::clone(&server_release);
+        async move {
+            Ok::<_, Infallible>(service_fn(move |request| {
+                let sent = Arc::clone(&sent);
+                let received = Arc::clone(&received);
+                let release = Arc::clone(&release);
+                async move {
+                    assert_eq!(request.method(), Method::DELETE);
+                    assert!(request.uri().path().ends_with("/members/30"));
+                    let response = match sent.fetch_add(1, Ordering::SeqCst) {
+                        0 => Response::builder()
+                            .status(429)
+                            .header("retry-after", "60")
+                            .body(Body::from(r#"{"code":0,"message":"Rate limited"}"#)),
+                        1 => Response::builder()
+                            .status(429)
+                            .header("retry-after", "0.01")
+                            .body(Body::from(r#"{"code":0,"message":"Rate limited"}"#)),
+                        2 => {
+                            received.notify_one();
+                            release.notified().await;
+                            Response::builder().status(204).body(Body::empty())
+                        }
+                        _ => panic!("unexpected DELETE retry"),
+                    };
+                    Ok::<_, Infallible>(response.unwrap())
+                }
+            }))
+        }
+    })));
+    let route = Route::GuildMember {
+        guild_id: GUILD.into(),
+        user_id: MEMBER.into(),
+    };
+    let routes = http.ratelimiter.as_ref().unwrap().routes();
+    let bucket = Arc::clone(
+        routes
+            .write()
+            .await
+            .entry(route.ratelimiting_bucket())
+            .or_default(),
+    );
+    let dispatch = |window| {
+        delete_before_dispatch_deadline(
+            &app,
+            &http,
+            route,
+            REASON,
+            tokio::time::Instant::now() + window,
+            || true,
+        )
+    };
+
+    let held = bucket.lock().await;
+    assert!(matches!(
+        dispatch(DISPATCH_EVIDENCE_WINDOW).await,
+        DeleteDispatch::Unsent
+    ));
+    // Loopback I/O needs the real clock so idle auto-advance cannot race the
+    // response. Advance manually only when the client enters the rate wait.
+    tokio::time::resume();
+    drop(held);
+    assert_eq!(sent.load(Ordering::SeqCst), 0);
+
+    let waiting = Arc::new(Notify::new());
+    let rate_wait_started = Arc::clone(&waiting);
+    let (outcome, ()) = tokio::join!(
+        with_rate_limit_wait_hook(
+            Arc::new(move || rate_wait_started.notify_one()),
+            dispatch(DISPATCH_EVIDENCE_WINDOW),
+        ),
+        async {
+            tokio::time::timeout(Duration::from_secs(3), waiting.notified())
+                .await
+                .unwrap();
+            advance_rest_clock(DISPATCH_EVIDENCE_WINDOW + Duration::from_secs(1)).await;
+        },
+    );
+    assert!(matches!(
+        outcome,
+        DeleteDispatch::Finished(Err(error))
+            if http_error_response(&error) == Some((429, 0))
+    ));
+    assert_eq!(sent.load(Ordering::SeqCst), 1);
+
+    let kick = tokio::time::timeout(Duration::from_secs(4), dispatch(DISPATCH_EVIDENCE_WINDOW));
+    let park_bookkeeping = async {
+        tokio::time::timeout(Duration::from_secs(3), received.notified())
+            .await
+            .unwrap();
+        let held = bucket.lock().await;
+        release.notify_one();
+        held
+    };
+    let (result, held) = tokio::join!(kick, park_bookkeeping);
+    assert!(matches!(result.unwrap(), DeleteDispatch::Finished(Ok(()))));
+    assert_eq!(sent.load(Ordering::SeqCst), 3);
+    drop(held);
+    server.abort();
+    let _ = server.await;
+    drop(app);
+    crate::tenant::remove_sidecars(&path);
+    std::fs::remove_file(path).unwrap();
 }
 
 #[tokio::test]
@@ -1568,7 +1852,7 @@ async fn selected_role_removals_run_before_the_kick_and_cleanup() {
     );
     FIXTURE_NOW
         .scope(
-            Timestamp::from_millis(FIXTURE_NOW_MS).unwrap(),
+            std::cell::Cell::new(Timestamp::from_millis(FIXTURE_NOW_MS).unwrap()),
             gateway_case(
                 member.clone(),
                 member,
@@ -1594,7 +1878,7 @@ async fn losing_the_bots_kick_role_after_a_removal_stops_the_sequence() {
         .permissions = Permissions::MANAGE_ROLES;
     FIXTURE_NOW
         .scope(
-            now,
+            std::cell::Cell::new(now),
             gateway_case(
                 member.clone(),
                 member,
@@ -1608,12 +1892,12 @@ async fn losing_the_bots_kick_role_after_a_removal_stops_the_sequence() {
         .await;
 }
 
-async fn bot_member_lookup_failure_case(event_kind: &str) {
+async fn role_removal_kick_case(event_kind: &str) {
     let now = Timestamp::from_millis(FIXTURE_NOW_MS).unwrap();
     let member = member(MEMBER, &[TRAP_ROLE, 24, 25], now);
     FIXTURE_NOW
         .scope(
-            now,
+            std::cell::Cell::new(now),
             gateway_case(
                 member.clone(),
                 member,
@@ -1629,12 +1913,12 @@ async fn bot_member_lookup_failure_case(event_kind: &str) {
 
 #[tokio::test]
 async fn bot_member_lookup_timeout_skips_further_removal_and_kicks() {
-    bot_member_lookup_failure_case("role removal bot lookup timeout").await;
+    role_removal_kick_case("role removal bot lookup timeout").await;
 }
 
 #[tokio::test]
 async fn bot_member_lookup_error_skips_further_removal_and_kicks() {
-    bot_member_lookup_failure_case("role removal bot lookup error").await;
+    role_removal_kick_case("role removal bot lookup error").await;
 }
 
 #[tokio::test]
@@ -1740,7 +2024,7 @@ async fn stalled_mandatory_evidence_prevents_mutation() {
 async fn an_expired_dispatch_cannot_resume_a_parked_mutation() {
     let attempted = AtomicBool::new(false);
     let expires_at = tokio::time::Instant::now() + DISPATCH_EVIDENCE_WINDOW;
-    let result = before_evidence_expires(expires_at, async {
+    let result = before_dispatch_deadline(expires_at, async {
         tokio::time::sleep_until(expires_at).await;
         attempted.store(true, Ordering::Relaxed);
     })
@@ -1802,7 +2086,7 @@ async fn dry_run_role_removal_logs_without_mutation_and_ignores_replays() {
         };
         FIXTURE_NOW
             .scope(
-                now,
+                std::cell::Cell::new(now),
                 gateway_case(member.clone(), member, guild, scenario, 30, true, false),
             )
             .await;
