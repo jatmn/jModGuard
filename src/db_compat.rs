@@ -672,6 +672,12 @@ impl DbRuntime {
         operation: &'static str,
         wait: Option<DatabaseWait>,
     ) -> Result<(Duration, impl Future<Output = ()> + use<>)> {
+        #[cfg(test)]
+        let clock = self.manual_clock.lock().expect("manual clock lock").clone();
+        #[cfg(test)]
+        if let Some(clock) = &clock {
+            clock.enter_operation(operation);
+        }
         let (timeout, deadline) = match wait {
             Some(DatabaseWait::Timeout(timeout)) => (timeout, Some(self.snapshot_now() + timeout)),
             Some(DatabaseWait::Deadline(deadline)) => {
@@ -679,8 +685,6 @@ impl DbRuntime {
             }
             None => (Duration::ZERO, None),
         };
-        #[cfg(test)]
-        let clock = self.manual_clock.lock().expect("manual clock lock").clone();
         Ok((timeout, async move {
             if let Some(deadline) = deadline {
                 #[cfg(test)]
@@ -931,6 +935,7 @@ pub(crate) struct ManualClock {
     origin: tokio::time::Instant,
     now_ms: AtomicU64,
     notify: tokio::sync::Notify,
+    advance_at_operation: Mutex<Option<(&'static str, Duration)>>,
 }
 
 #[cfg(test)]
@@ -940,6 +945,7 @@ impl ManualClock {
             origin: tokio::time::Instant::now(),
             now_ms: AtomicU64::new(0),
             notify: tokio::sync::Notify::new(),
+            advance_at_operation: Mutex::new(None),
         })
     }
 
@@ -947,6 +953,20 @@ impl ManualClock {
         let millis = u64::try_from(by.as_millis()).unwrap_or(u64::MAX);
         self.now_ms.fetch_add(millis, Ordering::SeqCst);
         self.notify.notify_waiters();
+    }
+
+    pub(crate) fn advance_at_operation(&self, operation: &'static str, by: Duration) {
+        *self.advance_at_operation.lock().unwrap() = Some((operation, by));
+    }
+
+    fn enter_operation(&self, operation: &'static str) {
+        let mut scheduled = self.advance_at_operation.lock().unwrap();
+        if let Some((name, by)) = *scheduled
+            && name == operation
+        {
+            *scheduled = None;
+            self.advance(by);
+        }
     }
 
     // Capture the deadline before polling the operation: its HTTP request can
@@ -2941,11 +2961,16 @@ impl Transaction {
                 );
             }
         }
+        let mut commit_started = false;
+        let inner = self.inner();
         let result = self.runtime.block_on_transaction_statement(
             "commit transaction",
             None,
             self.write_deadline,
-            self.inner().execute_batch("COMMIT"),
+            async {
+                commit_started = true;
+                inner.execute_batch("COMMIT").await
+            },
         );
         #[cfg(debug_assertions)]
         let result = if result.is_ok() && TEST_DROP_COMMIT_RESPONSE.swap(false, Ordering::SeqCst) {
@@ -2968,15 +2993,18 @@ impl Transaction {
                 Ok(())
             }
             Err(commit_error) if self.runtime.is_remote() => {
+                self.note_remote_stream_loss(&commit_error);
+                if !commit_started {
+                    // The deadline expired before the first poll of COMMIT.
+                    // Drop releases the live transaction on the short rollback budget.
+                    return Err(commit_error);
+                }
                 // Cleanup only: a successful ROLLBACK response cannot prove a
                 // preceding COMMIT was not accepted when its response was
-                // lost. Callers must reconcile every remote commit error as
-                // an indeterminate outcome. An interactive timeout already
-                // closed the stream; ROLLBACK on it waits out the client
-                // deadline and is not cleanup. Our own deadline is different:
-                // the baton may still be live, and the writer lock stays until
-                // the provider steals it unless we roll back promptly.
-                self.note_remote_stream_loss(&commit_error);
+                // lost. Once COMMIT might have been sent, reconcile against
+                // the primary. A provider timeout already closed the stream.
+                // A client deadline can leave the baton live, so roll back
+                // promptly to release the writer lock.
                 if self.stream.provider_closed() {
                     self.connection_health.taint();
                 } else if self.remote_write_needs_prompt_release() {

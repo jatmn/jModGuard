@@ -1674,7 +1674,53 @@ async fn remote_capture_reconciles_lost_commit_without_replay() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn remote_capture_keeps_the_original_write_deadline_through_commit_and_retry() {
+async fn remote_capture_expired_before_commit_rolls_back_without_reconciliation() {
+    let (f, _, local, scope) = ready().await;
+    let (fixture, remote) = remote_capture_fixture(&f, &local).await;
+    let clock = fixture.delay_client_requests(
+        &remote.db,
+        vec![("SELECT 1 FROM MUTATION_RECEIPTS", Duration::from_secs(6))],
+    );
+    // Expire at timer setup, after the final capacity check has returned.
+    clock.advance_at_operation("commit transaction", Duration::from_secs(5));
+
+    let error = remote
+        .observe_snapshot(scope.clone(), observation(41, Some("late"), None, 1))
+        .await
+        .unwrap_err();
+    assert!(
+        !crate::db_compat::is_database_commit_indeterminate(&error),
+        "{error:#}"
+    );
+    assert!(
+        crate::db_compat::is_database_operation_timeout(&error),
+        "{error:#}"
+    );
+    assert!(error.to_string().contains("commit transaction"));
+    let statements = fixture.take_statements();
+    assert!(statements.iter().all(|sql| !sql.starts_with("COMMIT")));
+    assert_eq!(
+        statements
+            .iter()
+            .filter(|sql| sql.starts_with("ROLLBACK"))
+            .count(),
+        1
+    );
+    assert_eq!(fixture.read_begins(), 1);
+    assert_eq!(fixture.immediate_begins(), 0);
+    assert_eq!(capture_receipt_count(&local).await, 0);
+    assert!(
+        local
+            .retained_snapshot(scope, 20, 41)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    fixture.assert_committed_within_lifetime(0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn remote_capture_keeps_the_pooled_write_deadline_through_commit_and_retry() {
     for retry in [false, true] {
         let (f, _, local, scope) = ready().await;
         // Give the fixture a longer provider lifetime so only the original
@@ -1686,11 +1732,23 @@ async fn remote_capture_keeps_the_original_write_deadline_through_commit_and_ret
             Default::default(),
         )
         .await;
-        let remote = GuildDataStore {
-            db: fixture.db_with_operation_timeout(Duration::from_secs(5)),
-            expected: local.expected.clone(),
-            core: None,
-        };
+        let mut opts = f.options();
+        opts.url = fixture.url();
+        opts.token = "test".into();
+        let expected = local.expected.clone();
+        let remote = tokio::task::spawn_blocking(move || GuildDataStore::open(opts, expected))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            remote.db.runtime.operation_limit(),
+            Some(Duration::from_secs(75))
+        );
+        assert_eq!(
+            remote.db.connections.runtime.operation_limit(),
+            Some(Duration::from_secs(5))
+        );
+        let startup_reads = fixture.read_begins();
         let delayed_request = if retry {
             let writer_path = f.store_path.clone();
             fixture.before_next_receipt(move || {
@@ -1728,7 +1786,7 @@ async fn remote_capture_keeps_the_original_write_deadline_through_commit_and_ret
             "{error:#}"
         );
         fixture.assert_client_delays_used();
-        assert_eq!(fixture.read_begins(), 1);
+        assert_eq!(fixture.read_begins(), startup_reads + 1);
         assert_eq!(fixture.immediate_begins(), usize::from(retry));
         assert_eq!(capture_receipt_count(&local).await, 0);
         assert!(

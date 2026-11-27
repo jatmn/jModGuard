@@ -509,7 +509,7 @@ impl GuildDataStore {
         T: Send + 'static,
         F: Fn(Transaction) -> Result<T> + Send + Sync + 'static,
     {
-        let deadline = self.db.runtime.capture_write_deadline();
+        let deadline = self.db.connections.runtime.capture_write_deadline();
         let operation = std::sync::Arc::new(operation);
         let first = operation.clone();
         match self
