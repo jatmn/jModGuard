@@ -34,17 +34,26 @@ wait
 HARNESS
 chmod +x "$fixture/timeout" "$fixture/harness"
 
-# The watchdog returns 124 if the review command overruns the scaled budget.
-status=0
+# Check the review command inside the watchdog because either timeout can return 124.
+# shellcheck disable=SC2016  # Expand the positional parameters inside the watchdog.
 PATH="$fixture:$PATH" "$REVIEW_TEST_TIMEOUT" --foreground --kill-after=1s 4s \
-  bash "$script_dir/review-launcher-tests.sh" run "$fixture/harness" "$fixture/review.log" \
-  > "$fixture/console.log" 2>&1 || status=$?
+  bash -c '
+    status=0
+    bash "$@" || status=$?
+    case "$status" in
+      124|137) exit 0 ;;
+    esac
+    printf "Expected a launcher timeout (124 or 137), got %s\n" "$status" >&2
+    exit 1
+  ' bash "$script_dir/review-launcher-tests.sh" run "$fixture/harness" "$fixture/review.log" \
+  > "$fixture/console.log" 2>&1 || {
+    watchdog_status=$?
+    cat "$fixture/console.log" >&2
+    printf 'Launcher deadline check failed under the watchdog (exit %s)\n' "$watchdog_status" >&2
+    exit 1
+  }
 
 diagnostic='test lingering_child panicked: fixture still holds stdout'
 grep -Fxq -- "$diagnostic" "$fixture/review.log"
 grep -Fxq -- "$diagnostic" "$fixture/console.log"
-if [[ "$status" -ne 137 ]]; then
-  printf 'Expected the launcher deadline to kill the command (137), got %s\n' "$status" >&2
-  exit 1
-fi
 echo 'Launcher review deadline and diagnostic regression passed'
