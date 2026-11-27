@@ -301,7 +301,6 @@ pub(crate) async fn enforce(
     if app.poll_config_version().await.is_err() {
         return ReportDisposition::Retryable;
     }
-    let write_generation = app.db.config_write_generation();
     let Ok(cfg) = app.configs.get(&app.db, found.guild).await else {
         return ReportDisposition::Retryable;
     };
@@ -371,33 +370,29 @@ pub(crate) async fn enforce(
         .await;
         return ReportDisposition::Consumed;
     }
-    let dispatch = crate::automod::ConfigDispatch::new(found.guild, &cfg, write_generation);
-    punish_proven_match(
-        app, http, cache, found, rule, name, rule_def, enrollment, dispatch,
-    )
-    .await
+    punish_proven_match(app, http, cache, found, rule, name, rule_def, enrollment).await
 }
 
 // Member lookup, earlier deletes, and ban preparation can all outlive the
-// admitted configuration or image window. Revalidate at each dispatch boundary.
-async fn image_match_still_current(
+// admitted configuration or image window.
+async fn proven_match_is_current(
     app: &BotState,
     found: &Match,
+    rule: &str,
+    rule_def: &jmodguard::types::RuleDef,
     own_deletes: &[crate::image_spam::OwnDelete],
 ) -> bool {
-    if found.kind != Kind::Image {
-        return true;
-    }
-    if app.poll_config_version().await.is_err() {
+    if found.kind == Kind::Image && app.poll_config_version().await.is_err() {
         return false;
     }
-    let Ok(cfg) = app.configs.get(&app.db, found.guild).await else {
-        return false;
-    };
-    (cfg.version, cfg.durable_version) == found.token
-        && found
-            .policy
-            .still_proving_with_deletes(app, found, Instant::now(), own_deletes)
+    crate::automod::recheck_live_rule(app, found.guild, rule, rule_def, |cfg| {
+        found.kind != Kind::Image
+            || ((cfg.version, cfg.durable_version) == found.token
+                && found
+                    .policy
+                    .still_proving_with_deletes(app, found, Instant::now(), own_deletes))
+    })
+    .await
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -410,7 +405,6 @@ async fn punish_proven_match(
     name: &str,
     rule_def: &jmodguard::types::RuleDef,
     enrollment: crate::db::GuildEnrollment,
-    dispatch: crate::automod::ConfigDispatch,
 ) -> ReportDisposition {
     let member = tokio::time::timeout(
         Duration::from_secs(10),
@@ -560,17 +554,22 @@ async fn punish_proven_match(
     let mut delete_notes = Vec::new();
     let mut own_deletes = Vec::new();
     let mut proof_stale = false;
-    let rule_is_current = || async {
-        dispatch.is_current(app)
-            || (found.kind == Kind::Text
-                && crate::automod::recheck_live_rule(app, found.guild, rule, rule_def, |_| true)
-                    .await)
+    let sweep_rule_is_current = || {
+        crate::automod::recheck_live_rule(app, found.guild, rule, rule_def, |cfg| {
+            // The image hash list can change independently of the rule row.
+            match &found.policy {
+                MatchPolicy::Image(policy) | MatchPolicy::ImageMetadata { policy, .. } => {
+                    cfg.known_bad_hashes == policy.known_bad_hashes
+                }
+                MatchPolicy::Text(_) => true,
+            }
+        })
     };
     for (channel, message) in &found.messages {
         if !app.activation.may_record() {
             break;
         }
-        if !image_match_still_current(app, &found, &own_deletes).await || !rule_is_current().await {
+        if !proven_match_is_current(app, &found, rule, rule_def, &own_deletes).await {
             proof_stale = true;
             break;
         }
@@ -887,8 +886,7 @@ async fn punish_proven_match(
                             Err(_) => None,
                         };
                         let purge_seconds = ban_action.ban_delete_message_seconds();
-                        if !image_match_still_current(app, &found, &own_deletes).await
-                            || (purge_seconds > 0 && !rule_is_current().await)
+                        if !proven_match_is_current(app, &found, rule, rule_def, &own_deletes).await
                         {
                             app.spam_gate
                                 .finish_ban(found.guild, found.author, now, false);
@@ -937,7 +935,7 @@ async fn punish_proven_match(
                                         purge_seconds,
                                         sweep_at_ms,
                                         cleanup.as_ref(),
-                                        rule_is_current,
+                                        sweep_rule_is_current,
                                     )
                                     .await;
                                 }
@@ -951,7 +949,7 @@ async fn punish_proven_match(
     }
     drop(cleanup);
     let action = if proof_stale {
-        "remaining actions skipped; image proof or configuration is no longer current".into()
+        "remaining actions skipped; match proof or rule is no longer current".into()
     } else if withhold_ban {
         format!(
             "delete matched messages; {}",
@@ -1776,12 +1774,14 @@ pub(crate) mod tests {
         #[derive(Clone, Copy, Debug)]
         enum ConfigEdit {
             Disable,
+            Remove,
             Unrelated,
             PurgeWindow,
         }
-        use ConfigEdit::{Disable, PurgeWindow, Unrelated};
+        use ConfigEdit::{Disable, PurgeWindow, Remove, Unrelated};
 
         let ban = ("PUT", "/api/v10/guilds/10/bans/99");
+        let ban_lookup = ("GET", "/api/v10/guilds/10/bans/99");
         let member = ("GET", "/api/v10/guilds/10/members/99");
         let first_sweep = ("DELETE", "/api/v10/channels/16/messages/46");
         let second_sweep = ("DELETE", "/api/v10/channels/15/messages/45");
@@ -1791,10 +1791,13 @@ pub(crate) mod tests {
             (true, false, Some((ban, Disable)), 3600, 0, 3),
             (true, false, Some((first_sweep, Disable)), 3600, 1, 3),
             (true, false, Some((member, Disable)), 3600, 0, 0),
+            (true, false, Some((member, Remove)), 3600, 0, 0),
             (true, false, Some((member, Unrelated)), 3600, 2, 3),
             (true, false, Some((ban, Unrelated)), 3600, 2, 3),
             (true, false, Some((first_sweep, Unrelated)), 3600, 2, 3),
             (true, false, Some((ban, PurgeWindow)), 3600, 0, 3),
+            (false, false, Some((ban_lookup, Disable)), 0, 0, 3),
+            (false, false, Some((ban_lookup, Remove)), 0, 0, 3),
             (true, false, None, 3600, 0, 1),
             (true, true, None, 3600, 0, 0),
         ] {
@@ -1884,23 +1887,36 @@ pub(crate) mod tests {
             let server_stop = Arc::clone(&stop);
             let writer = Arc::clone(&app);
             let runtime = tokio::runtime::Handle::current();
-            let edit_route = edit_on.map(|((method, path), edit)| {
-                let rule_id = match edit {
+            let mut edit_route = edit_on.map(|((method, path), edit)| {
+                let upsert = |id: &str, rule| crate::db::ControlOp::UpsertRule {
+                    request: scope.clone(),
+                    target: scope.clone(),
+                    id: id.into(),
+                    rule,
+                    clear_guild_override: false,
+                    replace_velocity_limit: false,
+                };
+                let op = match edit {
                     Disable => {
                         rule.enabled = false;
-                        "repeat_text"
+                        upsert("repeat_text", rule)
                     }
+                    Remove => crate::db::ControlOp::DeleteRule {
+                        request: scope.clone(),
+                        target: scope.clone(),
+                        id: "repeat_text".into(),
+                    },
                     Unrelated => {
                         rule = cfg.rules["velocity"].clone();
                         rule.log_automod = !rule.log_automod;
-                        "velocity"
+                        upsert("velocity", rule)
                     }
                     PurgeWindow => {
                         rule.actions[1].purge_last_hour = false;
-                        "repeat_text"
+                        upsert("repeat_text", rule)
                     }
                 };
-                (method, path.to_owned(), rule_id, rule)
+                (method, path.to_owned(), op)
             });
             let server = std::thread::spawn(move || {
                 serve_discord_stub(
@@ -1908,22 +1924,16 @@ pub(crate) mod tests {
                     server_lines,
                     server_stop,
                     move |method, path, _| {
-                        if let Some((m, p, rule_id, rule)) = &edit_route
+                        if let Some((m, p, _)) = &edit_route
                             && *m == method
                             && p == path
                         {
+                            let (_, _, edit) = edit_route.take().unwrap();
                             let saved = runtime
                                 .block_on(crate::db::apply_control(
                                     &writer.db,
                                     Some(&writer.tenant),
-                                    crate::db::ControlOp::UpsertRule {
-                                        request: scope.clone(),
-                                        target: scope.clone(),
-                                        id: (*rule_id).into(),
-                                        rule: rule.clone(),
-                                        clear_guild_override: false,
-                                        replace_velocity_limit: false,
-                                    },
+                                    edit,
                                     Some(writer.activation.instance()),
                                 ))
                                 .unwrap();
@@ -1952,11 +1962,12 @@ pub(crate) mod tests {
             server.join().unwrap();
             assert_eq!(disposition, ReportDisposition::Consumed);
             let seen = lines.lock().clone();
+            let edited_during_ban_lookup = edit_on.is_some_and(|(route, _)| route == ban_lookup);
             assert_eq!(
                 crate::db::active_ban_recorded(&app.db, 10, 99)
                     .await
                     .unwrap(),
-                matched == 3,
+                matched == 3 && !edited_during_ban_lookup,
                 "{seen:?}"
             );
             if dry {
@@ -1978,6 +1989,23 @@ pub(crate) mod tests {
                         format!("DELETE {first_match}"),
                     ],
                     "a dispatched DELETE can finish, but remaining actions must stop: {seen:?}"
+                );
+            } else if edited_during_ban_lookup {
+                assert!(
+                    seen.iter()
+                        .any(|line| line == "GET /api/v10/guilds/10/bans/99"),
+                    "{seen:?}"
+                );
+                assert_eq!(
+                    seen.iter()
+                        .filter(|line| line.starts_with("DELETE "))
+                        .count(),
+                    matched,
+                    "{seen:?}"
+                );
+                assert!(
+                    seen.iter().all(|line| !line.starts_with("PUT ")),
+                    "the changed rule must stop a ban even with zero purge: {seen:?}"
                 );
             } else {
                 let bans: Vec<_> = seen

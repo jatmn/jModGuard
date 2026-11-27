@@ -14,7 +14,7 @@ use serenity::client::Context;
 use serenity::model::guild::Member;
 use serenity::model::id::{ChannelId, GuildId, MessageId, UserId};
 use serenity::model::prelude::Timestamp;
-use std::cell::LazyCell;
+use std::cell::{LazyCell, OnceCell};
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -217,6 +217,42 @@ pub struct MsgCtx<'a> {
     pub received: Option<AutomodInstant>,
 }
 
+struct MessageText<'a> {
+    raw: &'a str,
+    normalized: OnceCell<String>,
+    compact: OnceCell<String>,
+}
+
+impl<'a> MessageText<'a> {
+    fn new(raw: &'a str) -> Self {
+        Self {
+            raw,
+            normalized: OnceCell::new(),
+            compact: OnceCell::new(),
+        }
+    }
+
+    fn normalized(&self) -> &str {
+        self.normalized
+            .get_or_init(|| normalize::normalize_lenient(self.raw))
+    }
+
+    fn compact(&self) -> &str {
+        self.compact
+            .get_or_init(|| normalize::compact_normalized(self.normalized()))
+    }
+
+    fn matches_pattern(&self, pattern: &Regex) -> bool {
+        pattern.is_match(self.raw)
+            || pattern.is_match(self.normalized())
+            || pattern.is_match(self.compact())
+    }
+
+    fn matches_badword(&self, patterns: &[Regex]) -> bool {
+        patterns.iter().any(|pattern| self.matches_pattern(pattern))
+    }
+}
+
 /// A rule fired and an action decided (highest severity across rules wins).
 pub struct PendingAction {
     pub rule_id: String,
@@ -224,6 +260,8 @@ pub struct PendingAction {
     pub action: ActionDef,
     pub strikes: u32,
     pub evidence: serde_json::Value,
+    /// Original badword input for live rechecks. The case excerpt can be truncated.
+    pub(crate) badword_content: Option<String>,
     /// The winning action is an everyone-attempt whose channel permission
     /// could not be resolved. Kick and ban delete the message and stop.
     pub mention_permission_unknown: bool,
@@ -252,6 +290,7 @@ impl PendingAction {
             action: primary.clone(),
             strikes: 1,
             evidence,
+            badword_content: None,
             mention_permission_unknown,
             matched_rule: Some(rule.clone()),
             dry_run: rule.dry_run,
@@ -361,15 +400,10 @@ impl AutomodEngine {
         // Only velocity counts by arrival; other windows and strikes keep the
         // evaluation clock, which never runs backwards for one author.
         let arrived = ctx.received.unwrap_or(now);
-        let normalized = LazyCell::new(|| normalize::normalize_lenient(ctx.content));
+        let text = MessageText::new(ctx.content);
         let literal = LazyCell::new(|| ctx.content.to_lowercase());
-        let message_words = LazyCell::new(|| (word_tokens(&literal), word_tokens(&normalized)));
-        let compact = LazyCell::new(|| normalize::compact_normalized(&normalized));
-        let matches_pattern = |pattern: &Regex| {
-            pattern.is_match(ctx.content)
-                || pattern.is_match(&normalized)
-                || pattern.is_match(&compact)
-        };
+        let message_words =
+            LazyCell::new(|| (word_tokens(&literal), word_tokens(text.normalized())));
         let has_url = URL_RE.is_match(ctx.content);
         let has_invite = INVITE_RE.is_match(ctx.content);
 
@@ -404,11 +438,11 @@ impl AutomodEngine {
                         .unwrap_or(false)
                         && (has_url || has_invite)
                 }
-                "badword" => cfg.regexes.iter().any(matches_pattern),
+                "badword" => text.matches_badword(&cfg.regexes),
                 "known_spam" => cfg.known_spam.matches_lazy_forms(
                     ctx.content,
-                    || normalized.as_str(),
-                    || compact.as_str(),
+                    || text.normalized(),
+                    || text.compact(),
                 ),
                 "invite" => has_invite && !self.invite_allowed(rule, ctx.content),
                 // Velocity observes each eligible message under the strike bucket lock.
@@ -433,6 +467,7 @@ impl AutomodEngine {
                     mention_permission_unknown: false,
                     evidence: serde_json::json!({ "content": ctx.content,
                         "channel_id": ctx.channel_id, "message_id": ctx.message_id }),
+                    badword_content: None,
                     matched_rule: Some(rule.clone()),
                     dry_run: rule.dry_run,
                 };
@@ -496,6 +531,7 @@ impl AutomodEngine {
                     "attachments": ctx.attachment_count,
                     "mentions": ctx.everyone_mentions + ctx.here_mentions + ctx.role_mentions,
                 }),
+                badword_content: (rule_id == "badword").then(|| ctx.content.to_owned()),
                 matched_rule: Some(rule.clone()),
                 dry_run: rule.dry_run,
             };
@@ -532,7 +568,7 @@ impl AutomodEngine {
                 "pattern" => cfg
                     .custom_patterns
                     .get(rule_id)
-                    .is_some_and(matches_pattern),
+                    .is_some_and(|pattern| text.matches_pattern(pattern)),
                 "word" => cfg.custom_words.get(rule_id).is_some_and(|dictionary| {
                     let (literal, normalized) = LazyCell::force(&message_words);
                     dictionary.matches(literal, normalized)
@@ -1428,10 +1464,17 @@ async fn recheck_message_rule(
         return false;
     }
     recheck_live_rule(app, guild, &pending.rule_id, checked_rule, |cfg| {
-        pending.rule_id != "known_spam"
-            || cfg
+        // These lists can change independently of the matched rule row.
+        match pending.rule_id.as_str() {
+            "badword" => pending
+                .badword_content
+                .as_deref()
+                .is_some_and(|raw| MessageText::new(raw).matches_badword(&cfg.regexes)),
+            "known_spam" => cfg
                 .known_spam
-                .matches(pending.evidence["content"].as_str().unwrap_or(""))
+                .matches(pending.evidence["content"].as_str().unwrap_or("")),
+            _ => true,
+        }
     })
     .await
 }
@@ -1471,8 +1514,8 @@ pub(crate) async fn recheck_live_rule(
     let Ok(cfg) = app.configs.get(&app.db, guild).await else {
         return false;
     };
-    // Earlier exemption checks used this rule. An unrelated save can advance
-    // the configuration version without changing the admission decision.
+    // Revalidate the admitted rule, then fence the snapshot that supplied it.
+    // An unrelated save can advance the version while leaving the decision valid.
     cfg.rules
         .get(rule_id)
         .is_some_and(|current| current.enabled && !current.dry_run && current == checked_rule)
@@ -1657,12 +1700,17 @@ async fn execute_live<'a>(
         return None;
     }
 
-    let dispatch_is_current = || preset_dispatch.is_none_or(|dispatch| dispatch.is_current(app));
-    if !dispatch_is_current() {
+    let is_ban = rule.action == "ban";
+    let preset_dispatch = preset_dispatch.filter(|_| !is_ban);
+    if preset_dispatch.is_some_and(|dispatch| !dispatch.is_current(app)) {
         return None;
     }
-    let message_rule_is_current =
-        || recheck_message_rule(app, guild_id.get(), pending, settings, preset_dispatch);
+    let message_rule_is_current = || async {
+        // A ban and its sweep can revalidate the original rule after a version
+        // change. The trigger and scope must still match the admitted rule.
+        (!is_ban || pending.matched_rule.as_ref() == Some(settings))
+            && recheck_message_rule(app, guild_id.get(), pending, settings, preset_dispatch).await
+    };
 
     if let Some(warning) = warning
         && matches!(rule.action.as_str(), "kick" | "ban")
@@ -2043,7 +2091,7 @@ async fn execute_live<'a>(
                         .is_some();
                 }
                 crate::member_directory::BanContinuation::BanThenRecord => {
-                    if !app.activation.may_record() || !dispatch_is_current() {
+                    if !app.activation.may_record() {
                         publish_report = false;
                     } else {
                         let pending_ban = crate::member_directory::begin_ban_attempt(
@@ -2053,9 +2101,6 @@ async fn execute_live<'a>(
                         )
                         .await;
                         if !app.activation.may_record() {
-                            publish_report = false;
-                        } else if !dispatch_is_current() {
-                            pending_ban.finish(app, CaseOutcome::Failed).await;
                             publish_report = false;
                         } else {
                             let attempted = if open_case {
@@ -2124,8 +2169,7 @@ async fn execute_live<'a>(
                             } else {
                                 None
                             };
-                            let raced = if (purge_seconds > 0 && !message_rule_is_current().await)
-                                || !dispatch_is_current()
+                            let raced = if !message_rule_is_current().await
                                 || automod_member_blocked(
                                     app,
                                     guild_id.get(),
@@ -2257,7 +2301,6 @@ async fn execute_live<'a>(
                                         .is_some();
                                         if let Some(enrollment) = &enrollment
                                             && purge_seconds > 0
-                                            && dispatch_is_current()
                                         {
                                             let deleted = crate::recent_messages::sweep_after_ban(
                                                 app,
@@ -4821,8 +4864,18 @@ mod tests {
         use serenity::model::user::User;
         use std::sync::{Arc, atomic::AtomicBool};
 
-        for id in ["mention_spam", "custom:0123456789abcdef"] {
-            for (stored_purge, days, dry, seconds, disable_on) in [
+        #[derive(Clone, Copy)]
+        enum ConfigEdit {
+            Disable,
+            Unrelated,
+        }
+        use ConfigEdit::{Disable, Unrelated};
+
+        let ban_lookup = ("GET", "/api/v10/guilds/10/bans/99");
+        let ban = ("PUT", "/api/v10/guilds/10/bans/99");
+        let first_sweep = ("DELETE", "/api/v10/channels/71/messages/41");
+        for id in ["mention_spam", "custom:0123456789abcdee", MEDIA_RULE_ID] {
+            for (stored_purge, days, dry, seconds, edit_on) in [
                 (None, 0, false, 0, None),
                 (Some(false), 0, false, 0, None),
                 (Some(true), 0, false, 3600, None),
@@ -4830,20 +4883,11 @@ mod tests {
                 (None, 7, false, 604800, None),
                 (Some(true), 1, false, 3600, None),
                 (Some(true), 0, true, 3600, None),
-                (
-                    Some(true),
-                    0,
-                    false,
-                    3600,
-                    Some(("GET", "/api/v10/guilds/10/bans/99")),
-                ),
-                (
-                    Some(true),
-                    0,
-                    false,
-                    3600,
-                    Some(("DELETE", "/api/v10/channels/71/messages/41")),
-                ),
+                (Some(false), 0, false, 0, Some((ban_lookup, Disable))),
+                (Some(true), 0, false, 3600, Some((ban_lookup, Disable))),
+                (Some(true), 0, false, 3600, Some((ban, Disable))),
+                (Some(true), 0, false, 3600, Some((ban, Unrelated))),
+                (Some(true), 0, false, 3600, Some((first_sweep, Disable))),
             ] {
                 let path = std::env::temp_dir()
                     .join(format!("ban_purge_{:032x}.db", rand::random::<u128>()));
@@ -4872,6 +4916,12 @@ mod tests {
                         rule.actions[0].delete_days, 1,
                         "shipped default remains one day"
                     );
+                    rule
+                } else if id == MEDIA_RULE_ID {
+                    let mut rule = media_rule();
+                    rule.skip_moderators = false;
+                    rule.whitelist_roles.clear();
+                    rule.actions[0].action = "ban".into();
                     rule
                 } else {
                     dry_run_word_ban()
@@ -4905,6 +4955,7 @@ mod tests {
                 let cfg = app.configs.get(&app.db, 10).await.unwrap();
                 let mut message = word_message(&[]);
                 message.everyone_mentions = if id == "mention_spam" { 6 } else { 0 };
+                message.attachment_count = usize::from(id == MEDIA_RULE_ID);
                 let pending = AutomodEngine::new()
                     .evaluate(&cfg, &message)
                     .expect("real rule match");
@@ -4915,7 +4966,7 @@ mod tests {
                 app.recent_messages
                     .remember(10, 99, 71, 41, now_ms - 1_800_000);
                 let (release, release_rx) = tokio::sync::oneshot::channel();
-                let requests = disable_on.map(|(method, path)| {
+                let requests = edit_on.map(|((method, path), _)| {
                     std::sync::Arc::new(ReplyRequests {
                         gate: Some(DiscordRequestGate {
                             method,
@@ -4926,7 +4977,7 @@ mod tests {
                         ..Default::default()
                     })
                 });
-                if matches!(disable_on, Some(("DELETE", _))) {
+                if edit_on.is_some_and(|(route, _)| route == first_sweep) {
                     app.recent_messages
                         .remember(10, 99, 72, 40, now_ms - 2_000_000);
                 }
@@ -4943,8 +4994,9 @@ mod tests {
                     Some(70),
                     &pending,
                 );
-                let disable = async {
-                    if let Some(requests) = &requests {
+                let edit = async {
+                    if let Some((_, edit)) = edit_on {
+                        let requests = requests.as_ref().unwrap();
                         let gate = requests.gate.as_ref().unwrap();
                         tokio::time::timeout(
                             std::time::Duration::from_secs(5),
@@ -4952,15 +5004,28 @@ mod tests {
                         )
                         .await
                         .unwrap();
-                        rule.enabled = false;
-                        let saved = crate::db::upsert_rule(&app.db, 10, id, &rule).await;
+                        let write_generation = app.db.config_write_generation();
+                        let saved = match edit {
+                            Disable => {
+                                rule.enabled = false;
+                                crate::db::upsert_rule(&app.db, 10, id, &rule).await
+                            }
+                            Unrelated => {
+                                let mut unrelated = cfg.rules["velocity"].clone();
+                                unrelated.log_automod = !unrelated.log_automod;
+                                crate::db::upsert_rule(&app.db, 10, "velocity", &unrelated).await
+                            }
+                        };
                         release.send(()).unwrap();
                         saved.unwrap();
+                        assert_ne!(app.db.config_write_generation(), write_generation);
                     }
                 };
-                tokio::join!(execute, disable);
+                tokio::join!(execute, edit);
                 let seen = stub.finish();
-                let disabled_before_ban = matches!(disable_on, Some(("GET", _)));
+                let disabled_before_ban = edit_on.is_some_and(|(route, _)| route == ban_lookup);
+                let disabled_during_ban =
+                    edit_on.is_some_and(|(route, edit)| route == ban && matches!(edit, Disable));
                 let bans: Vec<_> = seen
                     .iter()
                     .filter(|line| line.starts_with("PUT ") && line.contains("/bans/99"))
@@ -4983,7 +5048,7 @@ mod tests {
                 assert_eq!(
                     seen.iter()
                         .any(|line| line == "DELETE /api/v10/channels/71/messages/41"),
-                    !dry && seconds > 0 && !disabled_before_ban,
+                    !dry && seconds > 0 && !disabled_before_ban && !disabled_during_ban,
                     "{seen:?}"
                 );
                 assert!(
@@ -5002,6 +5067,150 @@ mod tests {
                 let _ = std::fs::remove_file(&path);
                 crate::tenant::remove_sidecars(&path);
             }
+        }
+    }
+
+    async fn badword_ban_purge_after_save(
+        method: &'static str,
+        remove_pattern: bool,
+    ) -> Vec<String> {
+        use serenity::model::id::{GuildId, UserId};
+        use serenity::model::user::User;
+        use std::sync::{Arc, atomic::AtomicBool};
+
+        let path = std::env::temp_dir().join(format!(
+            "badword_ban_purge_{:032x}.db",
+            rand::random::<u128>()
+        ));
+        let app =
+            BotState::new(Default::default(), crate::db::Db::open(&path, 2).unwrap()).unwrap();
+        let now_ms = jmodguard::control::now_ms();
+        assert!(
+            crate::db::claim_active_bot(
+                &app.db,
+                app.activation.instance(),
+                now_ms,
+                Arc::new(AtomicBool::new(false)),
+            )
+            .await
+            .unwrap()
+        );
+        app.activation.mark_lock_held(true);
+        let enrollment = crate::db::enroll_guild(&app.db, 10, 100)
+            .await
+            .unwrap()
+            .unwrap();
+        app.tenant.activate(enrollment).await.unwrap();
+
+        let mut rule = dry_run_word_ban();
+        rule.params = serde_json::json!({});
+        rule.dry_run = false;
+        rule.actions[0].purge_last_hour = true;
+        crate::db::upsert_rule(&app.db, 10, "badword", &rule)
+            .await
+            .unwrap();
+        let pattern_id = crate::db::add_badword(&app.db, 10, "scam$", None)
+            .await
+            .unwrap();
+        crate::db::add_badword(&app.db, 10, "unmatched-pattern", None)
+            .await
+            .unwrap();
+        let cfg = app.configs.get(&app.db, 10).await.unwrap();
+        // Only the compact form matches, beyond the case excerpt's limit.
+        let content = format!("{} s c 4 m", "z".repeat(2000));
+        let mut message = word_message(&[]);
+        message.content = &content;
+        let pending = app.automod.evaluate(&cfg, &message).expect("badword match");
+        assert_eq!(pending.rule_id, "badword");
+        assert!(
+            !pending.evidence["content"]
+                .as_str()
+                .unwrap()
+                .contains("s c 4 m")
+        );
+        app.recent_messages
+            .remember(10, 99, 71, 41, now_ms - 1_800_000);
+
+        let (release, release_rx) = tokio::sync::oneshot::channel();
+        let requests = Arc::new(ReplyRequests {
+            gate: Some(DiscordRequestGate {
+                method,
+                path: "/api/v10/guilds/10/bans/99",
+                entered: tokio::sync::Notify::new(),
+                release: std::sync::Mutex::new(Some(release_rx)),
+            }),
+            ..Default::default()
+        });
+        let stub = DiscordStub::bind(Some(Arc::clone(&requests)));
+        let mut user = User::default();
+        user.id = UserId::new(99);
+        user.name = "member".into();
+        let execute = execute_pending_with(
+            &app,
+            &stub.http,
+            &stub.cache,
+            GuildId::new(10),
+            &user,
+            None,
+            "member",
+            Some(42),
+            Some(70),
+            &pending,
+        );
+        let save = async {
+            let gate = requests.gate.as_ref().unwrap();
+            tokio::time::timeout(std::time::Duration::from_secs(5), gate.entered.notified())
+                .await
+                .unwrap();
+            let generation = app.db.config_write_generation();
+            if remove_pattern {
+                crate::db::delete_badword(&app.db, pattern_id, 10)
+                    .await
+                    .unwrap();
+            } else {
+                let mut unrelated = cfg.rules["velocity"].clone();
+                unrelated.log_automod = !unrelated.log_automod;
+                crate::db::upsert_rule(&app.db, 10, "velocity", &unrelated)
+                    .await
+                    .unwrap();
+            }
+            assert_ne!(app.db.config_write_generation(), generation);
+            release.send(()).unwrap();
+        };
+        tokio::join!(execute, save);
+        let seen = stub.finish();
+        drop(app);
+        let _ = std::fs::remove_file(&path);
+        crate::tenant::remove_sidecars(&path);
+        seen
+    }
+
+    #[tokio::test]
+    async fn badword_ban_purge_stops_after_pattern_removed_during_ban_lookup() {
+        let seen = badword_ban_purge_after_save("GET", true).await;
+        assert_eq!(seen, ["GET /api/v10/guilds/10/bans/99"]);
+    }
+
+    #[tokio::test]
+    async fn badword_ban_purge_stops_after_pattern_removed_during_ban() {
+        let seen = badword_ban_purge_after_save("PUT", true).await;
+        assert_eq!(
+            seen.len(),
+            2,
+            "expected only lookup and in-flight ban: {seen:?}"
+        );
+        assert_eq!(seen[0], "GET /api/v10/guilds/10/bans/99");
+        crate::spam_actions::tests::assert_ban_request(&seen[1], 10, 99, 3600);
+    }
+
+    #[tokio::test]
+    async fn badword_ban_purge_continues_after_unrelated_save() {
+        for method in ["GET", "PUT"] {
+            let seen = badword_ban_purge_after_save(method, false).await;
+            assert_eq!(seen.len(), 3, "{method}: {seen:?}");
+            assert_eq!(seen[0], "GET /api/v10/guilds/10/bans/99");
+            crate::spam_actions::tests::assert_ban_request(&seen[1], 10, 99, 3600);
+            assert_eq!(seen[2], "DELETE /api/v10/channels/71/messages/41");
         }
     }
 
@@ -7301,6 +7510,7 @@ mod tests {
                     "channel_id": 70,
                     "message_id": 42,
                 }),
+                badword_content: Some("spamword".into()),
                 mention_permission_unknown: false,
                 matched_rule: Some(matched),
                 dry_run: false,

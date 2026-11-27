@@ -4058,7 +4058,10 @@ mod tests {
     enum DispatchChange {
         None,
         PurgeLastHour,
+        UnrelatedRuleDuringBan,
         DryRunPurge,
+        EditRule,
+        RemoveRule,
         RemoveHash,
         Invalidate,
         Expire,
@@ -4223,7 +4226,9 @@ mod tests {
         .unwrap();
         if matches!(
             change,
-            DispatchChange::PurgeLastHour | DispatchChange::DryRunPurge
+            DispatchChange::PurgeLastHour
+                | DispatchChange::UnrelatedRuleDuringBan
+                | DispatchChange::DryRunPurge
         ) {
             rule.actions[1].purge_last_hour = true;
         }
@@ -4254,7 +4259,10 @@ mod tests {
         crate::db::upsert_log_channel(&app.db, 1, "automod", 999)
             .await
             .unwrap();
-        let purge = matches!(change, DispatchChange::PurgeLastHour);
+        let purge = matches!(
+            change,
+            DispatchChange::PurgeLastHour | DispatchChange::UnrelatedRuleDuringBan
+        );
         if !log_post_delay.is_zero() || purge {
             crate::db::upsert_log_channel(&app.db, 1, "automod_delete", 998)
                 .await
@@ -4270,6 +4278,8 @@ mod tests {
         app.poll_config_version().await.unwrap();
         let cfg = app.configs.get(&app.db, 1).await.unwrap();
         let policy = policy_for_config(&cfg, cfg.rules.get("attachment_flood").unwrap()).unwrap();
+        let mut unrelated_rule = cfg.rules["velocity"].clone();
+        unrelated_rule.log_automod = !unrelated_rule.log_automod;
         assert_eq!(
             policy.enforce,
             !matches!(change, DispatchChange::DryRunPurge)
@@ -4441,6 +4451,36 @@ mod tests {
                             | DispatchChange::DryRunPurge
                             | DispatchChange::OwnDeleteEcho
                             | DispatchChange::ExternalDeleteDuringRequest => {}
+                            DispatchChange::EditRule => {
+                                rule.whitelist_users.push(99);
+                                runtime
+                                    .block_on(crate::db::upsert_rule(
+                                        &server_app.db,
+                                        1,
+                                        "attachment_flood",
+                                        &rule,
+                                    ))
+                                    .unwrap();
+                            }
+                            DispatchChange::RemoveRule => {
+                                runtime
+                                    .block_on(crate::db::delete_rule(
+                                        &server_app.db,
+                                        1,
+                                        "attachment_flood",
+                                    ))
+                                    .unwrap();
+                            }
+                            DispatchChange::UnrelatedRuleDuringBan => {
+                                runtime
+                                    .block_on(crate::db::upsert_rule(
+                                        &server_app.db,
+                                        1,
+                                        "velocity",
+                                        &unrelated_rule,
+                                    ))
+                                    .unwrap();
+                            }
                             DispatchChange::OwnEchoAndWhitelistRole => {
                                 let event = serde_json::from_value(serde_json::json!({
                                     "guild_id": "1",
@@ -4575,11 +4615,7 @@ mod tests {
             "live enforcement reaches the request boundary; dry-run never dispatches"
         );
         let seen = lines.lock().clone();
-        let seconds = if matches!(change, DispatchChange::PurgeLastHour) {
-            3600
-        } else {
-            0
-        };
+        let seconds = if purge { 3600 } else { 0 };
         for ban in seen
             .iter()
             .filter(|line| line.starts_with("PUT ") && line.contains("/bans/"))
@@ -4712,6 +4748,27 @@ mod tests {
             "/members/99",
             0,
             0,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn image_rule_changes_after_proof_stop_pending_punishment() {
+        for change in [DispatchChange::EditRule, DispatchChange::RemoveRule] {
+            image_dispatch_race(false, change, "GET", "/members/99", 0, 0).await;
+            image_dispatch_race(false, change, "GET", "/bans/99", 3, 0).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn image_ban_purge_rechecks_unchanged_rule_after_unrelated_save() {
+        image_dispatch_race(
+            false,
+            DispatchChange::UnrelatedRuleDuringBan,
+            "PUT",
+            "/bans/99",
+            3,
+            1,
         )
         .await;
     }
