@@ -1545,6 +1545,45 @@ async fn slow_advised_due_check_leaves_time_to_prepare_the_claim() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn capture_promotes_after_the_read_deadline_within_the_write_budget() {
+    let path = super::tmp_db_path("remote_capture_promotion");
+    let local = Db::open(&path, 2).unwrap();
+    let (fixture, _) = HranaFixture::sqlite_backed_database(&path).await;
+    let remote = fixture.db_with_operation_timeout(Duration::from_secs(5));
+    let clock = install_clock(&remote);
+    let deadline = remote.connections.runtime.capture_write_deadline();
+
+    remote
+        .with_conn(move |conn| {
+            let mut tx = conn.transaction_capture_before(deadline, false)?;
+            let _: i64 = tx.query_row("SELECT 1", (), |row| Ok(row.get(0)?))?;
+            // The final read succeeded before the interactive deadline.
+            clock.advance(crate::db_compat::INTERACTIVE_READ_BUDGET + Duration::from_millis(500));
+            tx.prepare_capture_write()?;
+            tx.commit()
+        })
+        .await
+        .expect("promotion must use the remaining write budget");
+
+    let receipts: i64 = local
+        .with_conn(|conn| {
+            conn.query_row("SELECT COUNT(*) FROM mutation_receipts", (), |row| {
+                Ok(row.get(0)?)
+            })
+        })
+        .await
+        .unwrap();
+    assert_eq!(receipts, 1);
+    assert_eq!(fixture.read_begins(), 1);
+    assert_eq!(fixture.immediate_begins(), 0);
+
+    drop(remote);
+    drop(fixture);
+    drop(local);
+    super::cleanup_db(&path);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn expired_capture_cannot_prepare_growth_or_reclaim_receipts() {
     let fixture = HranaFixture::start().await;
     let remote = fixture.db_with_operation_timeout(Duration::from_secs(5));

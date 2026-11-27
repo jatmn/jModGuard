@@ -2697,11 +2697,8 @@ impl Transaction {
             "read snapshot cannot take the write lock"
         );
         if let Some(write) = self.write_deadline {
-            self.runtime.remaining_until(
-                "promote capture transaction",
-                self.active_read_deadline()
-                    .map_or(write, |read| read.min(write)),
-            )?;
+            self.runtime
+                .remaining_until("promote capture transaction", write)?;
         }
         self.read_deadline = None;
         Ok(())
