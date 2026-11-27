@@ -21,6 +21,8 @@ use tokio::time::Instant;
 
 pub use libsql::{Row, Value, params, params_from_iter};
 
+pub(crate) const BEGIN_PRIMARY_SNAPSHOT: &str = "begin primary snapshot";
+
 static RECEIPT_PRUNE_COUNTER: AtomicU64 = AtomicU64::new(0);
 // 64 possible 64-KiB pages cover row, both receipt B-trees and split paths.
 // This is independently admitted before creating/refreshing our own receipt.
@@ -145,6 +147,14 @@ pub(crate) fn is_database_operation_timeout(error: &anyhow::Error) -> bool {
         cause.downcast_ref::<DatabaseOperationTimedOut>().is_some()
             || cause.downcast_ref::<DatabaseCallerAbandoned>().is_some()
     })
+}
+
+pub(crate) fn local_database_timeout_operation(error: &anyhow::Error) -> Option<&'static str> {
+    error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<DatabaseOperationTimedOut>())
+        .filter(|timeout| timeout.remote_failure.is_none())
+        .map(|timeout| timeout.operation)
 }
 
 pub(crate) fn database_caller_abandoned(operation: &'static str) -> anyhow::Error {
@@ -840,13 +850,35 @@ impl DbRuntime {
             .map(|limit| self.snapshot_now() + limit)
     }
 
+    /// Time a local wait against an existing deadline without blaming the primary.
+    pub(crate) async fn wait_locally_before<F: Future>(
+        &self,
+        operation: &'static str,
+        deadline: Instant,
+        max_wait: Option<Duration>,
+        future: F,
+    ) -> Result<F::Output> {
+        let deadline = max_wait.map_or(deadline, |limit| deadline.min(self.snapshot_now() + limit));
+        let (timeout, expired) =
+            self.operation_timer(operation, Some(DatabaseWait::Deadline(deadline)))?;
+        tokio::select! {
+            biased;
+            _ = expired => Err(database_operation_timed_out(operation, timeout)),
+            result = future => Ok(result),
+        }
+    }
+
     fn remaining_read_budget(&self, deadline: Instant) -> Duration {
         let remaining = deadline.saturating_duration_since(self.snapshot_now());
         self.operation_limit()
             .map_or(remaining, |limit| remaining.min(limit))
     }
 
-    fn remaining_until(&self, operation: &'static str, deadline: Instant) -> Result<Duration> {
+    pub(crate) fn remaining_until(
+        &self,
+        operation: &'static str,
+        deadline: Instant,
+    ) -> Result<Duration> {
         let remaining = deadline.saturating_duration_since(self.snapshot_now());
         if remaining.is_zero() {
             return Err(database_operation_timed_out(operation, remaining));
@@ -1794,14 +1826,24 @@ impl Connection {
 
     #[track_caller]
     pub fn transaction_immediate(&self) -> Result<Transaction> {
+        self.transaction_immediate_before(None)
+    }
+
+    /// Starts and prepares an immediate write under an already captured deadline.
+    #[track_caller]
+    pub(crate) fn transaction_immediate_before(
+        &self,
+        write_deadline: Option<Instant>,
+    ) -> Result<Transaction> {
         self.refuse_writer_lock()?;
         let (inner, _, tally) = self.open_remote_transaction(
             "begin immediate transaction",
             libsql::TransactionBehavior::Immediate,
             None,
-            None,
+            write_deadline,
         )?;
         let mut transaction = self.wrap_transaction(inner, WriteState::Unprepared, None, tally);
+        transaction.write_deadline = write_deadline;
         transaction.ensure_mutation_receipt()?;
         Ok(transaction)
     }
@@ -1817,13 +1859,24 @@ impl Connection {
     /// replica. The snapshot cannot be upgraded into a write.
     #[track_caller]
     pub fn transaction_primary_snapshot(&self) -> Result<Transaction> {
+        self.transaction_primary_snapshot_before(None)
+    }
+
+    /// Starts a primary snapshot with its read budget capped by a write deadline.
+    #[track_caller]
+    pub(crate) fn transaction_primary_snapshot_before(
+        &self,
+        write_deadline: Option<Instant>,
+    ) -> Result<Transaction> {
         let (inner, deadline, tally) = self.open_remote_transaction(
-            "begin primary snapshot",
+            BEGIN_PRIMARY_SNAPSHOT,
             libsql::TransactionBehavior::Deferred,
             self.interactive_read_budget(),
-            None,
+            write_deadline,
         )?;
-        Ok(self.wrap_transaction(inner, WriteState::Snapshot, deadline, tally))
+        let mut transaction = self.wrap_transaction(inner, WriteState::Snapshot, deadline, tally);
+        transaction.write_deadline = write_deadline;
+        Ok(transaction)
     }
 
     /// Snapshot capture reads before acquiring the writer lock. A concurrent

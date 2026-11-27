@@ -603,6 +603,8 @@ impl HranaFixture {
             during_leased_guild_commit: Arc::new(Mutex::new(None)),
             #[cfg(test)]
             after_advised_due_read: Arc::new(Mutex::new(None)),
+            #[cfg(test)]
+            after_advised_busy: Arc::new(Mutex::new(None)),
             #[cfg(debug_assertions)]
             test_config_snapshot: Arc::new(Mutex::new(None)),
         }
@@ -804,8 +806,10 @@ async fn hold_immediate_begin(path: &str, input: &Json, state: &Arc<Mutex<HranaS
             return false;
         }
         guard.hang_next_begin = false;
-        guard.write_locked = true;
-        guard.in_transaction = true;
+        if guard.provider.is_none() {
+            guard.write_locked = true;
+            guard.in_transaction = true;
+        }
         guard.begin_hung = true;
         guard.progress.notify_waiters();
         Arc::clone(&guard.begin_release)
@@ -875,11 +879,12 @@ async fn respond(request: Request<Body>, state: Arc<Mutex<HranaState>>) -> Respo
             std::future::pending::<()>().await;
         }
     }
+    let held_begin = hold_immediate_begin(&path, &input, &state).await;
     let provider = state.lock().unwrap().provider.clone();
     if let Some(provider) = provider {
         return provider_response(&path, &input, &state, &provider).await;
     }
-    if hold_immediate_begin(&path, &input, &state).await {
+    if held_begin {
         // The lock was taken when the request arrived. This response is that
         // same BEGIN, so it must not be reported as a second writer.
         state.lock().unwrap().skip_immediate_lock = true;
@@ -1500,6 +1505,353 @@ async fn advised_bot_action_claim_revalidates_after_busy_promotion() {
         drop(local);
         super::cleanup_db(&path);
     }
+}
+
+async fn advised_claim_fallback_fixture(
+    path: &std::path::Path,
+) -> (Db, HranaFixture, Db, BotAction) {
+    let local = Db::open(path, 2).unwrap();
+    enroll_guild(&local, 10, 1).await.unwrap();
+    let action = enqueue_test_action(&local, 100, 20).await;
+    let (fixture, _) = HranaFixture::modeled_latency_database(
+        path,
+        Duration::ZERO,
+        Duration::from_secs(10),
+        Arc::default(),
+    )
+    .await;
+    let remote = fixture.db_with_operation_timeout(Duration::from_secs(5));
+    (local, fixture, remote, action)
+}
+
+fn invalidate_advised_claim_snapshot(fixture: &HranaFixture, path: &std::path::Path, id: &str) {
+    let path = path.to_owned();
+    let id = id.to_owned();
+    fixture.before_next_receipt(move || {
+        // Commit between the due read and the first promotion write, keeping
+        // the same action pending for the retry.
+        let writer = Connection::open(&path).unwrap();
+        assert_eq!(
+            writer
+                .execute_bounded(
+                    "UPDATE bot_actions SET expires_at=expires_at+1 WHERE id=?1",
+                    params![id],
+                    4096,
+                )
+                .unwrap(),
+            1
+        );
+    });
+}
+
+async fn assert_advised_action_pending(local: &Db, action: &BotAction) {
+    let stored = bot_action(local, 10, &action.id).await.unwrap().unwrap();
+    assert_eq!(stored.state, "pending");
+    assert_eq!(stored.claim, None);
+}
+
+fn hold_advised_fallback_permits(
+    remote: &Db,
+    clock: &Arc<crate::db_compat::ManualClock>,
+    spent: Duration,
+) -> tokio::sync::oneshot::Receiver<tokio::sync::OwnedSemaphorePermit> {
+    let permits = Arc::clone(&remote.permits);
+    let clock = Arc::clone(clock);
+    let (send, receive) = tokio::sync::oneshot::channel();
+    *remote.after_advised_busy.lock().unwrap() = Some(Box::new(move || {
+        let held = permits.try_acquire_many_owned(2).unwrap();
+        clock.advance(spent);
+        send.send(held).unwrap();
+    }));
+    receive
+}
+
+async fn assert_advised_fallback_checkout_timeout(
+    error: anyhow::Error,
+    local: &Db,
+    fixture: &HranaFixture,
+    remote: &Db,
+    action: &BotAction,
+) {
+    assert!(is_database_operation_timeout(&error), "{error:#}");
+    assert!(
+        error.to_string().contains("waiting for connection"),
+        "{error:#}"
+    );
+    assert_eq!(crate::db_compat::remote_unavailable_operation(&error), None);
+    assert_eq!(remote.connections.outage.failure_count(), 0);
+    assert_eq!(
+        fixture.read_begins(),
+        1,
+        "only the promotion snapshot began"
+    );
+    assert_eq!(fixture.immediate_begins(), 0);
+    fixture.assert_committed_within_lifetime(0);
+    assert_advised_action_pending(local, action).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn advised_claim_expired_busy_fallback_skips_permit_wait() {
+    let path = super::tmp_db_path("remote_action_claim_expired_before_checkout");
+    let (local, fixture, remote, action) = advised_claim_fallback_fixture(&path).await;
+    invalidate_advised_claim_snapshot(&fixture, &path, &action.id);
+    let clock = install_clock(&remote);
+    let write_limit = remote.connections.runtime.operation_limit().unwrap();
+    let held = hold_advised_fallback_permits(&remote, &clock, write_limit);
+
+    let error = tokio::time::timeout(
+        Duration::from_secs(2),
+        claim_advised_bot_action(&remote, 100),
+    )
+    .await
+    .expect("expired fallback waited for a pool permit")
+    .expect_err("expired fallback claimed work");
+    let held = held.await.unwrap();
+    assert_eq!(remote.permits.available_permits(), 0);
+    assert_advised_fallback_checkout_timeout(error, &local, &fixture, &remote, &action).await;
+    drop(held);
+    read_primary_fixture(&remote).await.unwrap();
+
+    drop(remote);
+    drop(fixture);
+    drop(local);
+    super::cleanup_db(&path);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn advised_claim_busy_fallback_permit_wait_uses_remaining_budget() {
+    let path = super::tmp_db_path("remote_action_claim_checkout_deadline");
+    let (local, fixture, remote, action) = advised_claim_fallback_fixture(&path).await;
+    invalidate_advised_claim_snapshot(&fixture, &path, &action.id);
+    let clock = install_clock(&remote);
+    let write_limit = remote.connections.runtime.operation_limit().unwrap();
+    let remaining = Duration::from_secs(1);
+    let held = hold_advised_fallback_permits(&remote, &clock, write_limit - remaining);
+
+    {
+        let claim = claim_advised_bot_action(&remote, 100);
+        tokio::pin!(claim);
+        // The busy hook runs while polling the claim, so it proceeds to poll
+        // checkout before the receiver below observes the held permits.
+        let held = tokio::time::timeout(Duration::from_secs(2), async {
+            tokio::select! {
+                biased;
+                result = &mut claim => panic!("claim returned before checkout queued: {result:?}"),
+                held = held => held.unwrap(),
+            }
+        })
+        .await
+        .expect("promotion did not reach the busy fallback");
+        clock.advance(remaining - Duration::from_millis(1));
+        tokio::select! {
+            biased;
+            result = &mut claim => panic!("checkout returned before the deadline: {result:?}"),
+            () = std::future::ready(()) => {}
+        }
+        clock.advance(Duration::from_millis(1));
+
+        let error = tokio::time::timeout(Duration::from_secs(2), claim)
+            .await
+            .expect("queued fallback outlived the remaining write budget")
+            .expect_err("fallback claimed work at the deadline");
+        assert_advised_fallback_checkout_timeout(error, &local, &fixture, &remote, &action).await;
+        drop(held);
+    }
+    read_primary_fixture(&remote).await.unwrap();
+
+    drop(remote);
+    drop(fixture);
+    drop(local);
+    super::cleanup_db(&path);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn advised_claim_busy_fallback_expiry_releases_primary_probe() {
+    let path = super::tmp_db_path("remote_action_claim_expired_probe");
+    let (local, fixture, remote, action) = advised_claim_fallback_fixture(&path).await;
+    fixture.state.lock().unwrap().fail_next_status = Some(StatusCode::SERVICE_UNAVAILABLE);
+    let failure = remote
+        .with_ungated_conn(|conn| conn.transaction_primary_snapshot()?.finish_read())
+        .await
+        .unwrap_err();
+    assert!(format!("{failure:#}").contains("status=503"), "{failure:#}");
+    let read_begins = fixture.read_begins();
+    let generation = match remote.connections.outage.admit().unwrap() {
+        Admission::Work(generation) => generation,
+        Admission::Probe(_) => panic!("the gate must be closed for the promotion"),
+    };
+    invalidate_advised_claim_snapshot(&fixture, &path, &action.id);
+
+    let clock = install_clock(&remote);
+    let write_limit = remote.connections.runtime.operation_limit().unwrap();
+    let remaining = Duration::from_secs(1);
+    let held = hold_advised_fallback_permits(&remote, &clock, write_limit - remaining);
+    let pool = Arc::clone(&remote.connections);
+    {
+        let mut after_busy = remote.after_advised_busy.lock().unwrap();
+        let hold_permits = after_busy.take().unwrap();
+        *after_busy = Some(Box::new(move || {
+            let gate = &pool.outage;
+            // Publish an outage observed by another caller after the promotion.
+            assert!(is_primary_outage(&gate.record_failure(
+                generation,
+                crate::db_compat::INTERACTIVE_READ_BUDGET,
+                failure,
+            )));
+            gate.elapse_probe_cooldown();
+            hold_permits();
+        }));
+    }
+
+    {
+        let claim = claim_advised_bot_action(&remote, 100);
+        tokio::pin!(claim);
+        let held = tokio::time::timeout(Duration::from_secs(2), async {
+            tokio::select! {
+                biased;
+                result = &mut claim => panic!("claim returned before probe checkout queued: {result:?}"),
+                held = held => held.unwrap(),
+            }
+        })
+        .await
+        .expect("promotion did not reach the busy fallback");
+        let gate = &remote.connections.outage;
+        assert!(
+            gate.admit()
+                .is_err_and(|error| error.is::<PrimaryBackoff>())
+        );
+        clock.advance(remaining);
+        let error = tokio::time::timeout(Duration::from_secs(2), claim)
+            .await
+            .expect("the probe checkout outlived the write budget")
+            .expect_err("the expired fallback claimed work");
+        assert!(is_database_operation_timeout(&error), "{error:#}");
+        assert!(
+            error.to_string().contains("waiting for connection"),
+            "{error:#}"
+        );
+        assert_eq!(gate.failure_count(), 1);
+        assert_eq!(
+            fixture.read_begins(),
+            read_begins + 1,
+            "only the promotion sent BEGIN"
+        );
+        assert_eq!(fixture.immediate_begins(), 0);
+        assert_advised_action_pending(&local, &action).await;
+        drop(held);
+    }
+
+    // The next caller must reach the primary immediately. A failure there
+    // starts a fresh cooldown because that caller actually sent a probe.
+    fixture.state.lock().unwrap().fail_next_status = Some(StatusCode::SERVICE_UNAVAILABLE);
+    let error = read_primary_fixture(&remote).await.unwrap_err();
+    assert!(format!("{error:#}").contains("status=503"), "{error:#}");
+    assert!(is_primary_outage(&error), "{error:#}");
+    assert_eq!(remote.connections.outage.failure_count(), 2);
+    let error = read_primary_fixture(&remote).await.unwrap_err();
+    assert!(error.is::<PrimaryBackoff>(), "{error:#}");
+
+    remote.connections.outage.elapse_probe_cooldown();
+    read_primary_fixture(&remote).await.unwrap();
+    assert_eq!(remote.connections.outage.failure_count(), 0);
+
+    drop(remote);
+    drop(fixture);
+    drop(local);
+    super::cleanup_db(&path);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn advised_claim_busy_fallback_times_out_at_original_deadline() {
+    let path = super::tmp_db_path("remote_action_claim_fallback_deadline");
+    let (local, fixture, remote, action) = advised_claim_fallback_fixture(&path).await;
+    invalidate_advised_claim_snapshot(&fixture, &path, &action.id);
+    let clock = install_clock(&remote);
+    let spent = Duration::from_secs(3);
+    let write_limit = remote.connections.runtime.operation_limit().unwrap();
+    let due_clock = Arc::clone(&clock);
+    *remote.after_advised_due_read.lock().unwrap() = Some(Box::new(move || {
+        due_clock.advance(spent);
+    }));
+    fixture.hang_next_begin();
+
+    let (result, releasing) = {
+        let claim = claim_advised_bot_action(&remote, 100);
+        tokio::pin!(claim);
+        tokio::select! {
+            result = &mut claim => panic!("claim returned before the fallback BEGIN: {result:?}"),
+            hung = tokio::time::timeout(Duration::from_secs(2), fixture.wait_until(|state| state.begin_hung)) => {
+                if hung.is_err() {
+                    fixture.release_begin();
+                }
+                hung.expect("fallback BEGIN was not sent");
+            }
+        }
+        clock.advance(write_limit - spent);
+        let releasing = tokio::time::timeout(Duration::from_secs(2), async {
+            while remote.runtime.open_release_count() == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+        // Always unblock the fixture, including when testing the old behavior.
+        fixture.release_begin();
+        (claim.await, releasing)
+    };
+    releasing.expect("fallback BEGIN must give up at the original write deadline");
+    let error = result.expect_err("the fallback cannot claim after the write deadline");
+    assert!(is_database_operation_timeout(&error), "{error:#}");
+    assert!(
+        error.to_string().contains("begin immediate transaction"),
+        "{error:#}"
+    );
+    assert_eq!(fixture.read_begins(), 2);
+    assert_eq!(fixture.immediate_begins(), 1);
+    fixture.assert_committed_within_lifetime(0);
+    assert_advised_action_pending(&local, &action).await;
+
+    drop(remote);
+    drop(fixture);
+    drop(local);
+    super::cleanup_db(&path);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn advised_claim_expiry_before_busy_fallback_leaves_primary_pool_available() {
+    let path = super::tmp_db_path("remote_action_claim_expired_fallback");
+    let (local, fixture, remote, action) = advised_claim_fallback_fixture(&path).await;
+    let clock = install_clock(&remote);
+    let write_limit = remote.connections.runtime.operation_limit().unwrap();
+
+    for _ in 0..2 {
+        invalidate_advised_claim_snapshot(&fixture, &path, &action.id);
+        clock.advance_at_operation("begin primary snapshot", write_limit);
+        let error = claim_advised_bot_action(&remote, 100)
+            .await
+            .expect_err("the fallback must stop before opening an expired snapshot");
+        assert!(is_database_operation_timeout(&error), "{error:#}");
+        assert!(
+            error.to_string().contains("begin primary snapshot"),
+            "{error:#}"
+        );
+        assert_eq!(crate::db_compat::remote_unavailable_operation(&error), None);
+        assert_advised_action_pending(&local, &action).await;
+    }
+    assert_eq!(
+        fixture.read_begins(),
+        2,
+        "only the promotion snapshots began"
+    );
+    assert_eq!(fixture.immediate_begins(), 0);
+    fixture.assert_committed_within_lifetime(0);
+    read_primary_fixture(&remote)
+        .await
+        .expect("local fallback expiry must leave the primary pool available");
+
+    drop(remote);
+    drop(fixture);
+    drop(local);
+    super::cleanup_db(&path);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
