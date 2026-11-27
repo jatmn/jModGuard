@@ -2104,13 +2104,20 @@ async fn scheduler_revalidates_stale_hits_and_falls_back_on_an_advisory_error() 
         );
     }
 
-    // Unlike a fresh claim, overdue receipt housekeeping must still wake
-    // the worker while the guild is fenced.
+    // Fenced overdue actions alone leave the scheduler idle.
     assert_eq!(
         db::bot_work_due(&primary.db, action.expires_at, &[])
             .await
             .unwrap(),
-        db::BotWorkDue::Action
+        db::BotWorkDue::Idle
+    );
+    drain_with_advisory_db(&app, &primary.db, &discord, &limits, action.expires_at)
+        .await
+        .unwrap();
+    assert_eq!(discord.calls.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        primary.persisted_status(&action).await,
+        ("pending".into(), None)
     );
     replica
         .db
