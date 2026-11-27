@@ -3319,6 +3319,159 @@ async fn onboarding_trap_bot_and_dashboard_saves_compare_the_same_base() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn onboarding_role_removal_manage_server_can_enable_and_change_roles() {
+    let mut f = Fixture::new(true).await;
+    f.enroll(10).await;
+    let bot = f.attach_save_writer().await;
+    let id = jmodguard::onboarding_trap::RULE_ID;
+    let path = format!("/api/guilds/10/rules/{id}");
+    let mut current = db::get_rule(&bot.db, 0, id).await.unwrap().unwrap();
+
+    for roles in [serde_json::json!(["22"]), serde_json::json!(["24", "23"])] {
+        let mut next = current.clone();
+        next.enabled = true;
+        next.dry_run = false;
+        next.params["role_id"] = serde_json::json!("20");
+        next.params["remove_role_ids"] = roles;
+        let payload = serde_json::json!({"scope":"guild","expected":current,"data":next});
+        let (status, saved) = f.request("PUT", &path, &payload.to_string()).await;
+        assert_eq!(status, StatusCode::OK, "{saved}");
+        assert_eq!(
+            saved["config_patch"]["value"],
+            serde_json::to_value(&next).unwrap()
+        );
+        assert_eq!(
+            db::get_rule(&bot.db, 10, id).await.unwrap(),
+            Some(next.clone())
+        );
+        current = next;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn onboarding_role_removal_delegated_settings_cannot_change_or_activate_policy() {
+    use db::guild_data::{AccessLevel, AccessRole};
+    use serde_json::json;
+
+    let mut f = Fixture::new(true).await;
+    f.enroll(10).await;
+    f.enroll(20).await;
+    let enrollment = db::guild_enrollment(&f.app.db, 10).await.unwrap().unwrap();
+    f.app.tenant.activate(enrollment).await.unwrap().unwrap();
+    set_access_roles(
+        &f,
+        10,
+        vec![AccessRole {
+            role_id: 555,
+            level: AccessLevel::Settings,
+        }],
+    )
+    .await;
+    // Keep the independent writer authorized. API rejection must happen before
+    // the writer receives a privileged proposed change.
+    let bot = f.attach_save_writer().await;
+    demote_to_member(&f).await;
+    f.discord
+        .member_roles
+        .lock()
+        .unwrap()
+        .insert(10, vec!["555".into()]);
+
+    let id = jmodguard::onboarding_trap::RULE_ID;
+    let path = format!("/api/guilds/10/rules/{id}");
+    let mut empty = db::get_rule(&bot.db, 0, id).await.unwrap().unwrap();
+    empty.params["role_id"] = json!("20");
+    let mut staged = empty.clone();
+    staged.params["remove_role_ids"] = json!(["22", "23"]);
+    let mut disabled_live = staged.clone();
+    disabled_live.dry_run = false;
+    let mut preview = staged.clone();
+    preview.enabled = true;
+    let mut live = preview.clone();
+    live.dry_run = false;
+    live.whitelist_users = vec![50];
+
+    for (label, current, mut next) in [
+        ("add roles", &empty, staged.clone()),
+        ("reorder roles", &staged, staged.clone()),
+        ("enable", &disabled_live, live.clone()),
+        ("leave dry-run", &preview, live.clone()),
+        ("change live trigger", &live, live.clone()),
+        ("change live window", &live, live.clone()),
+        ("change live exemptions", &live, live.clone()),
+        ("clear roles", &live, live.clone()),
+        ("forge expected", &empty, staged.clone()),
+    ] {
+        db::upsert_rule(&bot.db, 10, id, current).await.unwrap();
+        let version = db::get_config_version(&bot.db).await.unwrap();
+        match label {
+            "reorder roles" => next.params["remove_role_ids"] = json!(["23", "22"]),
+            "change live trigger" => next.params["role_id"] = json!("21"),
+            "change live window" => next.params["join_window_minutes"] = json!(0),
+            "change live exemptions" => next.whitelist_users.clear(),
+            "clear roles" => next.params["remove_role_ids"] = json!([]),
+            _ => {}
+        }
+        if matches!(label, "enable" | "leave dry-run") {
+            // Changing mode alone is enough to activate the staged list.
+            next.whitelist_users.clear();
+        }
+        let expected = if label == "forge expected" {
+            &next
+        } else {
+            current
+        };
+        let body = json!({"scope":"guild","expected":expected,"data":next});
+        let (status, reply) = f.request("PUT", &path, &body.to_string()).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{label}: {reply}");
+        assert_eq!(reply["code"], "guild_access_denied", "{label}");
+        assert_eq!(
+            db::get_config_version(&bot.db).await.unwrap(),
+            version,
+            "{label}"
+        );
+        assert_eq!(
+            db::get_rule(&bot.db, 10, id).await.unwrap().as_ref(),
+            Some(current),
+            "{label}"
+        );
+    }
+
+    db::upsert_rule(&bot.db, 10, id, &live).await.unwrap();
+    let version = db::get_config_version(&bot.db).await.unwrap();
+    for (method, path, payload, expected) in [
+        ("DELETE", path.as_str(), json!({}), StatusCode::BAD_REQUEST),
+        (
+            "POST",
+            "/api/guilds/10/copy",
+            json!({"from_guild_id":"20","sections":["all"]}),
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            "PUT",
+            "/api/guilds/10/settings",
+            json!({"prefix":"?","rules":[live]}),
+            StatusCode::UNPROCESSABLE_ENTITY,
+        ),
+    ] {
+        let (status, reply) = f.request(method, path, &payload.to_string()).await;
+        assert_eq!(status, expected, "{method} {path}: {reply}");
+        assert_eq!(db::get_config_version(&bot.db).await.unwrap(), version);
+        assert_eq!(
+            db::get_rule(&bot.db, 10, id).await.unwrap(),
+            Some(live.clone())
+        );
+    }
+
+    let mut safe = live.clone();
+    safe.params["cleanup_window_minutes"] = json!(12);
+    let edited = json!({"scope":"guild","expected":live,"data":safe});
+    let (status, reply) = f.request("PUT", &path, &edited.to_string()).await;
+    assert_eq!(status, StatusCode::OK, "{reply}");
+    assert_eq!(db::get_rule(&bot.db, 10, id).await.unwrap(), Some(safe));
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn invite_description_save_patch_uses_canonical_rule() {
     use db::SqlExecutor;
     const OLD: &str =

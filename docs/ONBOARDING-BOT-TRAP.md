@@ -5,8 +5,8 @@ starts disabled. When enabled, it checks whether the configured role arrived
 with a join or was added in a member update. Moderators, administrators and the
 server owner are always exempt.
 
-The trap kicks matching members and can clean up their recent messages after
-Discord confirms the kick. Role removal remains tracked in #786.
+The trap can remove selected roles from a matching member before kicking them.
+It can also clean up their recent messages after Discord confirms the kick.
 
 ## Create the Anti-bot role
 
@@ -43,17 +43,26 @@ for the Community server setup and preview requirements.
 3. Keep **Dry-run (log only)** selected, turn on **Enabled**, and save. The
    default join window is 30 minutes. Set it to 0 to check role grants at any
    time. Keeping a window helps protect members from accidental later grants.
+
+   Configuring or activating role removal requires **Manage Server**.
+   Leave **Roles to remove before kicking** empty to skip role removal. You
+   can select up to five additional roles. The trap removes selected roles the
+   member holds, in selection order. jModGuard needs **Manage Roles** and must
+   outrank the member. The trap role, `@everyone`, and integration-managed
+   roles are excluded. A refused or unconfirmed removal can still be followed
+   by a kick if the member and rule continue to pass the safety checks.
+
    Set **Recent-message cleanup** to 1–60 minutes to delete messages the bot
    observed during the member's current stay and within that time before the
    kick. The default is 0 (off). Cleanup needs **Manage Messages** in each
    affected channel and uses the bot's bounded in-memory message tracking.
-   In a staggered deployment, cleanup takes effect after the running bot is
-   upgraded.
+   In a staggered deployment, role removal and cleanup take effect after the
+   running bot is upgraded.
 4. In **Server Settings → Onboarding**, use **Preview** to view the server as
    a new member. Then join with a test account that has ordinary member
    permissions and select the decoy answer. Confirm the dry-run entry in
-   **Automod**. Dry-run leaves the account and messages in place and creates
-   no case.
+   **Automod**. Dry-run leaves the account, roles, and messages in place and
+   creates no case.
 5. Turn off dry-run and save. Rejoin with the test account and select the decoy
    again. Confirm the kick, the **Member kicked** log and the **Automod** entry.
    Find the kick case in the private dashboard **Cases** page and check its
@@ -64,6 +73,8 @@ for the Community server setup and preview requirements.
 
 - If the kick fails, check **Kick Members** and move jModGuard's highest role
   above the trap role and the test account's highest role.
+- If the Automod log reports skipped or unconfirmed role removals, check
+  **Manage Roles**, the role hierarchy, and that the selected roles still exist.
 - Keep the role exclusive to the onboarding answer. Check reaction roles,
   other bots and manual grants. A grant inside the configured join window can
   trigger the trap regardless of who applied it.

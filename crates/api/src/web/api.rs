@@ -349,6 +349,22 @@ pub async fn put_rule(
     let write = super::configuration_write_scope(&app, &auth, guild_id, scope)?;
     let (request, target) = write.to_wires();
     let op = if rule_id == jmodguard::onboarding_trap::RULE_ID {
+        if guild_id != 0 && !auth.can_manage(guild_id) {
+            // Read the current policy with the captured enrollment. A
+            // client-provided expected rule cannot decide permissions.
+            let scope = super::configuration_scope(&app, &auth, guild_id)?;
+            let (layers, default) = db::get_enrolled_builtin_rule(&app.db, scope, &rule_id).await?;
+            let current = db::resolve(&layers.guild, &layers.global, &default);
+            if jmodguard::onboarding_trap::role_removal_requires_manage(
+                guild_id, &current, &body.data,
+            ) {
+                return Err(super::GuildAccessDenied {
+                    have: db::guild_data::AccessLevel::Settings,
+                    need: GuildAccess::Manage,
+                }
+                .into());
+            }
+        }
         db::ControlOp::SaveOnboardingTrap {
             scope: target,
             expected: body.expected.ok_or_else(|| {
@@ -398,7 +414,12 @@ pub async fn delete_rule(
     Path((guild_id, rule_id)): Path<(u64, String)>,
     Json(body): Json<ScopeBody>,
 ) -> ApiResult<Json<serde_json::Value>> {
-    let auth = guild_scope_at(&app, &session, guild_id, GuildAccess::Settings).await?;
+    let need = if rule_id == jmodguard::onboarding_trap::RULE_ID {
+        GuildAccess::Manage
+    } else {
+        GuildAccess::Settings
+    };
+    let auth = guild_scope_at(&app, &session, guild_id, need).await?;
     super::check_page_enrollment(&auth, guild_id, &headers)?;
     if !jmodguard::custom_rules::known_rule_id(&rule_id) {
         return Err(ApiError(anyhow::anyhow!("unknown rule `{rule_id}`")));

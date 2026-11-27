@@ -1837,6 +1837,7 @@ fn copying_a_configured_onboarding_trap_requires_a_destination_role() {
         rule.enabled = true;
         rule.dry_run = false;
         rule.params["role_id"] = serde_json::json!("30");
+        rule.params["remove_role_ids"] = serde_json::json!(["31"]);
         upsert_rule(&db, 10, id, &rule).await.unwrap();
         copy_guild_config(&db, 10, 20, vec!["rules".into()])
             .await
@@ -1847,7 +1848,7 @@ fn copying_a_configured_onboarding_trap_requires_a_destination_role() {
             copied.params,
             serde_json::json!({"role_id": null, "join_window_minutes": 30})
         );
-        assert!(get_rule(&db, 10, id).await.unwrap().unwrap().enabled);
+        assert_eq!(get_rule(&db, 10, id).await.unwrap(), Some(rule));
     });
     drop(db);
     cleanup_db(&tmp);

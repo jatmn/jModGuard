@@ -1,10 +1,17 @@
 //! Shared Discord REST helpers.
 
+mod guarded_delete;
+
+#[cfg(test)]
+pub(crate) use guarded_delete::with_delete_connect_hook;
+
 use anyhow::{Context as _, Result, anyhow};
 use parking_lot::Mutex;
 use serenity::model::channel::Channel;
 use serenity::model::id::ChannelId;
 use std::collections::HashMap;
+use std::future::Future;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
@@ -17,23 +24,8 @@ pub(crate) async fn automod_ban(
     action: &crate::types::ActionDef,
     reason: &str,
 ) -> Result<(), Box<serenity::Error>> {
-    // Match Serenity's audit reason encoding (percent-encoded UTF-8).
-    let mut encoded = String::new();
-    for byte in reason.bytes() {
-        if byte.is_ascii_alphanumeric() {
-            encoded.push(char::from(byte));
-        } else {
-            use std::fmt::Write;
-            write!(encoded, "%{byte:02X}").expect("writing to a string");
-        }
-    }
     let mut headers = reqwest::header::HeaderMap::new();
-    headers.insert(
-        "X-Audit-Log-Reason",
-        reqwest::header::HeaderValue::from_str(&encoded)
-            .map_err(serenity::http::HttpError::InvalidHeader)
-            .map_err(serenity::Error::from)?,
-    );
+    headers.insert("X-Audit-Log-Reason", audit_reason_header(reason));
     let request = serenity::http::Request::new(
         serenity::http::Route::GuildBan { guild_id, user_id },
         serenity::http::LightMethod::Put,
@@ -47,6 +39,20 @@ pub(crate) async fn automod_ban(
         .into_bytes(),
     ));
     http.request(request).await.map(|_| ()).map_err(Box::new)
+}
+
+fn audit_reason_header(reason: &str) -> reqwest::header::HeaderValue {
+    // Match Serenity's audit reason encoding (percent-encoded UTF-8).
+    let mut encoded = String::new();
+    for byte in reason.bytes() {
+        if byte.is_ascii_alphanumeric() {
+            encoded.push(char::from(byte));
+        } else {
+            use std::fmt::Write;
+            write!(encoded, "%{byte:02X}").expect("writing to a string");
+        }
+    }
+    reqwest::header::HeaderValue::from_str(&encoded).expect("encoded audit reason is ASCII")
 }
 
 pub(crate) type OnGlobalRateLimitCallback = dyn Fn(crate::handlers::RateLimitWait) + Send + Sync;
@@ -66,6 +72,219 @@ pub(crate) fn member_sync_global_rate_limit_hook(
 /// Bounds every reconciliation REST attempt so one half-open Discord request
 /// cannot stall durable work for every guild indefinitely.
 pub const DISCORD_REST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+pub(crate) async fn before_dispatch_deadline<T>(
+    deadline: tokio::time::Instant,
+    work: impl Future<Output = T>,
+) -> Option<T> {
+    tokio::select! {
+        biased;
+        _ = tokio::time::sleep_until(deadline) => None,
+        result = work => Some(result),
+    }
+}
+
+pub(crate) enum DeleteDispatch {
+    Unsent,
+    Finished(serenity::Result<()>),
+    Uncertain,
+}
+
+struct RouteQuota<'a> {
+    bucket: Option<&'a tokio::sync::Mutex<serenity::http::Ratelimit>>,
+    request: &'a serenity::http::Request<'static>,
+    on_wait: &'a (dyn Fn(serenity::http::RatelimitInfo) + Send + Sync),
+}
+
+impl<'a> RouteQuota<'a> {
+    async fn acquire(&self) -> Option<tokio::sync::MutexGuard<'a, serenity::http::Ratelimit>> {
+        let mut held = self.bucket?.lock().await;
+        // With a recorded reset and no slots left, Serenity can wait but
+        // cannot debit a slot. Keep the lock until the request is sent.
+        if held.remaining() == 0 && held.reset().is_some() {
+            held.pre_hook(self.request, self.on_wait).await;
+        }
+        Some(held)
+    }
+
+    async fn charge(&self, held: Option<tokio::sync::MutexGuard<'a, serenity::http::Ratelimit>>) {
+        // This branch of pre_hook runs synchronously. Exhausted buckets
+        // have already waited in acquire and have no slot left to debit.
+        if let Some(mut held) = held
+            && (held.remaining() != 0 || held.reset().is_none())
+        {
+            held.pre_hook(self.request, self.on_wait).await;
+        }
+    }
+}
+
+/// Use Serenity's route buckets and validate admission at the first socket
+/// write. Only an explicit rate-limit rejection may authorize another attempt.
+pub(crate) async fn delete_before_dispatch_deadline<F: Future<Output = bool> + Send>(
+    app: &Arc<crate::state::BotState>,
+    http: &serenity::http::Http,
+    route: serenity::http::Route<'static>,
+    reason: &str,
+    deadline: tokio::time::Instant,
+    admit: impl Fn() -> bool + Sync,
+    refresh: impl Fn() -> F + Sync,
+) -> DeleteDispatch {
+    use hyper1::header::{AUTHORIZATION, CONNECTION, HOST, USER_AGENT};
+    use serenity::http::{LightMethod, RatelimitInfo, Request};
+
+    let path = route.path();
+    let url = http.proxy.as_ref().map_or_else(
+        || path.to_string(),
+        |proxy| path.replacen("https://discord.com", proxy.trim_end_matches('/'), 1),
+    );
+    let Ok(uri) = url.parse::<hyper1::Uri>() else {
+        return DeleteDispatch::Unsent;
+    };
+    let (Some(host), Some(target)) = (uri.authority(), uri.path_and_query()) else {
+        return DeleteDispatch::Unsent;
+    };
+    let rate_request = Request::new(route, LightMethod::Delete);
+    let admit = || app.activation.may_record() && admit();
+    let note_wait = |wait: crate::handlers::RateLimitWait| {
+        note_rate_limit_wait_for_test();
+        crate::resources::rate_limit_wait(
+            &format!("{:?}", wait.method),
+            &crate::handlers::redact_rate_limit_path(&wait.path),
+            wait.global,
+        );
+        crate::handlers::observe_member_sync_rate_limit_wait(app, wait);
+    };
+    let on_wait = |wait: RatelimitInfo| {
+        note_wait(crate::handlers::RateLimitWait {
+            timeout: wait.timeout,
+            limit: wait.limit,
+            method: wait.method,
+            path: wait.path,
+            global: wait.global,
+        });
+    };
+    let bucket = http
+        .ratelimiter
+        .as_ref()
+        .map(|ratelimiter| ratelimiter.routes());
+    let bucket = if let Some(routes) = bucket {
+        let key = route.ratelimiting_bucket();
+        let Some(bucket) = before_dispatch_deadline(deadline, async {
+            Arc::clone(routes.write().await.entry(key).or_default())
+        })
+        .await
+        else {
+            return DeleteDispatch::Unsent;
+        };
+        Some(bucket)
+    } else {
+        None
+    };
+    loop {
+        let outbound = hyper1::Request::builder()
+            .method(reqwest::Method::DELETE)
+            .uri(target.as_str())
+            .header(HOST, host.as_str())
+            .header(CONNECTION, "close")
+            .header(USER_AGENT, serenity::constants::USER_AGENT)
+            .header(AUTHORIZATION, http.token())
+            .header("X-Audit-Log-Reason", audit_reason_header(reason))
+            .body(http_body_util::Empty::new());
+        let Ok(outbound) = outbound else {
+            return DeleteDispatch::Unsent;
+        };
+        let quota = RouteQuota {
+            bucket: bucket.as_deref(),
+            request: &rate_request,
+            on_wait: &on_wait,
+        };
+        let receipt =
+            match guarded_delete::send(&uri, outbound, deadline, &admit, &refresh, quota).await {
+                Ok(receipt) => receipt,
+                Err(guarded_delete::SendFailure::Unsent) => return DeleteDispatch::Unsent,
+                Err(guarded_delete::SendFailure::Uncertain) => return DeleteDispatch::Uncertain,
+            };
+
+        if let Some(bucket) = &bucket {
+            if receipt.headers.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
+                let retry = if receipt.headers.headers().contains_key("x-ratelimit-global") {
+                    if let Some(timeout) = discord_retry_after(&receipt.headers) {
+                        note_wait(crate::handlers::RateLimitWait {
+                            timeout,
+                            limit: 50,
+                            method: LightMethod::Delete,
+                            path: path.to_string(),
+                            global: true,
+                        });
+                        before_dispatch_deadline(deadline, tokio::time::sleep(timeout))
+                            .await
+                            .is_some()
+                    } else {
+                        false
+                    }
+                } else {
+                    matches!(
+                        before_dispatch_deadline(deadline, async {
+                            bucket
+                                .lock()
+                                .await
+                                .post_hook(&receipt.headers, &rate_request, &on_wait, false)
+                                .await
+                        })
+                        .await,
+                        Some(Ok(true))
+                    )
+                };
+                if retry {
+                    continue;
+                }
+            } else {
+                settle_delete_quota(
+                    Arc::clone(bucket),
+                    rate_request.clone(),
+                    receipt.headers,
+                    receipt.response_deadline,
+                )
+                .await;
+            }
+        }
+
+        return DeleteDispatch::Finished(receipt.result);
+    }
+}
+
+async fn settle_delete_quota(
+    bucket: Arc<tokio::sync::Mutex<serenity::http::Ratelimit>>,
+    request: serenity::http::Request<'static>,
+    headers: reqwest::Response,
+    deadline: tokio::time::Instant,
+) {
+    // Queue the quota update before the next admission can miss this receipt.
+    // Keep that position even if the caller has to return the confirmed result
+    // before bookkeeping can finish. Non-429 post_hook never waits on a reset.
+    note_rate_limit_wait_for_test();
+    let mut update = Box::pin(async move {
+        let mut held = bucket.lock().await;
+        let _ = held.post_hook(&headers, &request, &|_| {}, false).await;
+    });
+    if tokio::time::timeout_at(deadline, update.as_mut())
+        .await
+        .is_err()
+    {
+        tokio::spawn(update);
+    }
+}
+
+fn discord_retry_after(response: &reqwest::Response) -> Option<Duration> {
+    let seconds = response
+        .headers()
+        .get("retry-after")?
+        .to_str()
+        .ok()?
+        .parse()
+        .ok()?;
+    Duration::try_from_secs_f64(seconds).ok()
+}
 
 /// Outcome of a Discord call raced against writer cutoff.
 pub(crate) enum DiscordCall<T> {
@@ -311,14 +530,7 @@ pub(crate) async fn send_discord_log_after_rate_limit(
         // A rejected 429 is settled before post_hook can wait for another attempt.
         let rate_limited = response.status() == reqwest::StatusCode::TOO_MANY_REQUESTS;
         let retry_after = rate_limited
-            .then(|| {
-                response
-                    .headers()
-                    .get("retry-after")
-                    .and_then(|value| value.to_str().ok())
-                    .and_then(|value| value.parse::<f64>().ok())
-                    .and_then(|delay| Duration::try_from_secs_f64(delay).ok())
-            })
+            .then(|| discord_retry_after(&response))
             .flatten();
         if let Some(attempt) = attempt.as_deref_mut() {
             attempt.status.observe_status(response.status().as_u16());

@@ -6,6 +6,7 @@ pub const RULE_ID: &str = "onboarding_bot_trap";
 pub const DEFAULT_JOIN_WINDOW: u32 = 30;
 const MAX_JOIN_WINDOW: u64 = 1440;
 const MAX_CLEANUP_WINDOW: u64 = 60;
+const MAX_REMOVAL_ROLES: usize = 5;
 
 pub fn role_id(rule: &RuleDef) -> Option<u64> {
     let value = rule.params.get("role_id")?;
@@ -38,6 +39,51 @@ pub fn cleanup_window_minutes(rule: &RuleDef) -> Option<u32> {
     (minutes <= MAX_CLEANUP_WINDOW).then_some(minutes as u32)
 }
 
+pub fn removal_role_ids(guild_id: u64, rule: &RuleDef) -> Option<Vec<u64>> {
+    let Some(value) = rule.params.get("remove_role_ids") else {
+        return Some(Vec::new());
+    };
+    let values = value.as_array()?;
+    if values.len() > MAX_REMOVAL_ROLES || (guild_id == 0 && !values.is_empty()) {
+        return None;
+    }
+    let trap_role = role_id(rule);
+    let mut ids = Vec::with_capacity(values.len());
+    for value in values {
+        let id = value.as_str()?.parse::<u64>().ok()?;
+        if id == 0 || id == guild_id || Some(id) == trap_role || ids.contains(&id) {
+            return None;
+        }
+        ids.push(id);
+    }
+    Some(ids)
+}
+
+/// Manage Server controls the saved removal list and who it can affect in live mode.
+/// An unchanged policy can be retained during ordinary edits or switched off.
+pub fn role_removal_requires_manage(guild_id: u64, current: &RuleDef, next: &RuleDef) -> bool {
+    let roles = removal_role_ids(guild_id, next);
+    removal_role_ids(guild_id, current) != roles
+        || (next.enabled
+            && !next.dry_run
+            && roles.is_some_and(|ids| !ids.is_empty())
+            && (!current.enabled
+                || current.dry_run
+                || role_id(current) != role_id(next)
+                || join_window_minutes(current) != join_window_minutes(next)
+                || current.whitelist_roles != next.whitelist_roles
+                || current.whitelist_users != next.whitelist_users
+                || current.whitelist_channels.contains(&0) != next.whitelist_channels.contains(&0)
+                || !current.skip_moderators
+                || !current.log_automod
+                || !current.open_case
+                || !has_kick_action(current)))
+}
+
+fn has_kick_action(rule: &RuleDef) -> bool {
+    matches!(rule.actions.as_slice(), [action] if action.action == "kick" && action.at == 1)
+}
+
 pub(crate) fn validate(guild_id: i64, rule: &RuleDef) -> Result<()> {
     let role = role_id(rule);
     if let Some(value) = rule.params.get("role_id")
@@ -62,6 +108,10 @@ pub(crate) fn validate(guild_id: i64, rule: &RuleDef) -> Result<()> {
         "The onboarding trap cleanup window must be 0–60 minutes"
     );
     ensure!(
+        removal_role_ids(u64::try_from(guild_id).unwrap_or_default(), rule).is_some(),
+        "Choose up to five distinct server roles other than @everyone and the trap role to remove"
+    );
+    ensure!(
         rule.skip_moderators,
         "The onboarding trap must skip moderators"
     );
@@ -70,7 +120,7 @@ pub(crate) fn validate(guild_id: i64, rule: &RuleDef) -> Result<()> {
         "The onboarding trap must log matches and open cases"
     );
     ensure!(
-        matches!(rule.actions.as_slice(), [action] if action.action == "kick" && action.at == 1),
+        has_kick_action(rule),
         "The onboarding trap requires one kick action"
     );
     Ok(())
@@ -80,6 +130,29 @@ pub(crate) fn validate(guild_id: i64, rule: &RuleDef) -> Result<()> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn removal_roles_are_opt_in_and_use_distinct_guild_role_strings() {
+        let mut rule = crate::defaults::rule(RULE_ID);
+        assert_eq!(removal_role_ids(10, &rule), Some(vec![]));
+        rule.params["role_id"] = json!("20");
+        rule.params["remove_role_ids"] = json!(["22", "21"]);
+        assert_eq!(removal_role_ids(10, &rule), Some(vec![22, 21]));
+        assert!(validate(10, &rule).is_ok());
+        assert_eq!(removal_role_ids(0, &rule), None);
+        for invalid in [
+            json!(null),
+            json!([22]),
+            json!(["0"]),
+            json!(["10"]),
+            json!(["20"]),
+            json!(["22", "22"]),
+            json!(["21", "22", "23", "24", "25", "26"]),
+        ] {
+            rule.params["remove_role_ids"] = invalid;
+            assert!(validate(10, &rule).is_err());
+        }
+    }
 
     #[test]
     fn shipped_trap_is_off_and_enabled_traps_require_guild_role_and_safety_settings() {

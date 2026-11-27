@@ -1214,19 +1214,26 @@ dependencies = [
  "anyhow",
  "chrono",
  "dashmap 6.2.1",
+ "http-body-util",
  "hyper 0.14.32",
+ "hyper 1.12.0",
+ "hyper-util",
  "jmodguard",
  "libsql",
  "parking_lot 0.13.0",
  "rand 0.10.4",
+ "rcgen",
  "regex",
  "reqwest 0.12.28",
  "serde_json",
  "serenity",
  "tokio",
+ "tokio-rustls",
  "tokio-tungstenite 0.30.0",
+ "tower-service",
  "tracing",
  "tracing-subscriber",
+ "webpki-roots 1.0.12",
 ]
 
 [[package]]
@@ -1986,6 +1993,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "eb95882a1e14462c69aea9984bb261293ccfe6022ef8de0eda18bd5afb0052df"
 dependencies = [
  "rand_core 0.10.1",
+]
+
+[[package]]
+name = "rcgen"
+version = "0.13.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "75e669e5202259b5314d1ea5397316ad400819437857b90861765f24c4cf80a2"
+dependencies = [
+ "ring",
+ "rustls-pki-types",
+ "time",
+ "yasna",
 ]
 
 [[package]]
@@ -3613,6 +3632,15 @@ checksum = "963d6fab92d5504b971dc8bd90ca743c2575e590bc8071ea5bc571598667ae08"
 dependencies = [
  "libc",
  "rustix 1.1.6",
+]
+
+[[package]]
+name = "yasna"
+version = "0.5.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e17bb3549cc1321ae1296b9cdc2698e2b6cb1992adfa19a8c72e5b7a738f44cd"
+dependencies = [
+ "time",
 ]
 
 [[package]]
