@@ -14393,13 +14393,13 @@ test('Bot Resources rounds combined memory up from bytes, including zero and blo
     assert.ok(textOf(panel).includes(`${blocks.toLocaleString('en-US')} block${blocks === 1 ? '' : 's'} (${capacity} MiB)`));
     assert.ok(textOf(panel).includes(`${headroom} MiB headroom to the next block in this estimate`));
     if (botBytes === 50 * mib) {
-      assert.equal(panel.querySelector('h3').textContent, 'In-process memory block estimate');
+      assert.equal(panel.querySelector('h3').textContent, 'Local memory block estimate');
       assert.match(textOf(panel), /These estimates exclude Bunny’s billed system overhead/);
       assert.match(textOf(panel), /whether hourly billing uses average or peak memory/);
       assert.match(textOf(panel), /whether blocks round per container or per pod/);
-      assert.match(textOf(panel), /Combined memory110 MiB/);
-      assert.match(textOf(panel), /Bot memory50 MiB/);
-      assert.match(textOf(panel), /API memory60 MiB/);
+      assert.match(textOf(panel), /Combined cgroup memory110 MiB/);
+      assert.match(textOf(panel), /Bot cgroup memory50 MiB/);
+      assert.match(textOf(panel), /API cgroup memory60 MiB/);
       const [bot, api] = resourceCards(h);
       assert.equal(resourceMetricValue(bot, 'Memory'), '50 MiB');
       assert.equal(resourceMetricValue(api, 'Memory'), '60 MiB');
@@ -14477,8 +14477,8 @@ test('Bot Resources displays sparse or empty paired coverage with an unpaired sp
     assert.equal(resourceFact(panel, 'Peak combined memory in 24h'), undefined);
     assert.match(resourceFact(panel, 'Estimated blocks'), /^1 block \(64 MiB\)/);
     if (periods) {
-      assert.match(textOf(panel), /covers only minutes with readings from both processes/);
-      assert.match(textOf(panel), /sum of their separate maxima is an upper bound on sampled combined memory in each minute because the processes can peak at different times/);
+      assert.match(textOf(panel), /covers only minutes with readings for both cgroups/);
+      assert.match(textOf(panel), /sum of their separate maxima is an upper bound on sampled combined memory in each minute because the cgroups can peak at different times/);
       assert.match(textOf(panel), /Periods without both readings can hide higher peaks/);
     }
   }
@@ -14510,9 +14510,9 @@ test('Bot Resources estimates memory and CPU run rates from fresh samples at con
   await check(['$0.001', '$0.72'], ['$0', '$0.00']);
   snapshot.processes.bot.current.stale = true;
   const stale = await check(['Unavailable', 'Unavailable'], ['Unavailable', 'Unavailable']);
-  assert.match(stale, /Combined memoryUnavailable/);
+  assert.match(stale, /Combined cgroup memoryUnavailable/);
   assert.match(stale, /Estimated blocksUnavailable/);
-  assert.match(stale, /Both processes need fresh, usable memory readings/);
+  assert.match(stale, /Both cgroups need fresh, usable memory readings/);
   assert.doesNotMatch(stale, roundingNote);
   snapshot.processes.bot.current.stale = false;
   snapshot.processes.bot.current.cpu_tenths = null;
@@ -14562,7 +14562,7 @@ test('Bot Resources shows estimated blocks and costs with an operator separation
   h.app.navigate('resources');
   await settle();
   const panel = h.nodes.get('#content').querySelector('[aria-labelledby="resources-memory-billing"]');
-  assert.match(textOf(panel), /Combined memory110 MiB/);
+  assert.match(textOf(panel), /Combined cgroup memory110 MiB/);
   assert.match(textOf(panel), /2 blocks \(128 MiB\).*18 MiB headroom/);
   assert.match(textOf(panel), /operator’s cgroup separation declaration for memory and CPU/);
   assert.deepEqual([...panel.querySelectorAll('tbody td')].map(textOf), ['$0.000625', '$0.45', '$0.01', '$7.20']);
@@ -14581,7 +14581,7 @@ test('Bot Resources measures disjoint CPU and memory cgroups independently', asy
     await settle();
     const panel = h.nodes.get('#content').querySelector('[aria-labelledby="resources-memory-billing"]');
     assert.deepEqual([...panel.querySelectorAll('tbody th')].map(textOf), [label]);
-    assert.equal(Boolean(panel.querySelector('dt')?.textContent === 'Combined memory'), label === 'Memory blocks');
+    assert.equal(Boolean(panel.querySelector('dt')?.textContent === 'Combined cgroup memory'), label === 'Memory blocks');
   }
 });
 

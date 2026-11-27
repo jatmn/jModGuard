@@ -434,20 +434,22 @@ uses that response until the page is reopened.
 **Bot Resources** is the system status view for the bot and API processes over a
 1-hour, 24-hour, 7-day or 30-day range (`GET` or `POST /api/owner/resources?range=`,
 owner only; others get 401 or 403). Each process has a card with CPU as a share of its
-cgroup quota (with the quota and schedulable CPUs), program memory in MiB against
+cgroup quota (with the quota and schedulable CPUs), cgroup memory in MiB against
 `memory.max` with its source and the range peak, disk (the temporary and file-log
 directories it writes; the container's root filesystem is not measured because its
 totals belong to the host; database size is on Database Usage), and process facts
 (version, commit, uptime, last restart, restarts in the range, pod, region, ready).
-The memory panel shows in-process estimates for capacity and headroom from fresh,
-usable readings in disjoint cgroups. It rounds up to 64 MiB blocks with a
-one-block minimum. The paired-period peak estimate uses only minutes (hours for
-7-day and 30-day ranges) with memory readings from both processes. It takes the
-highest sum of the two processes' separate maxima in any paired period. Those
-maxima can occur at different times, so their sum bounds the sampled combined
-memory within that period. The panel counts paired readings against completed
-minutes or hours with at least one completed minute in the chart window. It
-reports when there are no paired readings. Gaps can hide higher peaks.
+The memory panel estimates capacity and headroom from fresh, usable local readings
+in disjoint cgroups. Each reading covers the whole cgroup, including any other
+processes in it, and subtracts inactive file cache when available. The panel
+rounds up to 64 MiB blocks with a one-block minimum. The paired-period peak
+estimate uses only minutes (hours for 7-day and 30-day ranges) with memory
+readings for both cgroups. It takes the highest sum of their separate maxima
+in any paired period. Those maxima can occur at different times, so their sum
+bounds the sampled combined memory within that period. The panel counts paired
+readings against completed minutes or hours with at least one completed minute
+in the chart window. It reports when there are no paired readings. Gaps can hide
+higher peaks.
 
 The estimates exclude the variable system overhead that Bunny bills. Bunny's
 pricing docs leave open whether hourly billing uses average or peak memory and

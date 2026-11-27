@@ -1383,7 +1383,7 @@ function PlatformAnalytics() {
 // ---------------------------------------------------------------------------
 
 const RESOURCES_HELP = [
-  "CPU and memory come from each process's own container limits (cgroup), never host totals.",
+  "CPU and memory readings and limits come from the cgroups sampled by the bot and API.",
   "The API is sampled every 5 seconds; the bot saves its status and both processes' history once a minute.",
   "1h and 24h use minute rollups kept 48 hours; 7d and 30d use hourly rollups kept 31 days.",
   "Counts are this application's own work. Database rows read and provider billing are not shown because they cannot be read safely.",
@@ -1549,9 +1549,9 @@ function MemoryBillingPanel({ snapshot, nowMs }) {
   const useApiMemory = apiBytes != null && (botBytes == null || readings[1].age_ms <= readings[0].age_ms);
   const memoryRows = combineMemory
     ? [
-      ["Combined memory", formatMemoryMiB(total)],
-      ["Bot memory", formatMemoryMiB(botBytes)],
-      ["API memory", formatMemoryMiB(apiBytes)],
+      ["Combined cgroup memory", formatMemoryMiB(total)],
+      ["Bot cgroup memory", formatMemoryMiB(botBytes)],
+      ["API cgroup memory", formatMemoryMiB(apiBytes)],
       ["Estimated blocks", blockText],
       ["Paired-period peak estimate", peakText],
       ["Paired memory coverage", coverage],
@@ -1572,20 +1572,20 @@ function MemoryBillingPanel({ snapshot, nowMs }) {
   } else if (!combineMemory) {
     blockNote = `Combined memory and block estimates are unavailable because ${overlapReason(memoryRelation)}.`;
   } else if (total == null) {
-    blockNote = "Combined block estimate unavailable. Both processes need fresh, usable memory readings.";
+    blockNote = "Combined block estimate unavailable. Both cgroups need fresh, usable memory readings.";
   }
   const estimateRow = (label, hourly) => h("tr", null,
     h("th", { scope: "row" }, label),
     h("td", null, resourceValue(hostingCost(hourly, 1))),
     h("td", null, resourceValue(hostingCost(hourly, ESTIMATE_HOURS_30_DAYS))),
   );
-  return analyticsPanel("In-process memory block estimate", "resources-memory-billing", h("div", null,
+  return analyticsPanel("Local memory block estimate", "resources-memory-billing", h("div", null,
     h("dl", { className: "du-facts" },
       ...memoryRows.map(([label, value]) => h("div", { key: label }, h("dt", null, label), h("dd", null, resourceValue(value)))),
     ),
     h("p", { className: "an-note muted" }, blockNote),
     combineMemory && peakBlocks && h("p", { className: "an-note muted" },
-      `This peak estimate covers only ${peakPeriod}s with readings from both processes. The sum of their separate maxima is an upper bound on sampled combined memory in each ${peakPeriod} because the processes can peak at different times.`,
+      `This peak estimate covers only ${peakPeriod}s with readings for both cgroups. The sum of their separate maxima is an upper bound on sampled combined memory in each ${peakPeriod} because the cgroups can peak at different times.`,
     ),
     combineMemory && coverage && pairedPeriods > 0 && pairedPeriods < totalPeriods && h("p", { className: "an-note muted" },
       "Periods without both readings can hide higher peaks.",
