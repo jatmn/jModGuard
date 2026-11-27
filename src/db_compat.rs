@@ -1825,11 +1825,6 @@ impl Connection {
     /// writer can invalidate promotion; the capture owner must restart the
     /// entire operation on a proven busy error, never reuse the read results.
     #[track_caller]
-    pub(crate) fn transaction_capture(&self) -> Result<Transaction> {
-        self.transaction_capture_before(None, false)
-    }
-
-    #[track_caller]
     pub(crate) fn transaction_capture_before(
         &self,
         write_deadline: Option<Instant>,
@@ -3981,7 +3976,9 @@ mod tests {
             )
             .unwrap();
         let writer = Connection::open(&path).unwrap();
-        let mut capture = reader.transaction_capture().unwrap();
+        let mut capture = reader
+            .transaction_capture_before(reader.runtime.capture_write_deadline(), false)
+            .unwrap();
         let before: i64 = capture
             .query_row("SELECT value FROM counter", (), |r| Ok(r.get(0)?))
             .unwrap();

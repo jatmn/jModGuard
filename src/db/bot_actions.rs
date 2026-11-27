@@ -446,8 +446,20 @@ pub async fn claim_bot_action(db: &Db, now: i64) -> Result<Option<BotAction>> {
 /// Revalidate a positive scheduler advisory on the primary.
 pub async fn claim_advised_bot_action(db: &Db, now: i64) -> Result<Option<BotAction>> {
     if db.is_remote() && !db.is_read_only() {
+        let write_deadline = db.connections.runtime.capture_write_deadline();
+        #[cfg(test)]
+        let after_due_read = db.after_advised_due_read.lock().unwrap().take();
         let result = db
-            .with_conn(move |conn| claim_advised_bot_action_conn(conn, now, true))
+            .with_conn(move |conn| {
+                claim_advised_bot_action_conn(
+                    conn,
+                    now,
+                    true,
+                    write_deadline,
+                    #[cfg(test)]
+                    after_due_read,
+                )
+            })
             .await;
         match result {
             // A concurrent commit can invalidate a deferred transaction's
@@ -456,17 +468,28 @@ pub async fn claim_advised_bot_action(db: &Db, now: i64) -> Result<Option<BotAct
             result => return result,
         }
     }
-    db.with_conn(move |conn| claim_advised_bot_action_conn(conn, now, false))
-        .await
+    db.with_conn(move |conn| {
+        claim_advised_bot_action_conn(
+            conn,
+            now,
+            false,
+            None,
+            #[cfg(test)]
+            None,
+        )
+    })
+    .await
 }
 
 fn claim_advised_bot_action_conn(
     conn: &Connection,
     now: i64,
     promote: bool,
+    write_deadline: Option<tokio::time::Instant>,
+    #[cfg(test)] after_due_read: Option<super::AfterAdvisedDueRead>,
 ) -> Result<Option<BotAction>> {
     let mut tx = if promote {
-        conn.transaction_capture()?
+        conn.transaction_capture_before(write_deadline, false)?
     } else {
         conn.transaction_primary_snapshot()?
     };
@@ -477,6 +500,10 @@ fn claim_advised_bot_action_conn(
     }
     let tx = if promote {
         // The positive check and the write share one primary transaction.
+        #[cfg(test)]
+        if let Some(hook) = after_due_read {
+            hook();
+        }
         tx.prepare_capture_write()?;
         tx
     } else {
