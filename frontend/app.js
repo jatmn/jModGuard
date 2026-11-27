@@ -1820,6 +1820,7 @@ function BunnyCostHistory({ history }) {
 function BunnyCostPanel({ provider }) {
   const breakdown = provider.magic_breakdown;
   const cpu = provider.magic_cpu_hourly_averages;
+  const cpuSampleTime = formatInstant(Date.parse(cpu?.sampled_at ?? ""));
   let cpuAverage = "Not available";
   if (cpu) {
     cpuAverage = cpu.min === cpu.max ? String(cpu.min) : `${cpu.min}–${cpu.max}`;
@@ -1858,7 +1859,13 @@ function BunnyCostPanel({ provider }) {
     (breakdown || cpu) && h("dl", { className: "du-facts", "aria-label": "Magic Containers month-to-date estimate components" },
       h("div", null, h("dt", null, "CPU cost"), h("dd", null, "Not computed")),
       h("div", null, h("dt", null, "CPU raw hourly average per pod (unit unverified)"),
-        h("dd", { title: cpu && formatInstant(Date.parse(cpu.sampled_at)) }, cpuAverage)),
+        h("dd", null, cpuAverage,
+          cpu && h("span", { className: "muted" }, " · ",
+            cpuSampleTime ? "Sampled " : "Sample time unavailable",
+            cpuSampleTime && h("time", { dateTime: cpu.sampled_at }, cpuSampleTime),
+          ),
+        ),
+      ),
       ...(breakdown ? [["RAM", "ram"], ["Egress", "egress"], ["Volumes", "volume"]] : []).map(([label, key]) =>
         h("div", { key }, h("dt", null, label), h("dd", null, key === "egress" && breakdown[key] == null ? "Unknown regional rate" : bunnyUsd(breakdown[key]))),
       ),
