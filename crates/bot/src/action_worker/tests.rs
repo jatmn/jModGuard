@@ -2059,6 +2059,62 @@ async fn scheduler_combines_idle_checks_and_runs_actions_before_expiries() {
 }
 
 #[tokio::test]
+async fn scheduler_checks_ban_expiry_after_an_advised_claim_timeout() {
+    const GUILD: i64 = 10;
+    const EXPIRY_USER: i64 = 21;
+
+    for error in [
+        db::test_database_operation_timeout_error(),
+        anyhow::anyhow!("TRANSACTION_TIMEOUT"),
+    ] {
+        let f = Fixture::new();
+        let app = crate::state::BotState::new(Default::default(), f.db.clone()).unwrap();
+        app.activation.mark_lock_held(true);
+        let action = f.enqueue(GUILD, "queued", unban(20)).await;
+        let enrollment = db::enroll_guild(&f.db, GUILD, 1).await.unwrap().unwrap();
+        db::record_ban(&f.db, GUILD, EXPIRY_USER, None, "temporary")
+            .await
+            .unwrap();
+        arm_expiry(&f.db, enrollment, EXPIRY_USER, f.request_time - 1)
+            .await
+            .unwrap();
+        let discord = MockDiscord::default();
+
+        drain_actions_then_expire_bans(&app, &discord, &WorkerLimits::default(), Some(Err(error)))
+            .await
+            .unwrap();
+
+        assert_eq!(f.persisted_status(&action).await, ("pending".into(), None));
+        assert_eq!(
+            *discord.unbans.lock().unwrap(),
+            [(GUILD, EXPIRY_USER, "Ban duration expired".into())]
+        );
+        assert!(
+            db::active_ban_row(&f.db, GUILD, EXPIRY_USER)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+}
+
+#[tokio::test]
+async fn scheduler_preserves_an_indeterminate_advised_claim_timeout() {
+    let f = Fixture::new();
+    let app = crate::state::BotState::new(Default::default(), f.db.clone()).unwrap();
+    let error = db::test_database_commit_indeterminate_error().context("TRANSACTION_TIMEOUT");
+    let result = drain_actions_then_expire_bans(
+        &app,
+        &MockDiscord::default(),
+        &WorkerLimits::default(),
+        Some(Err(error)),
+    )
+    .await
+    .expect_err("indeterminate commits must be reported");
+    assert!(db::is_database_commit_indeterminate(&result));
+}
+
+#[tokio::test]
 async fn stale_action_advisory_opens_no_primary_write_transaction() {
     const GUILD: i64 = 10;
 

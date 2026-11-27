@@ -55,6 +55,7 @@ struct HranaState {
     backing: Option<(DbRuntime, libsql::Connection)>,
     provider: Option<Arc<ProviderModel>>,
     before_next_receipt: Option<Box<dyn FnOnce() + Send>>,
+    client_delays: Option<ClientDelays>,
     requests: usize,
     statements: Vec<String>,
 }
@@ -99,10 +100,16 @@ impl HranaState {
             backing: None,
             provider: None,
             before_next_receipt: None,
+            client_delays: None,
             requests: 0,
             statements: Vec::new(),
         }
     }
+}
+
+struct ClientDelays {
+    clock: Arc<crate::db_compat::ManualClock>,
+    requests: Vec<(&'static str, Duration)>,
 }
 
 // A scaled provider: one core writer, per-request latency, and an interactive
@@ -182,6 +189,24 @@ async fn provider_response(
         vec![input.clone()]
     };
     let first_sql = requests.first().map(statement_sql).unwrap_or_default();
+    if let Some(delays) = &mut state.lock().unwrap().client_delays {
+        let first = &requests[0];
+        let sql = first["sql"]
+            .as_str()
+            .unwrap_or(&first_sql)
+            .to_ascii_uppercase();
+        if let Some(index) = delays
+            .requests
+            .iter()
+            .position(|(prefix, _)| sql.starts_with(prefix))
+        {
+            let (_, delay) = delays.requests.remove(index);
+            delays.clock.advance(delay);
+            if let ProviderClock::Modeled(elapsed) = &model.clock {
+                *elapsed.lock().unwrap() += delay;
+            }
+        }
+    }
     if first_sql.starts_with("INSERT INTO MUTATION_RECEIPTS") {
         let before_receipt = state.lock().unwrap().before_next_receipt.take();
         if let Some(write) = before_receipt {
@@ -1437,6 +1462,61 @@ async fn advised_bot_action_claim_revalidates_after_busy_promotion() {
         drop(local);
         super::cleanup_db(&path);
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn slow_advised_due_check_leaves_time_to_prepare_the_claim() {
+    let path = super::tmp_db_path("remote_slow_action_due");
+    let local = Db::open(&path, 2).unwrap();
+    enroll_guild(&local, 10, 1).await.unwrap();
+    let action = enqueue_test_action(&local, 100, 20).await;
+    let (fixture, _) = HranaFixture::modeled_latency_database(
+        &path,
+        Duration::ZERO,
+        Duration::from_secs(5),
+        Arc::default(),
+    )
+    .await;
+    let remote = fixture.db_with_operation_timeout(Duration::from_secs(10));
+    let clock = install_clock(&remote);
+    fixture.state.lock().unwrap().client_delays = Some(ClientDelays {
+        clock,
+        requests: vec![
+            (
+                "SELECT EXISTS(SELECT 1 FROM BOT_ACTIONS",
+                Duration::from_millis(3700),
+            ),
+            (
+                "SELECT * FROM PRAGMA_PAGE_COUNT()",
+                Duration::from_millis(600),
+            ),
+        ],
+    });
+
+    let claim = claim_advised_bot_action(&remote, 100)
+        .await
+        .expect("receipt preparation must have the ordinary claim deadline")
+        .expect("the due action must be claimed");
+    assert_eq!(claim.id, action.id);
+    assert_eq!(fixture.read_begins(), 1);
+    assert_eq!(fixture.immediate_begins(), 0);
+    fixture.assert_committed_within_lifetime(1);
+    assert!(
+        fixture
+            .state
+            .lock()
+            .unwrap()
+            .client_delays
+            .as_ref()
+            .unwrap()
+            .requests
+            .is_empty()
+    );
+
+    drop(remote);
+    drop(fixture);
+    drop(local);
+    super::cleanup_db(&path);
 }
 
 fn read_one(conn: &mut Connection) -> Result<i64> {
@@ -3775,11 +3855,12 @@ async fn snapshot_rollback_after_expired_budget_uses_the_short_release() {
     fixture.hang_rollback();
     let first_connection = Arc::new(std::sync::Mutex::new(0usize));
     let record_connection = Arc::clone(&first_connection);
+    let snapshot_clock = Arc::clone(&clock);
     let call = spawn_write(db.clone(), move |conn| {
         *record_connection.lock().unwrap() = conn.pool_identity();
         let tx = conn.transaction_primary_snapshot()?;
         tx.query_row("SELECT 1", (), |_| Ok(()))?;
-        std::thread::sleep(crate::db_compat::INTERACTIVE_READ_BUDGET + Duration::from_millis(200));
+        snapshot_clock.advance(crate::db_compat::INTERACTIVE_READ_BUDGET);
         tx.finish_read()
     });
     tokio::time::timeout(
