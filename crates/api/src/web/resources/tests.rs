@@ -342,6 +342,146 @@ async fn saved_bot_history_and_status_reach_the_owner_response() {
         value["cgroup_relation"],
         json!({"memory": "unknown", "cpu": "unknown"})
     );
+    assert_eq!(
+        value["combined_memory_peak"],
+        json!({"peak_bytes": 2300 + 2050, "periods": 1, "total_periods": 59}),
+        "only the minute both processes recorded"
+    );
+}
+
+async fn paired_peak_at(f: &Fixture, range: ResourceRange, now_secs: i64) -> Value {
+    let (prepared, status) = history(&f.app, range, now_secs).await;
+    assert_eq!(status, "available");
+    response_json(build_response(
+        range,
+        now_secs * 1000,
+        prepared.as_deref(),
+        status,
+        &ProcessStatus::default(),
+        &HostingEstimateConfig::default(),
+    ))
+    .await["combined_memory_peak"]
+        .clone()
+}
+
+#[tokio::test]
+async fn paired_minute_coverage_excludes_open_and_future_minutes() {
+    let f = fixture();
+    let now = 1_800_000_000;
+    let rows = [
+        (now - 60, 100),
+        (now + 60, 200),
+        (now + 120, 300),
+        (now + 180, 400),
+    ]
+    .into_iter()
+    .flat_map(|(start, cpu)| {
+        [ResourceProcess::Bot, ResourceProcess::Api]
+            .map(|process| (process, minute(start, cpu, 0, 1)))
+    })
+    .collect();
+    // The store can accept a minute from a writer whose clock is ahead.
+    db::record_resource_rollups(&f.app.db, rows, None, now + 150)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        paired_peak_at(&f, ResourceRange::Day, now + 150).await,
+        json!({"peak_bytes": 4400, "periods": 2, "total_periods": 1432})
+    );
+    // Eligibility advances inside the same ten-minute chart bucket.
+    assert_eq!(
+        paired_peak_at(&f, ResourceRange::Day, now + 180).await,
+        json!({"peak_bytes": 4600, "periods": 3, "total_periods": 1433})
+    );
+}
+
+#[tokio::test]
+async fn failed_refresh_keeps_complete_paired_coverage_from_the_cached_snapshot() {
+    let f = fixture();
+    let range = ResourceRange::Day;
+    let now = 1_800_000_150;
+    let window = range.window(now);
+    let rows: Vec<_> = (window.from_secs..window.eligible_to_secs)
+        .step_by(60)
+        .map(|start| minute(start, 100, 0, 1))
+        .collect();
+    let records = ResourceRecords {
+        bot: rows.clone(),
+        api: rows,
+        ..ResourceRecords::default()
+    };
+    let snapshot = Arc::new(PreparedHistory::new(records, &window).unwrap());
+    assert_eq!(history(&f.app, range, now).await.1, "available");
+    f.app
+        .resource_cache
+        .entries
+        .lock()
+        .await
+        .get_mut(&range)
+        .unwrap()
+        .prepared = Some(snapshot.clone());
+    let complete = json!({"peak_bytes": 4200, "periods": 1432, "total_periods": 1432});
+    assert_eq!(paired_peak_at(&f, range, now).await, complete);
+
+    f.app
+        .db
+        .with_conn(|conn| {
+            conn.execute_batch_bounded(
+                "ALTER TABLE resource_rollups RENAME TO offline_rollups",
+                64 * 1024 * 1024,
+            )
+        })
+        .await
+        .unwrap();
+
+    // A request can arrive at the cache after a later eligibility cutoff
+    // was already attempted. Reuse depends on the successful snapshot.
+    for request_secs in [now + 30, now + 90, now + 30] {
+        let (prepared, status) = history(&f.app, range, request_secs).await;
+        let prepared = prepared.unwrap();
+        assert!(Arc::ptr_eq(&snapshot, &prepared));
+        let value = response_json(build_response(
+            range,
+            request_secs * 1000,
+            Some(&prepared),
+            status,
+            &ProcessStatus::default(),
+            &HostingEstimateConfig::default(),
+        ))
+        .await;
+        assert_eq!(value["history_status"], "stale");
+        assert_eq!(value["generated_at_ms"], request_secs * 1000);
+        assert_eq!(value["combined_memory_peak"], complete);
+    }
+}
+
+#[tokio::test]
+async fn paired_hour_coverage_includes_the_open_hour_after_its_first_minute() {
+    let f = fixture();
+    let now = 1_800_000_000;
+    let record_pair = async |start, cpu| {
+        let rows = [ResourceProcess::Bot, ResourceProcess::Api]
+            .map(|process| (process, minute(start, cpu, 0, 1)));
+        db::record_resource_rollups(&f.app.db, rows.into(), None, start + MINUTE_SECS)
+            .await
+            .unwrap();
+    };
+    record_pair(now - MINUTE_SECS, 100).await;
+    let ranges = [(ResourceRange::Week, 167), (ResourceRange::Month, 716)];
+    for (range, closed_hours) in ranges {
+        assert_eq!(
+            paired_peak_at(&f, range, now + 59).await,
+            json!({"peak_bytes": 4200, "periods": 1, "total_periods": closed_hours})
+        );
+    }
+    record_pair(now, 200).await;
+    for (range, closed_hours) in ranges {
+        assert_eq!(
+            paired_peak_at(&f, range, now + 60).await,
+            json!({"peak_bytes": 4400, "periods": 2, "total_periods": closed_hours + 1})
+        );
+    }
 }
 
 #[test]
