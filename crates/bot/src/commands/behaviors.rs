@@ -1726,7 +1726,6 @@ async fn run_rule(env: &CmdEnv<'_>, default_action: &str) -> Result<BehaviorOutc
     let mut args = env.args.clone();
     let (action, rule_id) = rule_action_and_id(&mut args, default_action);
     let vars = std::collections::BTreeMap::new();
-    let guild = env.guild_id.get() as i64;
     match action.as_str() {
         LIST => {
             let cfg = env.app.configs.get(&env.app.db, env.guild_id.get()).await?;
@@ -1768,7 +1767,7 @@ async fn run_rule(env: &CmdEnv<'_>, default_action: &str) -> Result<BehaviorOutc
             })?;
             let mut rule = previous.clone();
             rule.enabled = !rule.enabled;
-            save_command_rule(&env.app.db, guild, &rule_id, previous, &rule).await?;
+            save_command_rule(env, &rule_id, previous, &rule).await?;
             env.app.invalidate_configs();
             Ok(BehaviorOutcome {
                 response: Some(format!(
@@ -1801,7 +1800,7 @@ async fn run_rule(env: &CmdEnv<'_>, default_action: &str) -> Result<BehaviorOutc
             })?;
             let mut rule = previous.clone();
             set_rule_dry_run(&rule_id, &mut rule, on)?;
-            save_command_rule(&env.app.db, guild, &rule_id, previous, &rule).await?;
+            save_command_rule(env, &rule_id, previous, &rule).await?;
             env.app.invalidate_configs();
             Ok(BehaviorOutcome {
                 response: Some(format!("Rule `{rule_id}` dry-run is now {on}.")),
@@ -1816,13 +1815,46 @@ async fn run_rule(env: &CmdEnv<'_>, default_action: &str) -> Result<BehaviorOutc
 }
 
 async fn save_command_rule(
-    db: &db::Db,
-    guild: i64,
+    env: &CmdEnv<'_>,
     id: &str,
     previous: &crate::types::RuleDef,
     rule: &crate::types::RuleDef,
 ) -> Result<()> {
+    let guild = env.guild_id.get() as i64;
+    let db = &env.app.db;
     if id == jmodguard::onboarding_trap::RULE_ID {
+        if jmodguard::onboarding_trap::role_removal_requires_manage(
+            env.guild_id.get(),
+            previous,
+            rule,
+        ) {
+            // The invocation member has the caller's roles even when the
+            // cached member still lists a revoked role.
+            let cached = env
+                .ctx
+                .cache
+                .guild(env.guild_id)
+                .map(|guild| (guild.owner_id, guild.member_permissions(&env.actor_member)));
+            let (owner, permissions) = match cached {
+                Some(actor) => actor,
+                None => {
+                    let guild = env.ctx.http.get_guild(env.guild_id).await?;
+                    (guild.owner_id, guild.member_permissions(&env.actor_member))
+                }
+            };
+            db::decide_control_actor(
+                db::ControlActorNeed::ManageGuild(guild),
+                i64::try_from(env.actor.get())?,
+                env.app.cfg.bot.owner_id,
+                Some(db::CachedGuildActor {
+                    guild_owner_id: i64::try_from(owner.get())?,
+                    permissions: permissions.bits(),
+                }),
+            )
+            .map_err(|_| {
+                anyhow!("You need Manage Server to change or activate onboarding role removal")
+            })?;
+        }
         db::compare_and_set_onboarding_trap(db, guild, None, previous, rule).await?;
     } else {
         db::upsert_rule(db, guild, id, rule).await?;
@@ -2588,6 +2620,104 @@ mod tests {
             ("dryrun".into(), "repeat_text".into())
         );
         assert_eq!(slash.next_arg().as_deref(), Some("off"));
+    }
+
+    #[tokio::test]
+    async fn onboarding_rule_command_requires_manage_server_to_activate_role_removal() {
+        use serenity::all::{
+            Guild, GuildCreateEvent, GuildId, Member, Permissions, Role, RoleId, UserId,
+        };
+        use std::sync::Arc;
+
+        let guild_id = GuildId::new(10);
+        let actor = UserId::new(7);
+        let mut guild = Guild::default();
+        guild.id = guild_id;
+        guild.owner_id = UserId::new(1);
+        let mut everyone = Role::default();
+        everyone.id = RoleId::new(guild_id.get());
+        guild.roles.insert(everyone.id, everyone);
+        let mut manager = Role::default();
+        manager.id = RoleId::new(30);
+        manager.permissions = Permissions::MANAGE_GUILD;
+        let mut member = Member::default();
+        member.guild_id = guild_id;
+        member.user.id = actor;
+        let mut manager_member = member.clone();
+        manager_member.roles.push(manager.id);
+        guild.roles.insert(manager.id, manager);
+        // A role revoked before the invocation may still be on the cached member.
+        guild.members.insert(actor, manager_member.clone());
+        let cache = Arc::new(serenity::cache::Cache::new());
+        cache.update(
+            &mut serde_json::from_value::<GuildCreateEvent>(serde_json::to_value(guild).unwrap())
+                .unwrap(),
+        );
+        let ctx = mod_reason_dm::fixture_context_for_dm_order_test(
+            Arc::new(serenity::http::Http::new("fixture")),
+            cache,
+        )
+        .await;
+        let path = std::env::temp_dir().join(format!(
+            "onboarding_command_{:032x}.db",
+            rand::random::<u128>()
+        ));
+        let app = Arc::new(
+            crate::state::BotState::new(Default::default(), db::Db::open(&path, 2).unwrap())
+                .unwrap(),
+        );
+        let command = crate::defaults::default_commands()
+            .into_iter()
+            .find(|command| matches!(command.behavior, Behavior::Rule { .. }))
+            .unwrap();
+        let id = jmodguard::onboarding_trap::RULE_ID;
+        for (enabled, dry_run, args) in [
+            (false, false, format!("toggle {id}")),
+            (true, true, format!("{id} dryrun off")),
+        ] {
+            let mut previous = db::get_rule(&app.db, 0, id).await.unwrap().unwrap();
+            previous.enabled = enabled;
+            previous.dry_run = dry_run;
+            previous.params["role_id"] = serde_json::json!("20");
+            previous.params["remove_role_ids"] = serde_json::json!(["22"]);
+            db::upsert_rule(&app.db, 10, id, &previous).await.unwrap();
+            app.invalidate_configs();
+            let version = db::get_config_version(&app.db).await.unwrap();
+            let mut env = CmdEnv::new(
+                &app,
+                &ctx,
+                &command,
+                guild_id,
+                ChannelId::new(2),
+                actor,
+                member.clone(),
+                Args::new(&args),
+                false,
+                None,
+            );
+            let denial = run_rule(&env, "list")
+                .await
+                .err()
+                .map(|error| error.to_string());
+            assert_eq!(
+                denial.as_deref(),
+                Some("You need Manage Server to change or activate onboarding role removal"),
+                "{args}"
+            );
+            assert_eq!(
+                db::get_rule(&app.db, 10, id).await.unwrap(),
+                Some(previous.clone())
+            );
+            assert_eq!(db::get_config_version(&app.db).await.unwrap(), version);
+
+            env.actor_member = manager_member.clone();
+            run_rule(&env, "list").await.unwrap();
+            previous.enabled = true;
+            previous.dry_run = false;
+            assert_eq!(db::get_rule(&app.db, 10, id).await.unwrap(), Some(previous));
+        }
+        drop(app);
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]
