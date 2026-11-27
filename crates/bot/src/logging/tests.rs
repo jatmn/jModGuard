@@ -2483,6 +2483,70 @@ async fn member_reports_render_audit_context_and_apply_actor_filters() {
 }
 
 #[tokio::test]
+async fn gateway_ban_persists_ownership_before_first_audit_request() {
+    use serenity::client::EventHandler;
+
+    let f = Fixture::with_timeout(6);
+    f.app.activation.note_discord_connected();
+    let enrollment = db::enroll_guild(&f.app.db, 789, 100)
+        .await
+        .unwrap()
+        .unwrap();
+    let guild = GuildId::new(789);
+    let mut user = serenity::model::user::User::default();
+    user.id = serenity::model::id::UserId::new(123);
+    user.name = "member".into();
+    let (http, mut requests, server) = held_audit_proxy().await;
+    let ctx = crate::commands::mod_reason_dm::fixture_context_for_dm_order_test(
+        Arc::new(http),
+        Arc::new(serenity::cache::Cache::new()),
+    )
+    .await;
+    let handler = crate::handlers::Handler {
+        app: Arc::clone(&f.app),
+    };
+    let mut ban = std::pin::pin!(handler.guild_ban_addition(ctx, guild, user));
+    let (uri, reply) = tokio::select! {
+        request = tokio::time::timeout(Duration::from_secs(10), requests.recv()) => {
+            request.expect("gateway ban must reach audit lookup").unwrap()
+        }
+        _ = &mut ban => panic!("gateway ban finished before requesting audit context"),
+    };
+    let action = member_audit_action("member_ban").unwrap();
+    assert_audit_request(&uri, guild, action);
+    let observed_ms = f
+        .app
+        .db
+        .with_conn(|conn| {
+            conn.query_row(
+                "SELECT observed_at_ms FROM gateway_ban_deliveries
+                 WHERE guild_id = 789 AND user_id = 123 AND kind = 'ban' AND applied = 1",
+                (),
+                |row| Ok(row.get(0)?),
+            )
+        })
+        .await
+        .expect("the first audit request must follow the durable ban write");
+    let rows = db::list_enrolled_bans(&f.app.db, enrollment.clone(), 10)
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert!(rows[0].active);
+    assert_eq!(rows[0].moderator_id, None);
+    reply
+        .send(audit_fixture(action, 123, observed_ms, Some("spam")))
+        .unwrap();
+
+    ban.await;
+    server.abort();
+    let rows = db::list_enrolled_bans(&f.app.db, enrollment, 10)
+        .await
+        .unwrap();
+    assert_eq!(rows[0].moderator_id, Some(777));
+    assert_eq!(rows[0].reason.as_deref(), Some("spam"));
+}
+
+#[tokio::test]
 async fn gateway_ban_skips_eager_reads_when_ambiguity_covers_the_whole_window() {
     for reports in [false, true] {
         check_gateway_ban_audit_sequence(reports, false, 0).await;
@@ -2502,7 +2566,7 @@ async fn gateway_ban_keeps_claims_and_both_retry_windows_for_eligible_entries() 
 }
 
 async fn check_gateway_ban_audit_sequence(reports: bool, owned_by_bot: bool, first_match: usize) {
-    use crate::handlers::finish_gateway_ban;
+    use crate::handlers::{finish_gateway_ban, gateway_ban_audit_permit};
     use serenity::model::id::UserId;
     use serenity::model::user::User;
 
@@ -2525,6 +2589,26 @@ async fn check_gateway_ban_audit_sequence(reports: bool, owned_by_bot: bool, fir
     f.app.configs.get(&f.app.db, guild.get()).await.unwrap();
     let observed_ms = 1_790_086_832_000;
     let at = |ms| chrono::DateTime::from_timestamp_millis(ms).unwrap();
+    let finish = async |sink: &RepeatedAuditSink, ms, observation, write| {
+        let mut extra = if let Some(_permit) = gateway_ban_audit_permit(&f.app, &observation) {
+            lookup_member_audit(&f.app, sink, guild, &observation)
+                .await
+                .unwrap_or_default()
+        } else {
+            BTreeMap::new()
+        };
+        extra.insert("time".into(), at(ms).to_rfc3339());
+        finish_gateway_ban(
+            &f.app,
+            sink,
+            guild,
+            &user,
+            extra,
+            Some(observation),
+            Some((enrollment.clone(), write)),
+        )
+        .await;
+    };
     let action = member_audit_action("member_ban").unwrap();
     let claims = &f.app.member_audits;
     let record = |ms, bot, already_banned| {
@@ -2592,16 +2676,7 @@ async fn check_gateway_ban_audit_sequence(reports: bool, owned_by_bot: bool, fir
         sends: Default::default(),
     };
     tokio::time::pause();
-    finish_gateway_ban(
-        &f.app,
-        &first_sink,
-        guild,
-        &user,
-        at(observed_ms),
-        Some(first),
-        Some((enrollment.clone(), first_write)),
-    )
-    .await;
+    finish(&first_sink, observed_ms, first, first_write).await;
     tokio::time::resume();
     assert_eq!(
         first_sink.reads.load(std::sync::atomic::Ordering::Relaxed),
@@ -2651,16 +2726,7 @@ async fn check_gateway_ban_audit_sequence(reports: bool, owned_by_bot: bool, fir
         sends: Default::default(),
     };
     tokio::time::pause();
-    finish_gateway_ban(
-        &f.app,
-        &reban_sink,
-        guild,
-        &user,
-        at(rebanned_ms),
-        Some(rebanned),
-        Some((enrollment.clone(), reban_write)),
-    )
-    .await;
+    finish(&reban_sink, rebanned_ms, rebanned, reban_write).await;
     tokio::time::resume();
     assert_eq!(
         reban_sink.reads.load(std::sync::atomic::Ordering::Relaxed),

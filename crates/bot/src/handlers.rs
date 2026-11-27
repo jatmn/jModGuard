@@ -351,52 +351,49 @@ fn gateway_ban_row_to_attribute(write: db::GatewayBanWrite) -> Option<i64> {
     }
 }
 
-// Apply display attribution after the gateway's durable write settles.
+pub(crate) fn gateway_ban_audit_permit<'a>(
+    app: &'a BotState,
+    observation: &logging::MemberAuditObservation,
+) -> Option<tokio::sync::SemaphorePermit<'a>> {
+    // Even without a writable row or report, a successful claim can disambiguate
+    // the next ban. Skip eager reads only when the inherited cutoff excludes
+    // every candidate, leaving this observation unresolved for later bans.
+    if app.member_audits.window_is_fenced(observation) {
+        return None;
+    }
+    app.log_delivery_slots.try_acquire().ok()
+}
+
+// Apply display attribution and emit the report after the eager lookup.
 pub(crate) async fn finish_gateway_ban(
     app: &Arc<BotState>,
     sink: &impl logging::LogDelivery,
     guild_id: GuildId,
     banned_user: &User,
-    observed: chrono::DateTime<chrono::Utc>,
+    extra: BTreeMap<String, String>,
     observation: Option<logging::MemberAuditObservation>,
     write: Option<(db::GuildEnrollment, db::GatewayBanWrite)>,
 ) {
     let ban_row = write.and_then(|(enrollment, write)| {
         gateway_ban_row_to_attribute(write).map(|row_id| (enrollment, row_id))
     });
-    // Even without a writable row or report, a successful claim can disambiguate
-    // the next ban. Skip eager reads only when the inherited cutoff excludes
-    // every candidate, leaving this observation unresolved for later bans.
-    let audit = if let Some(observation) = observation.as_ref()
-        && !app.member_audits.window_is_fenced(observation)
-        && let Ok(_permit) = app.log_delivery_slots.try_acquire()
+    if let Some((enrollment, row_id)) = ban_row.as_ref()
+        && let Some(moderator_id) = extra.get("actor_id").and_then(|id| id.parse::<i64>().ok())
     {
-        logging::lookup_member_audit(app, sink, guild_id, observation).await
-    } else {
-        None
-    };
-    if let (Some((enrollment, row_id)), Some(context)) = (ban_row.as_ref(), audit.as_ref()) {
-        let moderator_id = context
-            .get("actor_id")
-            .and_then(|id| id.parse::<i64>().ok());
-        if let Some(moderator_id) = moderator_id {
-            let _ = db::attribute_enrolled_ban(
-                &app.db,
-                Some(enrollment.clone()),
-                *row_id,
-                banned_user.id.get() as i64,
-                moderator_id,
-                context.get("actor_name").map(String::as_str),
-                context
-                    .get("reason")
-                    .map(String::as_str)
-                    .unwrap_or("No reason provided"),
-            )
-            .await;
-        }
+        let _ = db::attribute_enrolled_ban(
+            &app.db,
+            Some(enrollment.clone()),
+            *row_id,
+            banned_user.id.get() as i64,
+            moderator_id,
+            extra.get("actor_name").map(String::as_str),
+            extra
+                .get("reason")
+                .map(String::as_str)
+                .unwrap_or("No reason provided"),
+        )
+        .await;
     }
-    let mut extra = audit.unwrap_or_default();
-    extra.insert("time".into(), observed.to_rfc3339());
     let (_, late_audit) = logging::emit_member_event_to(
         app,
         sink,
@@ -1126,12 +1123,22 @@ impl EventHandler for Handler {
                 None
             }
         };
+        let mut extra = if let Some(observation) = observation.as_ref()
+            && let Some(_permit) = gateway_ban_audit_permit(&app, observation)
+        {
+            logging::lookup_member_audit(&app, ctx.http.as_ref(), guild_id, observation)
+                .await
+                .unwrap_or_default()
+        } else {
+            BTreeMap::new()
+        };
+        extra.insert("time".into(), observed.to_rfc3339());
         finish_gateway_ban(
             &app,
             ctx.http.as_ref(),
             guild_id,
             &banned_user,
-            observed,
+            extra,
             observation,
             write,
         )
