@@ -1616,7 +1616,9 @@ async fn drain_inner(
                     && (db::is_database_operation_timeout(&error)
                         || db::is_remote_interactive_timeout(&error)) =>
             {
-                tracing::warn!(%error, "advised bot action claim timed out; deferring queue work");
+                if !db::is_primary_outage(&error) {
+                    tracing::warn!(%error, "advised bot action claim timed out; deferring queue work");
+                }
                 break;
             }
             Some(claim) => claim?,
