@@ -601,6 +601,8 @@ impl HranaFixture {
             before_final_lease_reread: Arc::new(Mutex::new(None)),
             #[cfg(test)]
             during_leased_guild_commit: Arc::new(Mutex::new(None)),
+            #[cfg(test)]
+            after_advised_due_read: Arc::new(Mutex::new(None)),
             #[cfg(debug_assertions)]
             test_config_snapshot: Arc::new(Mutex::new(None)),
         }
@@ -1615,6 +1617,107 @@ async fn expired_capture_cannot_prepare_growth_or_reclaim_receipts() {
     assert_eq!(fixture.read_begins(), 2);
     assert_eq!(fixture.immediate_begins(), 0);
     assert_eq!(fixture.rollback_requests(), 2);
+}
+
+async fn advised_claim_after_due_read(promotion_time: Duration, succeeds: bool) {
+    let path = super::tmp_db_path("remote_action_claim_promotion_deadline");
+    let local = Db::open(&path, 2).unwrap();
+    enroll_guild(&local, 10, 1).await.unwrap();
+    let action = enqueue_test_action(&local, 100, 20).await;
+    let (fixture, _) = HranaFixture::modeled_latency_database(
+        &path,
+        Duration::ZERO,
+        Duration::from_secs(10),
+        Arc::default(),
+    )
+    .await;
+    let remote = fixture.db_with_operation_timeout(Duration::from_secs(5));
+    let clock = install_clock(&remote);
+    let attempts = if succeeds { 1 } else { 2 };
+    for _ in 0..attempts {
+        let clock = Arc::clone(&clock);
+        *remote.after_advised_due_read.lock().unwrap() = Some(Box::new(move || {
+            // Advance only once the real due read has succeeded.
+            clock.advance(promotion_time);
+        }));
+
+        let result = claim_advised_bot_action(&remote, 100).await;
+        let stored = bot_action(&local, 10, &action.id).await.unwrap().unwrap();
+        if succeeds {
+            let claimed = result.unwrap().unwrap();
+            assert_eq!(claimed.id, action.id);
+            assert_eq!(stored.state, "claimed");
+            assert!(stored.claim.is_some());
+            assert_eq!(stored.claim, claimed.claim);
+        } else {
+            let error = result.expect_err("promotion must respect the original write deadline");
+            assert!(is_database_operation_timeout(&error), "{error:#}");
+            assert!(
+                error.to_string().contains("promote capture transaction"),
+                "{error:#}"
+            );
+            assert_eq!(stored.state, "pending");
+            assert_eq!(stored.claim, None);
+        }
+    }
+    assert_eq!(fixture.read_begins(), attempts);
+    assert_eq!(fixture.immediate_begins(), 0);
+    fixture.assert_committed_within_lifetime(usize::from(succeeds));
+    let receipts = local
+        .with_conn(|conn| {
+            conn.query_row("SELECT count(*) FROM mutation_receipts", (), |row| {
+                Ok(row.get::<i64>(0)?)
+            })
+        })
+        .await
+        .unwrap();
+    assert_eq!(receipts, i64::from(succeeds));
+    if !succeeds {
+        read_primary_fixture(&remote)
+            .await
+            .expect("local promotion timeouts must leave the primary pool available");
+    }
+
+    drop(remote);
+    drop(fixture);
+    drop(local);
+    super::cleanup_db(&path);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn advised_claim_promotes_after_the_interactive_deadline() {
+    advised_claim_after_due_read(
+        crate::db_compat::INTERACTIVE_READ_BUDGET + Duration::from_millis(500),
+        true,
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn advised_claim_aborts_promotion_after_the_write_deadline() {
+    advised_claim_after_due_read(Duration::from_millis(5500), false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn advised_claim_expiry_before_begin_leaves_primary_pool_available() {
+    let fixture = HranaFixture::start().await;
+    let write_limit = Duration::from_secs(5);
+    let remote = fixture.db_with_operation_timeout(write_limit);
+    let clock = install_clock(&remote);
+
+    for _ in 0..2 {
+        clock.advance_at_operation("begin capture transaction", write_limit);
+        let error = claim_advised_bot_action(&remote, 100).await.unwrap_err();
+        assert!(is_database_operation_timeout(&error), "{error:#}");
+        assert!(
+            error.to_string().contains("begin capture transaction"),
+            "{error:#}"
+        );
+    }
+    assert!(fixture.begin_sql().is_empty(), "expired claims sent BEGIN");
+    read_primary_fixture(&remote)
+        .await
+        .expect("local pre-BEGIN timeouts must leave the primary pool available");
 }
 
 fn read_one(conn: &mut Connection) -> Result<i64> {
