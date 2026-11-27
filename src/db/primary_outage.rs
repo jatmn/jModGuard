@@ -48,13 +48,27 @@ struct Failures {
 }
 
 impl PrimaryOutageGate {
+    #[cfg(test)]
+    pub(super) fn failure_count(&self) -> u64 {
+        self.0.lock().failures.as_ref().map_or(0, |f| f.count)
+    }
+
+    #[cfg(test)]
+    pub(super) fn elapse_probe_cooldown(&self) {
+        let mut state = self.0.lock();
+        state.retry_at = Some(state.retry_at.unwrap() - PROBE_INTERVAL);
+    }
+
     pub(super) fn admit(&self) -> Result<Admission<'_>> {
         let mut state = self.0.lock();
         match state.retry_at {
             None => Ok(Admission::Work(state.generation)),
             Some(retry_at) if !state.probing && Instant::now() >= retry_at => {
                 state.probing = true;
-                Ok(Admission::Probe(Probe { gate: self }))
+                Ok(Admission::Probe(Probe {
+                    gate: self,
+                    extend_cooldown: true,
+                }))
             }
             Some(_) => Err(PrimaryBackoff.into()),
         }
@@ -136,9 +150,15 @@ pub(super) enum Admission<'a> {
 
 pub(super) struct Probe<'a> {
     gate: &'a PrimaryOutageGate,
+    extend_cooldown: bool,
 }
 
 impl Probe<'_> {
+    /// Return the reservation at its current retry time when no probe ran.
+    pub(super) fn release_without_attempt(mut self) {
+        self.extend_cooldown = false;
+    }
+
     pub(super) fn finish(self, result: Result<()>) -> Result<u64> {
         let mut state = self.gate.0.lock();
         if let Err(error) = result {
@@ -167,7 +187,7 @@ impl Drop for Probe<'_> {
     fn drop(&mut self) {
         let mut state = self.gate.0.lock();
         state.probing = false;
-        if state.retry_at.is_some() {
+        if self.extend_cooldown && state.retry_at.is_some() {
             state.retry_at = Some(Instant::now() + PROBE_INTERVAL);
         }
     }

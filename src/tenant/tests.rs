@@ -265,9 +265,16 @@ async fn erasure_clears_owned_rows_without_backup_jobs() {
         .unwrap();
     db::retire_guild_enrollment(&f.db, 10, 100).await.unwrap();
     f.tenant.schedule_erasure(enrollment.clone()).await.unwrap();
+    let config_version = db::get_config_version(&f.db).await.unwrap();
     assert!(f.tenant.drive_erasure().await.unwrap());
+    assert!(!db::guild_erasure_queued(&f.db, 10).await.unwrap());
     assert!(guild_placement(&f.db, 10).await.unwrap().is_none());
     assert_eq!(db::get_settings(&f.db, 10).await.unwrap().prefix, "!");
+    assert_eq!(
+        db::get_config_version(&f.db).await.unwrap(),
+        config_version + 1
+    );
+    assert!(!f.tenant.drive_erasure().await.unwrap());
     assert!(
         f.tenant
             .record_selected_case(enrollment, case_data(9))
@@ -288,6 +295,338 @@ async fn erasure_clears_owned_rows_without_backup_jobs() {
     assert_eq!(intents, 0);
 }
 
+async fn fence_guild_erasure(db: &Db, guild: i64) {
+    let dest = StoreId::new();
+    register_store(db, dest.clone(), StorePolicy::Dedicated { guild_id: guild })
+        .await
+        .unwrap();
+    db.with_conn(move |conn| {
+        conn.execute_bounded(
+            "INSERT INTO guild_write_fences(
+                guild_id,generation,phase,destination_store_id,destination_revision,created_at
+             ) VALUES(?1,?2,'freeze',?3,?2,unixepoch())",
+            db::params![guild, format!("{:032x}", 9u128), dest.as_str()],
+            64 * 1024 * 1024,
+        )
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn fenced_erasure_waits_without_primary_polling_or_blocking_other_guilds() {
+    let probe = Arc::new(db::StartupProbe::default());
+    let f = {
+        let _probe = db::enter_startup_probe(Some(probe.clone()));
+        Fixture::new()
+    };
+    enroll(&f, 10, 100).await;
+    enroll(&f, 20, 100).await;
+    db::retire_guild_enrollment(&f.db, 10, 100).await.unwrap();
+    fence_guild_erasure(&f.db, 10).await;
+
+    let queries = probe.queries();
+    let transactions = probe.transactions();
+    let first = f.tenant.drive_erasure().await.unwrap();
+    let second = f.tenant.drive_erasure().await.unwrap();
+    assert_eq!(
+        probe.transactions() - transactions,
+        0,
+        "fenced-only polls must avoid the primary"
+    );
+    assert_eq!(probe.queries() - queries, 2, "one advisory per poll");
+    assert!(
+        !first && !second,
+        "fenced jobs must not keep the drain running"
+    );
+
+    db::retire_guild_enrollment(&f.db, 20, 100).await.unwrap();
+    assert!(f.tenant.drive_erasure().await.unwrap());
+    assert!(!db::guild_erasure_queued(&f.db, 20).await.unwrap());
+    assert!(db::guild_erasure_queued(&f.db, 10).await.unwrap());
+    assert!(!f.tenant.drive_erasure().await.unwrap());
+
+    f.db.with_conn(|conn| {
+        conn.execute_bounded(
+            "DELETE FROM guild_write_fences WHERE guild_id=10",
+            (),
+            64 * 1024 * 1024,
+        )
+    })
+    .await
+    .unwrap();
+    assert!(f.tenant.drive_erasure().await.unwrap());
+    assert!(!db::guild_erasure_queued(&f.db, 10).await.unwrap());
+}
+
+#[tokio::test]
+async fn fence_after_erasure_selection_defers_completion_until_retry() {
+    let f = Fixture::new();
+    let enrollment = enroll(&f, 10, 100).await;
+    let (store, scope) = f.tenant.live(enrollment.clone()).await.unwrap();
+    f.tenant
+        .record_selected_case(enrollment, case_data(9))
+        .await
+        .unwrap();
+    db::patch_settings(&f.db, 10, Some(Some("?".into())), None, None)
+        .await
+        .unwrap();
+    enroll(&f, 20, 100).await;
+    db::retire_guild_enrollment(&f.db, 10, 100).await.unwrap();
+    db::retire_guild_enrollment(&f.db, 20, 100).await.unwrap();
+
+    let lock = f.tenant.lock(10);
+    let guard = lock.lock().await;
+    let mut drive = std::pin::pin!(f.tenant.drive_erasure());
+    // Poll the worker first so it holds the cursor through selection. The
+    // guild lock then pauses it before the execution-time fence check.
+    tokio::select! {
+        biased;
+        result = &mut drive => panic!("erasure returned before taking the guild lock: {result:?}"),
+        cursor = f.tenant.inner.erasure_cursor.lock() => {
+            assert!(matches!(*cursor, ErasureCursor::After(10)));
+        }
+    }
+    fence_guild_erasure(&f.db, 10).await;
+    drop(guard);
+    drop(lock);
+
+    assert!(!drive.await.unwrap(), "a fenced attempt completed no job");
+    assert!(db::guild_erasure_queued(&f.db, 10).await.unwrap());
+    assert!(db::guild_erasure_queued(&f.db, 20).await.unwrap());
+    assert_eq!(
+        guild_placement(&f.db, 10).await.unwrap().as_ref(),
+        Some(scope.placement())
+    );
+    assert_eq!(store.case_count(scope, case_limits()).await.unwrap(), 1);
+    assert_eq!(db::get_settings(&f.db, 10).await.unwrap().prefix, "?");
+
+    assert!(f.tenant.drive_erasure().await.unwrap());
+    assert!(!db::guild_erasure_queued(&f.db, 20).await.unwrap());
+    assert!(!f.tenant.drive_erasure().await.unwrap());
+    assert!(db::guild_erasure_queued(&f.db, 10).await.unwrap());
+
+    f.db.with_conn(|conn| {
+        conn.execute_bounded(
+            "DELETE FROM guild_write_fences WHERE guild_id=10",
+            (),
+            64 * 1024 * 1024,
+        )
+    })
+    .await
+    .unwrap();
+    assert!(f.tenant.drive_erasure().await.unwrap());
+    assert!(!db::guild_erasure_queued(&f.db, 10).await.unwrap());
+    assert!(guild_placement(&f.db, 10).await.unwrap().is_none());
+    assert_eq!(db::get_settings(&f.db, 10).await.unwrap().prefix, "!");
+    assert!(!f.tenant.drive_erasure().await.unwrap());
+}
+
+tokio::task_local! {
+    static FENCE_BEFORE_ERASURE_PHASE: ErasurePhase;
+    static REJOIN_BEFORE_ERASURE_DIRECTORY: ();
+}
+
+pub(super) async fn before_erasure_phase(db: &Db, guild: i64, phase: &ErasurePhase) {
+    if FENCE_BEFORE_ERASURE_PHASE
+        .try_with(|target| target == phase)
+        .unwrap_or(false)
+    {
+        fence_guild_erasure(db, guild).await;
+    }
+    if *phase == ErasurePhase::Core(ErasureCoreStep::Directory)
+        && REJOIN_BEFORE_ERASURE_DIRECTORY.try_with(|()| ()).is_ok()
+    {
+        db::enroll_guild(db, guild, 101).await.unwrap().unwrap();
+        db::patch_settings(db, guild, Some(Some("?".into())), None, None)
+            .await
+            .unwrap();
+    }
+}
+
+async fn assert_late_erasure_fence_defers(phase: ErasurePhase) {
+    let f = Fixture::new();
+    let enrollment = enroll(&f, 10, 100).await;
+    f.tenant
+        .record_selected_case(enrollment, case_data(9))
+        .await
+        .unwrap();
+    let placement = guild_placement(&f.db, 10).await.unwrap().unwrap();
+    db::patch_settings(&f.db, 10, Some(Some("?".into())), None, None)
+        .await
+        .unwrap();
+    db::retire_guild_enrollment(&f.db, 10, 100).await.unwrap();
+    let config_version = db::get_config_version(&f.db).await.unwrap();
+    let directory_done = phase != ErasurePhase::Core(ErasureCoreStep::Directory);
+    let placement_done = phase == ErasurePhase::FinishJob;
+
+    // Commit a real fence immediately before the selected core write.
+    let completed = FENCE_BEFORE_ERASURE_PHASE
+        .scope(phase, f.tenant.drive_erasure())
+        .await
+        .unwrap();
+    assert_eq!(
+        db::get_settings(&f.db, 10).await.unwrap().prefix,
+        if directory_done { "!" } else { "?" }
+    );
+    assert_eq!(
+        db::get_config_version(&f.db).await.unwrap(),
+        config_version + u64::from(directory_done)
+    );
+    assert_eq!(
+        guild_placement(&f.db, 10).await.unwrap(),
+        (!placement_done).then_some(placement)
+    );
+    assert!(db::guild_erasure_queued(&f.db, 10).await.unwrap());
+    assert!(!completed, "a fenced attempt completed no job");
+
+    assert!(!f.tenant.drive_erasure().await.unwrap());
+    f.db.with_conn(|conn| {
+        conn.execute_bounded(
+            "DELETE FROM guild_write_fences WHERE guild_id=10",
+            (),
+            64 * 1024 * 1024,
+        )
+    })
+    .await
+    .unwrap();
+    let settled = if placement_done {
+        // An already absent placement supersedes the suffix before FinishJob.
+        FENCE_BEFORE_ERASURE_PHASE
+            .scope(ErasurePhase::FinishJob, f.tenant.drive_erasure())
+            .await
+            .unwrap()
+    } else {
+        f.tenant.drive_erasure().await.unwrap()
+    };
+    assert!(settled);
+    assert!(!db::guild_erasure_queued(&f.db, 10).await.unwrap());
+    assert!(guild_placement(&f.db, 10).await.unwrap().is_none());
+    assert_eq!(db::get_settings(&f.db, 10).await.unwrap().prefix, "!");
+    assert_eq!(
+        db::get_config_version(&f.db).await.unwrap(),
+        config_version + 1,
+        "directory cleanup advanced the configuration version only once"
+    );
+    assert!(!f.tenant.drive_erasure().await.unwrap());
+}
+
+#[tokio::test]
+async fn late_erasure_fence_before_directory_preserves_directory_and_placement() {
+    assert_late_erasure_fence_defers(ErasurePhase::Core(ErasureCoreStep::Directory)).await;
+}
+
+#[tokio::test]
+async fn late_erasure_fence_before_placement_preserves_placement() {
+    assert_late_erasure_fence_defers(ErasurePhase::Core(ErasureCoreStep::Placement)).await;
+}
+
+#[tokio::test]
+async fn late_erasure_fence_before_finish_preserves_job() {
+    assert_late_erasure_fence_defers(ErasurePhase::FinishJob).await;
+}
+
+#[tokio::test]
+async fn erasure_supersedes_directory_wipe_when_guild_rejoins_mid_job() {
+    let f = Fixture::new();
+    let old = enroll(&f, 10, 100).await;
+    let (_, old_scope) = f.tenant.live(old).await.unwrap();
+    db::retire_guild_enrollment(&f.db, 10, 100).await.unwrap();
+
+    assert!(
+        REJOIN_BEFORE_ERASURE_DIRECTORY
+            .scope((), f.tenant.drive_erasure())
+            .await
+            .unwrap()
+    );
+    assert_eq!(db::get_settings(&f.db, 10).await.unwrap().prefix, "?");
+    assert_eq!(
+        guild_placement(&f.db, 10).await.unwrap().as_ref(),
+        Some(old_scope.placement())
+    );
+    assert!(!db::guild_erasure_queued(&f.db, 10).await.unwrap());
+    assert!(!f.tenant.drive_erasure().await.unwrap());
+    let rejoined = db::enroll_guild(&f.db, 10, 101).await.unwrap().unwrap();
+    assert!(f.tenant.activate(rejoined).await.unwrap().is_some());
+    assert!(f.tenant.live(old_scope.enrollment().clone()).await.is_err());
+}
+
+#[tokio::test]
+async fn erasure_defers_when_placement_delete_changes_no_rows() {
+    let f = Fixture::new();
+    enroll(&f, 10, 100).await;
+    db::patch_settings(&f.db, 10, Some(Some("?".into())), None, None)
+        .await
+        .unwrap();
+    db::retire_guild_enrollment(&f.db, 10, 100).await.unwrap();
+    let placement = guild_placement(&f.db, 10).await.unwrap();
+    let version = db::get_config_version(&f.db).await.unwrap();
+    f.db.with_conn(|conn| {
+        conn.execute_batch_bounded(
+            "CREATE TRIGGER ignore_placement_delete BEFORE DELETE ON guild_store_placements
+             BEGIN SELECT RAISE(IGNORE); END",
+            64 * 1024 * 1024,
+        )
+    })
+    .await
+    .unwrap();
+
+    assert!(!f.tenant.drive_erasure().await.unwrap());
+    assert!(db::guild_erasure_queued(&f.db, 10).await.unwrap());
+    assert_eq!(guild_placement(&f.db, 10).await.unwrap(), placement);
+    assert_eq!(db::get_settings(&f.db, 10).await.unwrap().prefix, "!");
+    assert_eq!(db::get_config_version(&f.db).await.unwrap(), version + 1);
+
+    f.db.with_conn(|conn| {
+        conn.execute_batch_bounded("DROP TRIGGER ignore_placement_delete", 64 * 1024 * 1024)
+    })
+    .await
+    .unwrap();
+    assert!(f.tenant.drive_erasure().await.unwrap());
+    assert!(!db::guild_erasure_queued(&f.db, 10).await.unwrap());
+    assert!(guild_placement(&f.db, 10).await.unwrap().is_none());
+    assert_eq!(db::get_config_version(&f.db).await.unwrap(), version + 1);
+    assert!(!f.tenant.drive_erasure().await.unwrap());
+}
+
+#[tokio::test]
+async fn erasure_defers_when_placement_revision_changes() {
+    let f = Fixture::new();
+    enroll(&f, 10, 100).await;
+    db::retire_guild_enrollment(&f.db, 10, 100).await.unwrap();
+    let original = guild_placement(&f.db, 10).await.unwrap().unwrap();
+    let replacement = StoreId::new().as_str().to_owned();
+    f.db.with_conn(move |conn| {
+        conn.execute_bounded(
+            "UPDATE guild_store_placements SET revision=?1 WHERE guild_id=10",
+            db::params![replacement],
+            64 * 1024 * 1024,
+        )
+    })
+    .await
+    .unwrap();
+    let changed = guild_placement(&f.db, 10).await.unwrap();
+    assert_ne!(changed.as_ref(), Some(&original));
+
+    assert!(!f.tenant.drive_erasure().await.unwrap());
+    assert!(db::guild_erasure_queued(&f.db, 10).await.unwrap());
+    assert_eq!(guild_placement(&f.db, 10).await.unwrap(), changed);
+
+    f.db.with_conn(move |conn| {
+        conn.execute_bounded(
+            "UPDATE guild_store_placements SET revision=?1 WHERE guild_id=10",
+            db::params![original.revision()],
+            64 * 1024 * 1024,
+        )
+    })
+    .await
+    .unwrap();
+    assert!(f.tenant.drive_erasure().await.unwrap());
+    assert!(!db::guild_erasure_queued(&f.db, 10).await.unwrap());
+    assert!(guild_placement(&f.db, 10).await.unwrap().is_none());
+    assert!(!f.tenant.drive_erasure().await.unwrap());
+}
+
 #[tokio::test]
 async fn stale_erasure_does_not_wipe_a_rejoined_guilds_directory_data() {
     let f = Fixture::new();
@@ -296,6 +635,7 @@ async fn stale_erasure_does_not_wipe_a_rejoined_guilds_directory_data() {
         .record_selected_case(departed.clone(), case_data(9))
         .await
         .unwrap();
+    let placement = guild_placement(&f.db, 10).await.unwrap().unwrap();
     db::retire_guild_enrollment(&f.db, 10, 100).await.unwrap();
     f.tenant.schedule_erasure(departed).await.unwrap();
 
@@ -310,7 +650,7 @@ async fn stale_erasure_does_not_wipe_a_rejoined_guilds_directory_data() {
 
     assert!(f.tenant.drive_erasure().await.unwrap());
     assert_eq!(db::get_settings(&f.db, 10).await.unwrap().prefix, "?");
-    assert!(guild_placement(&f.db, 10).await.unwrap().is_none());
+    assert_eq!(guild_placement(&f.db, 10).await.unwrap(), Some(placement));
     assert!(
         f.tenant.activate(rejoined).await.unwrap().is_some(),
         "the current membership can bind after stale erasure completes"

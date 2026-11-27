@@ -1,4 +1,6 @@
 use super::*;
+use crate::db::tests::remote_stream::HranaFixture;
+use std::time::Duration;
 
 fn at(offset_ms: i64) -> i64 {
     static START: std::sync::OnceLock<i64> = std::sync::OnceLock::new();
@@ -1449,4 +1451,351 @@ async fn capture_batch_pressure_split_makes_no_partial_writes() {
         Some("fits")
     );
     assert!(rows[1].is_none());
+}
+
+const SNAPSHOT_MEMBERSHIP_READ: &str = "SELECT ENROLLMENT_ID,JOINED_AT_NS,ACTIVE,CONFIG_REVISION";
+const RECEIPT_INSERT: &str = "INSERT INTO MUTATION_RECEIPTS";
+
+async fn remote_capture_fixture(
+    f: &Fixture,
+    local: &GuildDataStore,
+) -> (HranaFixture, GuildDataStore) {
+    let (fixture, _) = HranaFixture::modeled_latency_database(
+        &f.store_path,
+        Duration::ZERO,
+        Duration::from_secs(5),
+        Default::default(),
+    )
+    .await;
+    let remote = GuildDataStore {
+        db: fixture.db_with_operation_timeout(Duration::from_secs(5)),
+        expected: local.expected.clone(),
+        core: None,
+    };
+    (fixture, remote)
+}
+
+async fn capture_receipt_count(local: &GuildDataStore) -> i64 {
+    local
+        .db
+        .with_conn(|conn| {
+            conn.query_row("SELECT COUNT(*) FROM mutation_receipts", (), |row| {
+                Ok(row.get(0)?)
+            })
+        })
+        .await
+        .unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn remote_capture_promotes_before_growth_and_reclaim_receipts() {
+    let (f, _, local, scope) = ready().await;
+    let (fixture, remote) = remote_capture_fixture(&f, &local).await;
+    let input = observation(41, Some("before"), None, 1);
+
+    let slow_write = || {
+        fixture.delay_client_requests(
+            &remote.db,
+            vec![
+                (SNAPSHOT_MEMBERSHIP_READ, Duration::from_millis(3700)),
+                (RECEIPT_INSERT, Duration::from_millis(600)),
+            ],
+        );
+    };
+    slow_write();
+    assert_eq!(
+        remote
+            .observe_snapshot(scope.clone(), input.clone())
+            .await
+            .unwrap(),
+        SnapshotOutcome::Stored
+    );
+    fixture.assert_client_delays_used();
+    assert_eq!(capture_receipt_count(&local).await, 1);
+    let sample = local.db.with_conn(|conn| {
+        conn.query_row(
+            "SELECT physical_sample_at_ms, snapshot_count FROM guild_snapshot_health WHERE singleton=1",
+            (),
+            |row| Ok((row.get::<Option<i64>>(0)?, row.get::<i64>(1)?)),
+        )
+    }).await.unwrap();
+    assert_eq!(sample, (Some(input.observed_at_ms), 1));
+
+    fixture.delay_client_requests(
+        &remote.db,
+        vec![(SNAPSHOT_MEMBERSHIP_READ, Duration::from_millis(3700))],
+    );
+    fixture.take_data_statements();
+    assert_eq!(
+        remote.observe_snapshot(scope.clone(), input).await.unwrap(),
+        SnapshotOutcome::Duplicate
+    );
+    fixture.assert_client_delays_used();
+    assert_eq!(capture_receipt_count(&local).await, 1);
+    assert!(
+        fixture
+            .take_data_statements()
+            .iter()
+            .all(|sql| sql.trim_start().starts_with("SELECT")),
+        "a duplicate must only issue reads"
+    );
+
+    slow_write();
+    let edit = remote
+        .apply_snapshot_edit(
+            scope.clone(),
+            observation(41, Some("after"), Some(at(10)), 1),
+        )
+        .await
+        .unwrap();
+    assert_eq!(edit.outcome, SnapshotOutcome::Stored);
+    fixture.assert_client_delays_used();
+    assert_eq!(capture_receipt_count(&local).await, 2);
+
+    slow_write();
+    let taken = remote
+        .take_snapshot(scope.clone(), 20, 41, at(20))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(taken.fields.content.as_deref(), Some("after"));
+    fixture.assert_client_delays_used();
+    assert_eq!(capture_receipt_count(&local).await, 3);
+    assert!(
+        local
+            .retained_snapshot(scope, 20, 41)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(fixture.read_begins(), 4);
+    assert_eq!(fixture.immediate_begins(), 0);
+    fixture.assert_committed_within_lifetime(3);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn remote_capture_busy_retry_rechecks_scope_and_rows() {
+    for close_scope in [false, true] {
+        let (f, _, local, scope) = ready().await;
+        let (fixture, remote) = remote_capture_fixture(&f, &local).await;
+        let competing_store = local.clone();
+        let competing_scope = scope.clone();
+        let runtime = tokio::runtime::Handle::current();
+        fixture.before_next_receipt(move || {
+            runtime.block_on(async {
+                if close_scope {
+                    competing_store
+                        .close_membership(competing_scope)
+                        .await
+                        .unwrap();
+                } else {
+                    let input = observation(41, Some("competing capture"), None, 1);
+                    assert_eq!(
+                        competing_store
+                            .observe_snapshot(competing_scope, input)
+                            .await
+                            .unwrap(),
+                        SnapshotOutcome::Stored
+                    );
+                }
+            });
+        });
+
+        let result = remote
+            .observe_snapshot(
+                scope.clone(),
+                observation(41, Some("original capture"), None, 1),
+            )
+            .await;
+        if close_scope {
+            assert!(matches!(
+                result.unwrap_err().downcast_ref::<TenantDataError>(),
+                Some(TenantDataError::Membership)
+            ));
+        } else {
+            assert_eq!(result.unwrap(), SnapshotOutcome::Duplicate);
+            let retained = local
+                .retained_snapshot(scope, 20, 41)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                retained.fields.content.as_deref(),
+                Some("competing capture")
+            );
+        }
+        assert_eq!(fixture.read_begins(), 1);
+        assert_eq!(fixture.immediate_begins(), 1);
+        assert_eq!(capture_receipt_count(&local).await, 0);
+        fixture.assert_committed_within_lifetime(0);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn remote_capture_reconciles_lost_commit_without_replay() {
+    for fail_reconciliation in [false, true] {
+        let (f, _, local, scope) = ready().await;
+        let (fixture, remote) = remote_capture_fixture(&f, &local).await;
+        fixture.drop_next_commit_response();
+        if fail_reconciliation {
+            fixture.delay_client_requests(
+                &remote.db,
+                vec![("SELECT 1 FROM MUTATION_RECEIPTS", Duration::from_secs(6))],
+            );
+        }
+        let result = remote
+            .observe_snapshot(scope.clone(), observation(41, Some("saved"), None, 1))
+            .await;
+        if fail_reconciliation {
+            let error = result.unwrap_err();
+            assert!(
+                crate::db_compat::is_database_commit_indeterminate(&error),
+                "{error:#}"
+            );
+            fixture.assert_client_delays_used();
+        } else {
+            assert_eq!(result.unwrap(), SnapshotOutcome::Stored);
+            fixture.assert_committed_within_lifetime(1);
+        }
+        assert_eq!(fixture.read_begins(), 1);
+        assert_eq!(
+            fixture.immediate_begins(),
+            1,
+            "only receipt reconciliation opens an immediate transaction"
+        );
+        assert_eq!(capture_receipt_count(&local).await, 1);
+        let retained = local
+            .retained_snapshot(scope, 20, 41)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(retained.fields.content.as_deref(), Some("saved"));
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn remote_capture_expired_before_commit_rolls_back_without_reconciliation() {
+    let (f, _, local, scope) = ready().await;
+    let (fixture, remote) = remote_capture_fixture(&f, &local).await;
+    let clock = fixture.delay_client_requests(
+        &remote.db,
+        vec![("SELECT 1 FROM MUTATION_RECEIPTS", Duration::from_secs(6))],
+    );
+    // Expire at timer setup, after the final capacity check has returned.
+    clock.advance_at_operation("commit transaction", Duration::from_secs(5));
+
+    let error = remote
+        .observe_snapshot(scope.clone(), observation(41, Some("late"), None, 1))
+        .await
+        .unwrap_err();
+    assert!(
+        !crate::db_compat::is_database_commit_indeterminate(&error),
+        "{error:#}"
+    );
+    assert!(
+        crate::db_compat::is_database_operation_timeout(&error),
+        "{error:#}"
+    );
+    assert!(error.to_string().contains("commit transaction"));
+    let statements = fixture.take_statements();
+    assert!(statements.iter().all(|sql| !sql.starts_with("COMMIT")));
+    assert_eq!(
+        statements
+            .iter()
+            .filter(|sql| sql.starts_with("ROLLBACK"))
+            .count(),
+        1
+    );
+    assert_eq!(fixture.read_begins(), 1);
+    assert_eq!(fixture.immediate_begins(), 0);
+    assert_eq!(capture_receipt_count(&local).await, 0);
+    assert!(
+        local
+            .retained_snapshot(scope, 20, 41)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    fixture.assert_committed_within_lifetime(0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn remote_capture_keeps_the_pooled_write_deadline_through_commit_and_retry() {
+    for retry in [false, true] {
+        let (f, _, local, scope) = ready().await;
+        // Give the fixture a longer provider lifetime so only the original
+        // client deadline can prevent the late mutation from committing.
+        let (fixture, _) = HranaFixture::modeled_latency_database(
+            &f.store_path,
+            Duration::ZERO,
+            Duration::from_secs(10),
+            Default::default(),
+        )
+        .await;
+        let mut opts = f.options();
+        opts.url = fixture.url();
+        opts.token = "test".into();
+        let expected = local.expected.clone();
+        let remote = tokio::task::spawn_blocking(move || GuildDataStore::open(opts, expected))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            remote.db.runtime.operation_limit(),
+            Some(Duration::from_secs(75))
+        );
+        assert_eq!(
+            remote.db.connections.runtime.operation_limit(),
+            Some(Duration::from_secs(5))
+        );
+        let startup_reads = fixture.read_begins();
+        let delayed_request = if retry {
+            let writer_path = f.store_path.clone();
+            fixture.before_next_receipt(move || {
+                let writer = Connection::open(&writer_path).unwrap();
+                writer
+                    .execute_bounded(
+                        "UPDATE guild_snapshot_health SET lost_count=1 WHERE singleton=1",
+                        (),
+                        1_000_000,
+                    )
+                    .unwrap();
+            });
+            "BEGIN IMMEDIATE"
+        } else {
+            "UPDATE MUTATION_RECEIPTS"
+        };
+        fixture.delay_client_requests(
+            &remote.db,
+            vec![
+                (SNAPSHOT_MEMBERSHIP_READ, Duration::from_millis(3700)),
+                (delayed_request, Duration::from_secs(2)),
+            ],
+        );
+
+        let error = remote
+            .observe_snapshot(scope.clone(), observation(41, Some("late"), None, 1))
+            .await
+            .unwrap_err();
+        assert!(
+            crate::db_compat::is_database_operation_timeout(&error),
+            "{error:#}"
+        );
+        assert!(
+            !crate::db_compat::is_database_commit_indeterminate(&error),
+            "{error:#}"
+        );
+        fixture.assert_client_delays_used();
+        assert_eq!(fixture.read_begins(), startup_reads + 1);
+        assert_eq!(fixture.immediate_begins(), usize::from(retry));
+        assert_eq!(capture_receipt_count(&local).await, 0);
+        assert!(
+            local
+                .retained_snapshot(scope, 20, 41)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        fixture.assert_committed_within_lifetime(0);
+    }
 }

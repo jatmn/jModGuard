@@ -1,6 +1,7 @@
 //! Durable action storage with current and captured membership checks.
 use super::*;
 use crate::bot_actions::{Action, Limits};
+use crate::db_compat::Transaction;
 use serde::Deserialize;
 
 // Stored and wire strings remain adapters; unknown values remain readable.
@@ -101,6 +102,8 @@ pub enum BotActionDispatch {
 const ACTIVE: &str =
     "EXISTS(SELECT 1 FROM guild_enrollments e WHERE e.guild_id=bot_actions.guild_id
     AND e.id=bot_actions.enrollment_id AND e.joined_at_ns=bot_actions.joined_at_ns AND e.active=1)";
+const UNFENCED: &str =
+    "NOT EXISTS(SELECT 1 FROM guild_write_fences f WHERE f.guild_id=bot_actions.guild_id)";
 const COLS: &str = "id,guild_id,actor_id,payload,state,outcome,created_at,expires_at,claim,enrollment_id,joined_at_ns";
 
 fn row_action(r: &Row) -> Result<BotAction> {
@@ -374,18 +377,19 @@ async fn recent_bot_actions_inner(db: &Db, scope: ActionScope) -> Result<Vec<Bot
 fn claim_next_sql() -> String {
     // Expiry searches use bot_actions_expiry; selecting one oldest job must
     // walk pending order so LIMIT can stop without sorting all live jobs.
-    format!("SELECT {COLS} FROM bot_actions INDEXED BY bot_actions_pending WHERE state='pending' AND expires_at>?1 AND {ACTIVE}
-                      AND NOT EXISTS(SELECT 1 FROM guild_write_fences f WHERE f.guild_id=bot_actions.guild_id)
+    format!("SELECT {COLS} FROM bot_actions INDEXED BY bot_actions_pending WHERE state='pending' AND expires_at>?1 AND {ACTIVE} AND {UNFENCED}
                       ORDER BY created_at,id LIMIT 1")
 }
 
 fn action_due_expression() -> String {
     // Separate the two searches so expiry uses (state,expires_at) and pending
-    // admission keeps its own indexed branch. Both retain active membership.
-    format!("EXISTS(SELECT 1 FROM bot_actions WHERE {ACTIVE}
-                AND state IN ('pending','claimed','running') AND expires_at<=?1)
-            OR EXISTS(SELECT 1 FROM bot_actions WHERE {ACTIVE} AND state='pending'
-                AND NOT EXISTS(SELECT 1 FROM guild_write_fences f WHERE f.guild_id=bot_actions.guild_id))")
+    // admission keeps its own indexed branch. Both require active membership
+    // in an unfenced guild.
+    format!(
+        "EXISTS(SELECT 1 FROM bot_actions WHERE {ACTIVE}
+                AND state IN ('pending','claimed','running') AND expires_at<=?1 AND {UNFENCED})
+            OR EXISTS(SELECT 1 FROM bot_actions WHERE {ACTIVE} AND state='pending' AND {UNFENCED})"
+    )
 }
 
 fn poll_due_sql() -> String {
@@ -427,22 +431,94 @@ pub async fn claim_bot_action(db: &Db, now: i64) -> Result<Option<BotAction>> {
     db.with_conn(move |conn| {
         // An advisory read avoids idle write transactions/receipts. Replica lag
         // can defer a poll but never authorizes dispatch: claim below is primary.
-        // Housekeeping (expiry/uncertain) is independent of write fences. Claim
-        // selection still excludes fenced guilds in the UPDATE/SELECT below.
+        // Only unfenced rows can trigger a poll. Once opened, the primary
+        // transaction can process overdue receipts across guilds.
         let due: bool =
             conn.query_row_advisory(&poll_due_sql(), params![now], |r| Ok(r.get(0)?))?;
         if !due {
             return Ok(None);
         }
-        claim_bot_action_conn(conn, now)
+        claim_bot_action_tx(conn.transaction_immediate()?, now)
     })
     .await
 }
 
 /// Revalidate a positive scheduler advisory on the primary.
 pub async fn claim_advised_bot_action(db: &Db, now: i64) -> Result<Option<BotAction>> {
-    db.with_conn(move |conn| claim_bot_action_conn(conn, now))
-        .await
+    let write_deadline = if db.is_remote() && !db.is_read_only() {
+        let write_deadline = db.connections.runtime.capture_write_deadline();
+        #[cfg(test)]
+        let after_due_read = db.after_advised_due_read.lock().unwrap().take();
+        let result = db
+            .with_conn(move |conn| {
+                claim_advised_bot_action_conn(
+                    conn,
+                    now,
+                    true,
+                    write_deadline,
+                    #[cfg(test)]
+                    after_due_read,
+                )
+            })
+            .await;
+        match result {
+            // A concurrent commit can invalidate a deferred transaction's
+            // promotion. Recheck due work on a fresh primary snapshot.
+            Err(ref error) if crate::db_compat::is_database_busy(error) => {
+                #[cfg(test)]
+                if let Some(hook) = db.after_advised_busy.lock().unwrap().take() {
+                    hook();
+                }
+                write_deadline
+            }
+            result => return result,
+        }
+    } else {
+        None
+    };
+    db.with_conn_before(write_deadline, move |conn| {
+        claim_advised_bot_action_conn(
+            conn,
+            now,
+            false,
+            write_deadline,
+            #[cfg(test)]
+            None,
+        )
+    })
+    .await
+}
+
+fn claim_advised_bot_action_conn(
+    conn: &Connection,
+    now: i64,
+    promote: bool,
+    write_deadline: Option<tokio::time::Instant>,
+    #[cfg(test)] after_due_read: Option<super::AdvisedClaimHook>,
+) -> Result<Option<BotAction>> {
+    let mut tx = if promote {
+        conn.transaction_capture_before(write_deadline, false)?
+    } else {
+        conn.transaction_primary_snapshot_before(write_deadline)?
+    };
+    let due: bool = tx.query_row(&poll_due_sql(), params![now], |r| Ok(r.get(0)?))?;
+    if !due {
+        tx.finish_read()?;
+        return Ok(None);
+    }
+    let tx = if promote {
+        // The positive check and the write share one primary transaction.
+        #[cfg(test)]
+        if let Some(hook) = after_due_read {
+            hook();
+        }
+        tx.prepare_capture_write()?;
+        tx
+    } else {
+        tx.finish_read()?;
+        conn.transaction_immediate_before(write_deadline)?
+    };
+    claim_bot_action_tx(tx, now)
 }
 
 const EXPIRE_UNSTARTED_SQL: &str =
@@ -454,8 +530,7 @@ const MARK_EXPIRED_RUNNING_UNCERTAIN_SQL: &str =
          WHERE id IN (SELECT id FROM bot_actions
          WHERE state='running' AND expires_at<=?1 LIMIT 64)";
 
-fn claim_bot_action_conn(conn: &mut Connection, now: i64) -> Result<Option<BotAction>> {
-    let tx = conn.transaction_immediate()?;
+fn claim_bot_action_tx(tx: Transaction, now: i64) -> Result<Option<BotAction>> {
     tx.execute_matching(EXPIRE_UNSTARTED_SQL, params![now])?;
     tx.execute_matching(MARK_EXPIRED_RUNNING_UNCERTAIN_SQL, params![now])?;
     let job = tx

@@ -308,9 +308,19 @@ async fn each_expiry_poll_caps_unstarted_and_running_work_separately() {
 }
 
 #[tokio::test]
-async fn move_fence_does_not_skip_overdue_expiry_when_no_unfenced_work_is_due() {
-    let f = Fixture::new(&[10]).await;
-    let job = f.enqueue(10, "fenced_expiry", unban(99)).await;
+async fn fenced_overdue_actions_do_not_wake_the_poller() {
+    let probe = std::sync::Arc::new(StartupProbe::default());
+    let f = {
+        let _probe = enter_startup_probe(Some(probe.clone()));
+        Fixture::new(&[]).await
+    };
+    enroll_guild(&f.db, 10, 100).await.unwrap();
+    f.enqueue(10, "fenced_running", unban(97)).await;
+    let running = claim_bot_action(&f.db, 1001).await.unwrap().unwrap();
+    assert!(begin_bot_action(&f.db, &running, 1001).await.unwrap());
+    f.enqueue(10, "fenced_claimed", unban(98)).await;
+    let claimed = claim_bot_action(&f.db, 1001).await.unwrap().unwrap();
+    let pending = f.enqueue(10, "fenced_pending", unban(99)).await;
     let destination = crate::db::guild_stores::StoreId::new();
     crate::db::guild_stores::register_store(
         &f.db,
@@ -334,36 +344,44 @@ async fn move_fence_does_not_skip_overdue_expiry_when_no_unfenced_work_is_due() 
     }
     .await
     .unwrap();
-    assert!(claim_bot_action(&f.db, 1001).await.unwrap().is_none());
-    let pending: String =
-        f.db.with_conn({
-            let id = job.id.clone();
-            move |conn| {
-                conn.query_row(
-                    "SELECT state FROM bot_actions WHERE id=?1",
-                    params![id],
-                    |row| Ok(row.get(0)?),
-                )
-            }
-        })
-        .await
-        .unwrap();
-    assert_eq!(pending, "pending");
-    assert!(claim_bot_action(&f.db, 1300).await.unwrap().is_none());
-    let expired: String =
-        f.db.with_conn({
-            let id = job.id.clone();
-            move |conn| {
-                conn.query_row(
-                    "SELECT state FROM bot_actions WHERE id=?1",
-                    params![id],
-                    |row| Ok(row.get(0)?),
-                )
-            }
-        })
-        .await
-        .unwrap();
-    assert_eq!(expired, "expired");
+
+    let transactions = probe.transactions();
+    for now in [
+        pending.expires_at - 1,
+        pending.expires_at,
+        pending.expires_at + 1,
+    ] {
+        assert_eq!(
+            bot_work_due(&f.db, now, &[]).await.unwrap(),
+            BotWorkDue::Idle
+        );
+        assert!(claim_bot_action(&f.db, now).await.unwrap().is_none());
+    }
+    assert_eq!(probe.transactions(), transactions);
+
+    f.db.with_conn(|conn| {
+        conn.execute_bounded(
+            "DELETE FROM guild_write_fences WHERE guild_id=?1",
+            params![10],
+            64 * 1024 * 1024,
+        )?;
+        Ok(())
+    })
+    .await
+    .unwrap();
+    let now = pending.expires_at;
+    assert_eq!(
+        bot_work_due(&f.db, now, &[]).await.unwrap(),
+        BotWorkDue::Action
+    );
+    assert!(claim_bot_action(&f.db, now).await.unwrap().is_none());
+    assert_eq!(f.state(&pending).await, "expired");
+    assert_eq!(f.state(&claimed).await, "expired");
+    assert_eq!(f.state(&running).await, "uncertain");
+    assert_eq!(
+        bot_work_due(&f.db, now, &[]).await.unwrap(),
+        BotWorkDue::Idle
+    );
 }
 
 #[tokio::test]
