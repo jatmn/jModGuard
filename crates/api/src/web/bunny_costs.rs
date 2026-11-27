@@ -17,7 +17,7 @@ use reqwest::header::HeaderValue;
 use serde::Serialize;
 
 use super::state::ApiState;
-use client::{Client, McChart};
+use client::Client;
 
 const REFRESH: Duration = Duration::from_hours(6);
 const RETRY: Duration = Duration::from_mins(15);
@@ -174,35 +174,18 @@ async fn collect(
     client: &Client,
     source: &Source,
     window: Window,
-    backfill_at: Option<DateTime<Utc>>,
+    historical: bool,
 ) -> Result<MonthData, Failure> {
     let mut data = MonthData::default();
     match source.service {
         Service::MagicContainers => {
-            // Stay within the hourly lookback even when backfilling a month
-            // that ended before this collection ran.
-            let now = backfill_at.unwrap_or(window.to);
-            let recent = midnight(now.date_naive() - CalendarDays::new(6));
-            let hourly_from = window.from.max(recent);
-            if backfill_at.is_some() {
-                client
-                    .mc_days(source, window, McChart::Daily, &mut data)
-                    .await?;
-                client
-                    .mc_days(
-                        source,
-                        Window {
-                            from: hourly_from,
-                            to: midnight(window.to.date_naive()),
-                            ..window
-                        },
-                        McChart::HourlyCpu,
-                        &mut data,
-                    )
-                    .await?;
+            if historical {
+                client.mc_days(source, window, false, &mut data).await?;
             } else {
                 client.mc_summary(source, window, &mut data).await?;
                 // Use the most recent six full days plus today's closed hours.
+                let recent = midnight(window.to.date_naive() - CalendarDays::new(6));
+                let hourly_from = window.from.max(recent);
                 client
                     .mc_days(
                         source,
@@ -210,7 +193,7 @@ async fn collect(
                             to: hourly_from,
                             ..window
                         },
-                        McChart::Daily,
+                        false,
                         &mut data,
                     )
                     .await?;
@@ -221,23 +204,21 @@ async fn collect(
                             from: hourly_from,
                             ..window
                         },
-                        McChart::Hourly,
+                        true,
                         &mut data,
                     )
                     .await?;
             }
-            data.magic_cpu_from_hourly = true;
+            data.magic_cpu_from_current_hours = true;
         }
         Service::CoreDatabase | Service::GuildDatabase => {
-            data.days = client
-                .database_days(source, window, backfill_at.is_none())
-                .await?;
+            data.days = client.database_days(source, window, !historical).await?;
         }
         Service::Storage => data.days = client.storage_days(source, window).await?,
     }
     // Allow the same publication lag for a day at the end of a live
     // window as for the final day at month rollover.
-    let complete_to = if backfill_at.is_some() {
+    let complete_to = if historical {
         window.to
     } else {
         window.to - REFRESH
@@ -493,7 +474,7 @@ async fn refresh_current(
     }
     if !feed.failed
         && feed.months.get(&month).is_some_and(|row| {
-            (source.service != Service::MagicContainers || row.data.magic_cpu_from_hourly)
+            (source.service != Service::MagicContainers || row.data.magic_cpu_from_current_hours)
                 && (0..REFRESH.as_secs() as i64).contains(&(now.timestamp() - row.fetched_at))
         })
     {
@@ -508,7 +489,7 @@ async fn refresh_current(
             from,
             to: now,
         },
-        None,
+        false,
     )
     .await?;
     feed.failed = false;
@@ -524,7 +505,9 @@ async fn backfill(
 ) -> Result<(), Failure> {
     for window in backfill_windows(source.service, now) {
         if feed.months.get(&window.month).is_some_and(|row| {
-            (source.service != Service::MagicContainers || row.data.magic_cpu_from_hourly)
+            (source.service != Service::MagicContainers
+                || (row.data.magic_cpu_from_current_hours
+                    && row.fetched_at >= window.to.timestamp()))
                 && row
                     .data
                     .covers(window.from.date_naive(), window.to.date_naive())
@@ -533,7 +516,7 @@ async fn backfill(
         }
         // Pace historical requests and prioritize the current cycle.
         tokio::time::sleep(Duration::from_secs(2)).await;
-        let data = collect(client, source, window, Some(now)).await?;
+        let data = collect(client, source, window, true).await?;
         save(app, source, feed, window.month, now.timestamp(), data).await?;
     }
     Ok(())

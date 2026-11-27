@@ -101,10 +101,10 @@ hours or full days. Today's daily bucket is dropped.
 | `trafficSplitChart` | Bytes summed per bucket, with daily values equal to the sum of hourly values | Priced as egress at the rate for the reporting pod's region |
 
 Daily CPU and RAM values are sample-weighted means of the underlying readings.
-CPU cost uses closed hourly observations or saved hourly costs. A daily CPU
-mean alone gives no usage duration, so CPU cost is unavailable when neither
-hourly source is available. Daily RAM still uses the mean for block rounding
-and applies the resulting blocks over 24 hours.
+Current CPU cost uses closed hourly observations. Historical backfill reads
+daily RAM and traffic, and history can retain CPU costs saved during the
+current period. Daily RAM uses the mean for block rounding and applies the
+resulting blocks over 24 hours.
 
 Persistent volume cost uses the app summary's `totalVolumeSizeInGb` at
 $0.10/GB-month. The current allocated size is prorated over the elapsed UTC

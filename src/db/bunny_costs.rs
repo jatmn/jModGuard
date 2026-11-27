@@ -50,6 +50,15 @@ pub struct BunnyDayCost {
     pub egress_rate_unknown: bool,
 }
 
+impl BunnyDayCost {
+    fn has_only_hourly_cpu(self) -> bool {
+        self.hourly_cpu_cost.is_some()
+            && self.ram == 0.0
+            && self.egress == 0.0
+            && !self.egress_rate_unknown
+    }
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, Serialize)]
 pub struct BunnyCpuAverages {
     pub sampled_at: DateTime<Utc>,
@@ -61,7 +70,7 @@ pub struct BunnyCpuAverages {
 pub struct BunnyMonthData {
     pub days: CostDays,
     #[serde(default)]
-    pub magic_cpu_from_hourly: bool,
+    pub magic_cpu_from_current_hours: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cpu_hourly_averages: Option<BunnyCpuAverages>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -97,16 +106,14 @@ impl BunnyMonthData {
         })
     }
 
-    fn merge_days(&mut self, previous: CostDays) {
+    fn merge_days(&mut self, previous: CostDays, close_out_current: bool) {
         for (date, saved) in previous {
             self.days
                 .entry(date)
                 .and_modify(|day| {
-                    // Keep a collected full day, including its original
-                    // hourly detail, when a later rollup revisits that date.
-                    if saved.complete {
-                        // Fill in verified CPU pricing when a legacy snapshot
-                        // already has a full day of RAM and traffic.
+                    // Keep recorded rates and amounts from complete days.
+                    // At close-out only a daily observation confirms coverage.
+                    if saved.complete && !(close_out_current && saved.has_only_hourly_cpu()) {
                         let hourly_cpu_cost = if day.complete {
                             saved.hourly_cpu_cost.or(day.hourly_cpu_cost)
                         } else {
@@ -114,6 +121,7 @@ impl BunnyMonthData {
                         };
                         *day = BunnyDayCost {
                             hourly_cpu_cost,
+                            complete: !close_out_current || day.complete,
                             ..saved
                         };
                     } else {
@@ -122,7 +130,10 @@ impl BunnyMonthData {
                         day.hourly_cpu_cost = day.hourly_cpu_cost.or(saved.hourly_cpu_cost);
                     }
                 })
-                .or_insert(saved);
+                .or_insert_with(|| BunnyDayCost {
+                    complete: saved.complete && !close_out_current,
+                    ..saved
+                });
         }
     }
 
@@ -168,8 +179,23 @@ pub struct BunnyCostSnapshot {
 
 impl BunnyCostSnapshot {
     fn refresh_stored_total(&mut self, service: BunnyService) {
-        if service == BunnyService::MagicContainers {
-            // Earlier snapshots included unverified chart charges in the total.
+        if service != BunnyService::MagicContainers {
+            return;
+        }
+        if !self.data.magic_cpu_from_current_hours
+            && let Some(end) = self.month.checked_add_months(Months::new(1))
+            && self.fetched_at >= midnight_secs(end)
+            && let Some(observed) = DateTime::from_timestamp(self.fetched_at, 0)
+        {
+            // Older history may include supplemental CPU with no daily
+            // observation. Discard ambiguous CPU charges and coverage.
+            self.data.days.retain(|_, day| {
+                let keep_usage = !day.has_only_hourly_cpu();
+                day.hourly_cpu_cost = None;
+                keep_usage
+            });
+            self.data.summarize(service, self.month, observed);
+        } else {
             self.data.month_to_date = self.data.magic_subtotal();
         }
     }
@@ -266,17 +292,21 @@ pub(super) async fn store_bunny_cost_snapshot(
             .optional()?;
         if let Some(previous) = previous {
             let mut previous: BunnyCostSnapshot = serde_json::from_str(&previous)?;
+            previous.refresh_stored_total(service);
             if previous.fetched_at > row.fetched_at {
                 tx.finish_read()?;
-                previous.refresh_stored_total(service);
                 return Ok(previous);
             }
-            if observed.date_naive() >= row.month + Months::new(1) {
+            let month_end = midnight_secs(row.month + Months::new(1));
+            if row.fetched_at >= month_end {
                 // Backfill has no allocation history. Keep the volume cost
                 // estimated by the last observation within the month.
                 row.data.allocated_volume_cost = previous.data.allocated_volume_cost;
             }
-            row.data.merge_days(previous.data.days);
+            let close_out_current = service == BunnyService::MagicContainers
+                && previous.fetched_at < month_end
+                && row.fetched_at >= month_end;
+            row.data.merge_days(previous.data.days, close_out_current);
         }
         row.data.summarize(service, row.month, observed);
         anyhow::ensure!(
@@ -326,5 +356,36 @@ mod tests {
             data.summarize(BunnyService::MagicContainers, month, observed);
             assert_eq!(data.month_to_date, None);
         }
+    }
+
+    #[test]
+    fn old_magic_history_does_not_keep_supplemental_cpu_coverage() {
+        let month = NaiveDate::from_ymd_opt(2026, 11, 1).unwrap();
+        let end = month + Months::new(1);
+        let missing_day = month.succ_opt().unwrap();
+        let cpu_only = BunnyDayCost {
+            hourly_cpu_cost: Some(0.01),
+            complete: true,
+            ..BunnyDayCost::default()
+        };
+        let daily_usage = BunnyDayCost {
+            ram: 0.125,
+            egress: 0.0625,
+            ..cpu_only
+        };
+        let mut row = BunnyCostSnapshot {
+            month,
+            fetched_at: midnight_secs(end),
+            data: BunnyMonthData {
+                days: [(month, daily_usage), (missing_day, cpu_only)].into(),
+                allocated_volume_cost: Some(0.25),
+                ..BunnyMonthData::default()
+            },
+        };
+        row.refresh_stored_total(BunnyService::MagicContainers);
+        assert!(row.data.days[&month].complete);
+        assert_eq!(row.data.days[&month].hourly_cpu_cost, None);
+        assert!(!row.data.days.contains_key(&missing_day));
+        assert_eq!(row.data.month_to_date, Some(0.4375));
     }
 }

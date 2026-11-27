@@ -17,13 +17,6 @@ const CPU_CORE_HOUR: f64 = 0.02;
 const VOLUME_GB_MONTH: f64 = 0.10;
 const STORAGE_GB_MONTH: f64 = 0.01;
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub(super) enum McChart {
-    Daily,
-    Hourly,
-    HourlyCpu,
-}
-
 pub(super) struct Client {
     http: reqwest::Client,
     base: reqwest::Url,
@@ -105,10 +98,9 @@ impl Client {
         &self,
         source: &Source,
         window: Window,
-        chart: McChart,
+        hourly: bool,
         data: &mut MonthData,
     ) -> Result<(), Failure> {
-        let hourly = chart != McChart::Daily;
         let hours = if hourly { 1 } else { 24 };
         let seconds = 3600 * hours;
         // Bunny can return buckets past toDate, including the open bucket.
@@ -143,9 +135,7 @@ impl Client {
                     let day = data.days.entry(time.date_naive()).or_default();
                     *day.hourly_cpu_cost.get_or_insert(0.0) += nonnegative(value)? * CPU_CORE_HOUR;
                 }
-                if chart == McChart::Hourly
-                    && let Some((&sampled_at, &value)) = samples.next_back()
-                {
+                if let Some((&sampled_at, &value)) = samples.next_back() {
                     match &mut data.cpu_hourly_averages {
                         Some(cpu) if sampled_at < cpu.sampled_at => {}
                         Some(cpu) if sampled_at == cpu.sampled_at => {
@@ -162,9 +152,6 @@ impl Client {
                     }
                 }
             }
-        }
-        if chart == McChart::HourlyCpu {
-            return Ok(());
         }
         // Daily RAM points average their raw samples. Traffic points are
         // byte totals for their bucket at either granularity.
