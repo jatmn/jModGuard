@@ -14393,6 +14393,10 @@ test('Bot Resources rounds combined memory up from bytes, including zero and blo
     assert.ok(textOf(panel).includes(`${blocks.toLocaleString('en-US')} block${blocks === 1 ? '' : 's'} (${capacity} MiB)`));
     assert.ok(textOf(panel).includes(`${headroom} MiB headroom to the next block in this estimate`));
     if (botBytes === 50 * mib) {
+      assert.equal(panel.querySelector('h3').textContent, 'In-process memory block estimate');
+      assert.match(textOf(panel), /These estimates exclude Bunny’s billed system overhead/);
+      assert.match(textOf(panel), /whether hourly billing uses average or peak memory/);
+      assert.match(textOf(panel), /whether blocks round per container or per pod/);
       assert.match(textOf(panel), /Combined memory110 MiB/);
       assert.match(textOf(panel), /Bot memory50 MiB/);
       assert.match(textOf(panel), /API memory60 MiB/);
@@ -14431,7 +14435,7 @@ test('Bot Resources rounds the paired-period memory peak and shows its coverage'
       await settle();
     }
     const panel = h.nodes.get('#content').querySelector('[aria-labelledby="resources-memory-billing"]');
-    assert.equal(resourceFact(panel, 'Paired-period peak combined memory'), expected);
+    assert.equal(resourceFact(panel, 'Paired-period peak estimate'), expected);
     assert.equal(resourceFact(panel, 'Paired memory coverage'), coverage);
     assert.doesNotMatch(textOf(panel), /can hide higher peaks/);
   }
@@ -14464,13 +14468,13 @@ test('Bot Resources displays sparse or empty paired coverage with an unpaired sp
     const panel = h.nodes.get('#content').querySelector('[aria-labelledby="resources-memory-billing"]');
     const [bot] = resourceCards(h);
     assert.match(textOf(bot), /peak 160 MiB in last 24 hours/);
-    assert.equal(resourceFact(panel, 'Paired-period peak combined memory'), periods ? '110 MiB · 2 blocks (128 MiB)' : 'No paired memory readings');
+    assert.equal(resourceFact(panel, 'Paired-period peak estimate'), periods ? '110 MiB · 2 blocks (128 MiB)' : 'No paired memory readings');
     assert.equal(resourceFact(panel, 'Paired memory coverage'), `${periods} of 1,440 minutes`);
     assert.equal(resourceFact(panel, 'Peak combined memory in 24h'), undefined);
     assert.match(resourceFact(panel, 'Estimated blocks'), /^1 block \(64 MiB\)/);
     if (periods) {
-      assert.match(textOf(panel), /highest reading in each paired minute/);
-      assert.match(textOf(panel), /can overstate the peak within paired periods/);
+      assert.match(textOf(panel), /covers only minutes with readings from both processes/);
+      assert.match(textOf(panel), /sum of their separate maxima is an upper bound on sampled combined memory in each minute because the processes can peak at different times/);
       assert.match(textOf(panel), /Periods without both readings can hide higher peaks/);
     }
   }

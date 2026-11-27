@@ -1553,7 +1553,7 @@ function MemoryBillingPanel({ snapshot, nowMs }) {
       ["Bot memory", formatMemoryMiB(botBytes)],
       ["API memory", formatMemoryMiB(apiBytes)],
       ["Estimated blocks", blockText],
-      ["Paired-period peak combined memory", peakText],
+      ["Paired-period peak estimate", peakText],
       ["Paired memory coverage", coverage],
     ]
     : [[
@@ -1579,16 +1579,19 @@ function MemoryBillingPanel({ snapshot, nowMs }) {
     h("td", null, resourceValue(hostingCost(hourly, 1))),
     h("td", null, resourceValue(hostingCost(hourly, ESTIMATE_HOURS_30_DAYS))),
   );
-  return analyticsPanel("Memory block estimate", "resources-memory-billing", h("div", null,
+  return analyticsPanel("In-process memory block estimate", "resources-memory-billing", h("div", null,
     h("dl", { className: "du-facts" },
       ...memoryRows.map(([label, value]) => h("div", { key: label }, h("dt", null, label), h("dd", null, resourceValue(value)))),
     ),
     h("p", { className: "an-note muted" }, blockNote),
     combineMemory && peakBlocks && h("p", { className: "an-note muted" },
-      `The peak uses each process’s highest reading in each paired ${peakPeriod}. Those readings can occur at different times, so their sum can overstate the peak within paired periods.`,
+      `This peak estimate covers only ${peakPeriod}s with readings from both processes. The sum of their separate maxima is an upper bound on sampled combined memory in each ${peakPeriod} because the processes can peak at different times.`,
     ),
     combineMemory && coverage && pairedPeriods > 0 && pairedPeriods < totalPeriods && h("p", { className: "an-note muted" },
       "Periods without both readings can hide higher peaks.",
+    ),
+    combineMemory && (blocks || peakBlocks) && h("p", { className: "an-note muted" },
+      "These estimates exclude Bunny’s billed system overhead. Bunny’s pricing docs leave open whether hourly billing uses average or peak memory and whether blocks round per container or per pod.",
     ),
     rates
       ? h("div", null,
