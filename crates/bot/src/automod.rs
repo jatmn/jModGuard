@@ -1436,6 +1436,30 @@ async fn recheck_message_rule(
     .await
 }
 
+fn reply_match_is_current(pending: &PendingAction, checked_rule: &RuleDef) -> bool {
+    let Some(matched) = pending.matched_rule.as_ref() else {
+        return false;
+    };
+    let (Some(matched_params), Some(checked_params)) =
+        (matched.params.as_object(), checked_rule.params.as_object())
+    else {
+        return false;
+    };
+
+    // The pending match can justify updated reply settings only while the
+    // trigger and scope that selected it still agree with the live rule.
+    matched.include_channels == checked_rule.include_channels
+        && matched.whitelist_channels == checked_rule.whitelist_channels
+        && matched.whitelist_users == checked_rule.whitelist_users
+        && matched.whitelist_roles == checked_rule.whitelist_roles
+        && matched.skip_moderators == checked_rule.skip_moderators
+        && matched_params
+            .keys()
+            .chain(checked_params.keys())
+            .filter(|key| key.as_str() != "channel_reply")
+            .all(|key| matched_params.get(key) == checked_params.get(key))
+}
+
 pub(crate) async fn recheck_live_rule(
     app: &BotState,
     guild: u64,
@@ -1752,6 +1776,7 @@ async fn execute_live<'a>(
             let outcome = if let Some(channel) = msg_channel
                 && let Ok((template, delete_after)) =
                     jmodguard::custom_rules::channel_reply(settings)
+                && reply_match_is_current(pending, settings)
                 && message_rule_is_current().await
             {
                 app.automod
@@ -5489,18 +5514,23 @@ mod tests {
         #[derive(Clone, Copy, Debug, PartialEq, Eq)]
         enum Edit {
             BeforeDispatch,
+            TriggerBeforeDispatch,
+            ScopeBeforeDispatch,
             UnrelatedDuringDelete,
             TemplateDuringDelete,
             DisableDuringDelete,
         }
         use Edit::{
-            BeforeDispatch, DisableDuringDelete, TemplateDuringDelete, UnrelatedDuringDelete,
+            BeforeDispatch, DisableDuringDelete, ScopeBeforeDispatch, TemplateDuringDelete,
+            TriggerBeforeDispatch, UnrelatedDuringDelete,
         };
 
         const RULE: &str = "custom:0123456789abcdef";
         const DELETE: &str = "/api/v10/channels/70/messages/42";
         for edit in [
             BeforeDispatch,
+            TriggerBeforeDispatch,
+            ScopeBeforeDispatch,
             UnrelatedDuringDelete,
             TemplateDuringDelete,
             DisableDuringDelete,
@@ -5537,9 +5567,10 @@ mod tests {
             let pending = app.automod.evaluate(&cfg, &word_message(&[])).unwrap();
             assert_eq!(pending.rule_id, RULE);
 
+            let changes_match = matches!(edit, TriggerBeforeDispatch | ScopeBeforeDispatch);
             let (release, release_rx) = tokio::sync::oneshot::channel();
             let requests = Arc::new(ReplyRequests {
-                gate: (edit != BeforeDispatch).then(|| DiscordRequestGate {
+                gate: (edit != BeforeDispatch && !changes_match).then(|| DiscordRequestGate {
                     method: "DELETE",
                     path: DELETE,
                     entered: tokio::sync::Notify::new(),
@@ -5582,6 +5613,11 @@ mod tests {
                         rule.params["channel_reply"] = serde_json::json!({
                             "template": "Updated", "delete_after_seconds": 1
                         });
+                        if edit == TriggerBeforeDispatch {
+                            rule.params["words"] = serde_json::json!(["differentword"]);
+                        } else if edit == ScopeBeforeDispatch {
+                            rule.whitelist_channels.push(70);
+                        }
                         crate::db::upsert_rule(&app.db, 10, RULE, &rule)
                             .await
                             .unwrap();
@@ -5595,6 +5631,16 @@ mod tests {
                 assert!(tokio::join!(execution, save).0);
             } else {
                 save.await;
+                if changes_match {
+                    let current = app.configs.get(&app.db, 10).await.unwrap();
+                    assert_eq!(current.rules[RULE].actions, cfg.rules[RULE].actions);
+                    assert!(
+                        AutomodEngine::new()
+                            .evaluate(&current, &word_message(&[]))
+                            .is_none_or(|matched| matched.rule_id != RULE),
+                        "{edit:?}: the current rule must reject the old match"
+                    );
+                }
                 assert!(execution.await);
             }
             let observed = requests.posts.lock().unwrap().clone();
@@ -5616,7 +5662,10 @@ mod tests {
             let expected: &[_] = match edit {
                 BeforeDispatch => &[Some("Updated")],
                 UnrelatedDuringDelete => &[Some("Original")],
-                TemplateDuringDelete | DisableDuringDelete => &[],
+                TriggerBeforeDispatch
+                | ScopeBeforeDispatch
+                | TemplateDuringDelete
+                | DisableDuringDelete => &[],
             };
             assert_eq!(content, expected, "{edit:?}");
             drop(app);
