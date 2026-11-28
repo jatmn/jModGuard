@@ -4120,7 +4120,7 @@ fn image_test_rule_writes_reject_punishment_before_changing_configuration() {
             ConfigurationWriteScope::new(ConfigurationScope::Global, ConfigurationScope::Global)
                 .unwrap();
         assert!(
-            upsert_enrolled_rule(&db, scope, "attachment_flood", &rule)
+            upsert_enrolled_rule(&db, scope.clone(), "attachment_flood", &rule)
                 .await
                 .is_err()
         );
@@ -4163,6 +4163,25 @@ fn image_test_rule_writes_reject_punishment_before_changing_configuration() {
         let stored = get_rule(&db, 0, "attachment_flood").await.unwrap().unwrap();
         assert!(!stored.dry_run);
         assert_eq!(stored.params["mode"], "exact_image");
+
+        let positional_params = serde_json::json!(["exact_image", 60, 3, 2]);
+        rule.params = positional_params.clone();
+        upsert_enrolled_rule(&db, scope.clone(), "attachment_flood", &rule)
+            .await
+            .unwrap();
+        let before = get_primary_versions(&db).await.unwrap();
+        rule.params = serde_json::json!(["exact_image", 60, 3]);
+        assert!(
+            upsert_enrolled_rule(&db, scope, "attachment_flood", &rule)
+                .await
+                .is_err(),
+            "incomplete positional image policy must be rejected on save"
+        );
+        let after = get_primary_versions(&db).await.unwrap();
+        assert_eq!(before.config_revision, after.config_revision);
+        let stored = get_rule(&db, 0, "attachment_flood").await.unwrap().unwrap();
+        assert_eq!(stored.params, positional_params);
+
         let mut text = crate::defaults::default_rules().remove(2);
         text.dry_run = false;
         text.actions = rule.actions.clone();
