@@ -1,16 +1,19 @@
 //! Independent exact-text spam policy. Matching is trim-only equality.
 use anyhow::{Context, Result, bail, ensure};
+use serde::Deserialize;
 use serde_json::Value;
 
 pub const MODE: &str = "exact_text";
 pub const DEFAULT_MIN_LENGTH: usize = 20;
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Policy {
     pub mode: String,
     pub window_secs: u64,
     pub min_channels: usize,
     pub min_length: usize,
+    #[serde(default, skip_deserializing)]
     pub enforce: bool,
 }
 
@@ -158,13 +161,18 @@ mod tests {
         assert_eq!(positional.min_length, 2000);
         assert!(!positional.enforce);
 
+        let deserialized: Policy = serde_json::from_str(r#"["exact_text",600,2,2000]"#).unwrap();
+        assert_eq!(deserialized.min_length, positional.min_length);
+
         for params in [
-            json!({"mode": MODE, "window_secs": 60, "min_channels": 3, "enforce": true}),
+            json!({"mode": MODE, "window_secs": 60, "min_channels": 3, "min_length": 20, "enforce": true}),
+            json!({"mode": MODE, "window_secs": 60, "min_channels": 3}),
             json!({"mode": MODE, "window_secs": 60, "min_channels": 3, "min_length": 20, "extra": 0}),
             json!({"mode": MODE, "window_secs": 60, "min_channels": 3.0, "min_length": 20}),
             json!([MODE, 60, 3]),
             json!([MODE, 60, 3, 20, true]),
         ] {
+            assert!(serde_json::from_str::<Policy>(&params.to_string()).is_err());
             rule.params = params;
             assert!(Policy::parse(&rule).is_err(), "accepted {}", rule.params);
         }

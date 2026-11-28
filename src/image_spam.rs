@@ -24,13 +24,16 @@ pub const TEST_MODE: &str = "exact_image_test";
 pub const ENFORCE_MODE: &str = "exact_image";
 pub const MODE: &str = TEST_MODE;
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Policy {
     pub mode: String,
     pub window_secs: u64,
     pub min_channels: usize,
     pub min_attachments: usize,
+    #[serde(default, skip_deserializing)]
     pub enforce: bool,
+    #[serde(default, skip_deserializing)]
     pub known_bad_hashes: Option<Arc<BTreeSet<Hash>>>,
 }
 impl Policy {
@@ -177,7 +180,7 @@ pub fn validate_rule(id: &str, rule: &crate::types::RuleDef) -> Result<()> {
                 );
             }
         }
-        "attachment_flood" if rule.params.get("mode").is_some() => {
+        "attachment_flood" if rule.params.is_array() || rule.params.get("mode").is_some() => {
             Policy::parse(rule)?;
         }
         "repeat_text" => {
@@ -899,6 +902,9 @@ mod tests {
         assert!(!parsed.enforce);
         assert!(parsed.known_bad_hashes.is_none());
 
+        let deserialized: Policy = serde_json::from_str(r#"["exact_image_test",60,3,2]"#).unwrap();
+        assert_eq!(deserialized.min_attachments, parsed.min_attachments);
+
         for params in [
             json!([TEST_MODE, 60, 3]),
             json!([TEST_MODE, 60, 3, 2, true]),
@@ -907,6 +913,7 @@ mod tests {
             json!({"mode": TEST_MODE, "window_secs": 60, "min_channels": 3, "min_attachments": 2, "enforce": true}),
             json!({"mode": TEST_MODE, "window_secs": 60, "min_channels": 3, "min_attachments": 2, "known_bad_hashes": []}),
         ] {
+            assert!(serde_json::from_str::<Policy>(&params.to_string()).is_err());
             rule.params = params;
             assert!(Policy::parse(&rule).is_err(), "{}", rule.params);
         }
